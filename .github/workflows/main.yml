@@ -67,11 +67,13 @@ jobs:
           Restart-Service -Name TermService -Force
           Write-Host "RDP configured."
 
-      - name: Install TightVNC
+      - name: Install TightVNC with loopback enabled
         shell: pwsh
         env:
           VNC_PASSWORD: ${{ secrets.VNC_PASSWORD }}
         run: |
+          $ErrorActionPreference = "Stop"
+
           if ([string]::IsNullOrWhiteSpace($env:VNC_PASSWORD)) {
             throw "Set VNC_PASSWORD in repository Actions secrets."
           }
@@ -85,11 +87,11 @@ jobs:
           $url = "https://www.tightvnc.com/download/2.8.85/tightvnc-2.8.85-gpl-setup-64bit.msi"
 
           try {
-            Invoke-WebRequest -Uri $url -OutFile $installer
+            Invoke-WebRequest -Uri $url -OutFile $installer -ErrorAction Stop
           }
           catch {
             $url = "https://www.tightvnc.com/download/2.8.81/tightvnc-2.8.81-gpl-setup-64bit.msi"
-            Invoke-WebRequest -Uri $url -OutFile $installer
+            Invoke-WebRequest -Uri $url -OutFile $installer -ErrorAction Stop
           }
 
           $arguments = @(
@@ -104,6 +106,10 @@ jobs:
             "VALUE_OF_USEVNCAUTHENTICATION=1"
             "SET_PASSWORD=1"
             "VALUE_OF_PASSWORD=$($env:VNC_PASSWORD)"
+            "SET_ALLOWLOOPBACK=1"
+            "VALUE_OF_ALLOWLOOPBACK=1"
+            "SET_ACCEPTRFBCONNECTIONS=1"
+            "VALUE_OF_ACCEPTRFBCONNECTIONS=1"
           ) -join " "
 
           $process = Start-Process `
@@ -116,17 +122,54 @@ jobs:
             throw "TightVNC installation failed: $($process.ExitCode)"
           }
 
-          Start-Service -Name tvnserver -ErrorAction SilentlyContinue
+          # Explicitly enable loopback in the 64-bit machine registry.
+          $regPath = "HKLM:\SOFTWARE\TightVNC\Server"
+
+          if (-not (Test-Path $regPath)) {
+            New-Item -Path $regPath -Force | Out-Null
+          }
+
+          New-ItemProperty `
+            -Path $regPath `
+            -Name "AllowLoopback" `
+            -PropertyType DWord `
+            -Value 1 `
+            -Force | Out-Null
+
+          New-ItemProperty `
+            -Path $regPath `
+            -Name "AcceptRfbConnections" `
+            -PropertyType DWord `
+            -Value 1 `
+            -Force | Out-Null
+
+          # Restart the server so it reads the new configuration.
+          Restart-Service -Name tvnserver -Force
           Start-Sleep -Seconds 5
 
-          Get-Service -Name tvnserver -ErrorAction SilentlyContinue |
-            Format-Table -AutoSize
+          $value = Get-ItemPropertyValue `
+            -Path $regPath `
+            -Name "AllowLoopback"
+
+          Write-Host "AllowLoopback registry value: $value"
+
+          if ($value -ne 1) {
+            throw "TightVNC loopback setting was not applied."
+          }
+
+          if ((Get-Service tvnserver).Status -ne "Running") {
+            Start-Service tvnserver
+          }
+
+          Write-Host "TightVNC ready; loopback is enabled."
 
       - name: Download Unreal Engine ZIP parts
         shell: pwsh
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          $ErrorActionPreference = "Stop"
+
           $owner = "forgotenmywin"
           $repo = "Windows_with_no_vnc"
           $tag = "ue5.8"
@@ -139,9 +182,7 @@ jobs:
             "X-GitHub-Api-Version" = "2022-11-28"
           }
 
-          $release = Invoke-RestMethod `
-            -Uri $api `
-            -Headers $headers
+          $release = Invoke-RestMethod -Uri $api -Headers $headers
 
           $names = 1..8 | ForEach-Object {
             "UE_5.8.zip.{0:D3}" -f $_
@@ -152,27 +193,21 @@ jobs:
               Where-Object { $_.name -eq $name } |
               Select-Object -First 1
 
-            if ($null -eq $asset) {
-              throw "Release asset not found: $name"
+            if (-not $asset) {
+              throw "Release asset missing: $name"
             }
 
             $destination = "D:\UE58\Parts\$name"
             $expected = [long]$asset.size
             $success = $false
 
-            Write-Host ""
-            Write-Host "========================================"
-            Write-Host "Asset: $name"
-            Write-Host "Expected size: $expected bytes"
-            Write-Host "========================================"
+            Write-Host "Downloading $name; expected $expected bytes."
 
-            # Try the direct download URL first.
+            # Public release URL; verify each part's exact size.
             for ($attempt = 1; $attempt -le 3; $attempt++) {
-              Remove-Item $destination `
-                -Force `
-                -ErrorAction SilentlyContinue
+              Remove-Item $destination -Force -ErrorAction SilentlyContinue
 
-              Write-Host "Direct download attempt $attempt of 3"
+              Write-Host "Download attempt $attempt of 3"
 
               & curl.exe `
                 -fL `
@@ -190,90 +225,34 @@ jobs:
 
                 if ($actual -eq $expected) {
                   $success = $true
-                  Write-Host "Verified direct download: $actual bytes"
+                  Write-Host "VERIFIED: $name ($actual bytes)"
                   break
                 }
 
                 Write-Host "Incorrect size: $actual bytes"
               }
               else {
-                Write-Host "Direct download failed: curl exit $curlExit"
+                Write-Host "curl failed with exit code $curlExit"
               }
 
-              Remove-Item $destination `
-                -Force `
-                -ErrorAction SilentlyContinue
-
+              Remove-Item $destination -Force -ErrorAction SilentlyContinue
               Start-Sleep -Seconds 5
             }
 
-            # Retry through the authenticated GitHub API if needed.
             if (-not $success) {
-              Write-Host "Trying GitHub API asset download."
-
-              $downloadHeaders = @{
-                Authorization = "Bearer $env:GH_TOKEN"
-                Accept = "application/octet-stream"
-                "X-GitHub-Api-Version" = "2022-11-28"
-              }
-
-              for ($attempt = 1; $attempt -le 3; $attempt++) {
-                Remove-Item $destination `
-                  -Force `
-                  -ErrorAction SilentlyContinue
-
-                Write-Host "API download attempt $attempt of 3"
-
-                try {
-                  Invoke-WebRequest `
-                    -Uri $asset.url `
-                    -Headers $downloadHeaders `
-                    -OutFile $destination `
-                    -MaximumRedirection 10 `
-                    -TimeoutSec 1800 `
-                    -ErrorAction Stop
-
-                  if (Test-Path $destination) {
-                    $actual = (Get-Item $destination).Length
-
-                    if ($actual -eq $expected) {
-                      $success = $true
-                      Write-Host "Verified API download: $actual bytes"
-                      break
-                    }
-
-                    Write-Host "Incorrect API response size: $actual bytes"
-                  }
-                }
-                catch {
-                  Write-Host "API download error: $($_.Exception.Message)"
-                }
-
-                Remove-Item $destination `
-                  -Force `
-                  -ErrorAction SilentlyContinue
-
-                Start-Sleep -Seconds 5
-              }
+              throw "Download failed or size mismatch: $name"
             }
-
-            if (-not $success) {
-              throw "Failed to download and verify $name."
-            }
-
-            Write-Host "VERIFIED: $name ($expected bytes)"
           }
 
-          Write-Host "All eight ZIP parts downloaded and verified."
+          Write-Host "All eight ZIP parts verified."
 
       - name: Rebuild and test ZIP
         shell: pwsh
         run: |
-          $output = "D:\UE58\UE_5.8.zip"
+          $ErrorActionPreference = "Stop"
 
-          Remove-Item $output `
-            -Force `
-            -ErrorAction SilentlyContinue
+          $output = "D:\UE58\UE_5.8.zip"
+          Remove-Item $output -Force -ErrorAction SilentlyContinue
 
           $parts = 1..8 | ForEach-Object {
             "D:\UE58\Parts\UE_5.8.zip.{0:D3}" -f $_
@@ -303,7 +282,7 @@ jobs:
             $stream.Dispose()
           }
 
-          Write-Host "Reconstructed ZIP size: $((Get-Item $output).Length) bytes"
+          Write-Host "ZIP size: $((Get-Item $output).Length) bytes"
 
           $candidates = @(
             "$env:ProgramFiles\7-Zip\7z.exe",
@@ -321,17 +300,16 @@ jobs:
               -Uri "https://www.7-zip.org/a/7z2409-x64.exe" `
               -OutFile $installer
 
-            $installProcess = Start-Process `
+            Start-Process `
               -FilePath $installer `
               -ArgumentList "/S" `
-              -Wait `
-              -PassThru
+              -Wait
 
             $sevenZip = "$env:ProgramFiles\7-Zip\7z.exe"
+          }
 
-            if (-not (Test-Path $sevenZip)) {
-              throw "7-Zip installation failed: $($installProcess.ExitCode)"
-            }
+          if (-not (Test-Path $sevenZip)) {
+            throw "7-Zip executable not found."
           }
 
           & $sevenZip t $output
@@ -345,6 +323,8 @@ jobs:
       - name: Extract Unreal Engine
         shell: pwsh
         run: |
+          $ErrorActionPreference = "Stop"
+
           $sevenZip = "$env:ProgramFiles\7-Zip\7z.exe"
           $archive = "D:\UE58\UE_5.8.zip"
           $destination = "D:\UE58\Extracted"
@@ -366,18 +346,12 @@ jobs:
 
           $engineFolder = "$destination\UE_5.8"
 
-          if (-not (Test-Path $engineFolder)) {
-            throw "Expected extracted folder not found: $engineFolder"
+          if (-not (Test-Path "$engineFolder\Engine")) {
+            throw "Unreal Engine Engine folder not found."
           }
 
-          Write-Host "========================================"
           Write-Host "UNREAL ENGINE EXTRACTION SUCCESSFUL"
-          Write-Host "Engine folder: $engineFolder"
-          Write-Host "========================================"
-
-          Get-ChildItem $engineFolder -Force |
-            Select-Object Name, FullName |
-            Format-Table -AutoSize
+          Write-Host "Engine path: $engineFolder"
 
       - name: Start noVNC after extraction and keep runner alive
         shell: pwsh
@@ -389,18 +363,13 @@ jobs:
           $noVncDir = "$base\noVNC"
           $engineFolder = "$base\Extracted\UE_5.8"
 
-          New-Item -ItemType Directory -Force -Path $logDir |
-            Out-Null
-
-          # Only start noVNC after successful Unreal Engine extraction.
-          if (-not (Test-Path $engineFolder)) {
-            throw "Unreal Engine extraction folder not found: $engineFolder"
+          if (-not (Test-Path "$engineFolder\Engine")) {
+            throw "Unreal Engine was not extracted correctly."
           }
 
-          Write-Host "Unreal Engine is extracted:"
-          Write-Host $engineFolder
+          Write-Host "Extraction confirmed. Starting noVNC."
 
-          # Download and install noVNC after extraction.
+          # Download noVNC only after Unreal Engine extraction.
           $noVncZip = "$base\novnc.zip"
 
           Invoke-WebRequest `
@@ -421,13 +390,8 @@ jobs:
           New-Item -ItemType Directory -Force -Path $noVncDir |
             Out-Null
 
-          Copy-Item `
-            "$sourceDir\*" `
-            $noVncDir `
-            -Recurse `
-            -Force
+          Copy-Item "$sourceDir\*" $noVncDir -Recurse -Force
 
-          # Install websockify.
           py -m pip install websockify
 
           $scripts = (
@@ -437,7 +401,28 @@ jobs:
           $websockify = Join-Path $scripts "websockify.exe"
 
           if (-not (Test-Path $websockify)) {
-            throw "websockify.exe not found: $websockify"
+            throw "websockify.exe not found."
+          }
+
+          # Ensure TightVNC loopback remains enabled before starting bridge.
+          $regPath = "HKLM:\SOFTWARE\TightVNC\Server"
+
+          New-ItemProperty `
+            -Path $regPath `
+            -Name "AllowLoopback" `
+            -PropertyType DWord `
+            -Value 1 `
+            -Force | Out-Null
+
+          Restart-Service -Name tvnserver -Force
+          Start-Sleep -Seconds 5
+
+          $loopback = Get-ItemPropertyValue `
+            -Path $regPath `
+            -Name "AllowLoopback"
+
+          if ($loopback -ne 1) {
+            throw "TightVNC loopback is not enabled."
           }
 
           # Start websockify in this persistent step.
@@ -477,7 +462,7 @@ jobs:
 
           Write-Host "Websockify is listening on port 6080."
 
-          # Start Cloudflare only after noVNC is ready.
+          # Start Cloudflare tunnel after noVNC is ready.
           $cf = "$base\cloudflared.exe"
 
           Invoke-WebRequest `
@@ -495,7 +480,6 @@ jobs:
             -RedirectStandardError "$logDir\cloudflared-live-error.log" `
             -WindowStyle Hidden
 
-          # Wait for the public tunnel URL to appear in the log.
           $tunnelUrl = $null
 
           for ($i = 0; $i -lt 60; $i++) {
@@ -530,13 +514,12 @@ jobs:
             Write-Host "========================================"
           }
           else {
-            Write-Host "Tunnel URL was not detected."
+            Write-Host "Tunnel URL not detected."
             Get-Content "$logDir\cloudflared-live-error.log" `
               -Tail 40 `
               -ErrorAction SilentlyContinue
           }
 
-          # Keep both the machine and connection processes alive.
           while ($true) {
             $now = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
 
@@ -544,18 +527,18 @@ jobs:
               -Name "tvnserver" `
               -ErrorAction SilentlyContinue
 
-            $websockifyListener = Get-NetTCPConnection `
+            $listener = Get-NetTCPConnection `
               -LocalPort 6080 `
               -State Listen `
               -ErrorAction SilentlyContinue
 
-            $cloudflaredProcess = Get-Process `
+            $cloudflare = Get-Process `
               -Name "cloudflared" `
               -ErrorAction SilentlyContinue
 
             $vncState = if ($vnc) { "RUNNING" } else { "STOPPED" }
-            $websockifyState = if ($websockifyListener) { "LISTENING" } else { "STOPPED" }
-            $cloudflareState = if ($cloudflaredProcess) { "RUNNING" } else { "STOPPED" }
+            $websockifyState = if ($listener) { "LISTENING" } else { "STOPPED" }
+            $cloudflareState = if ($cloudflare) { "RUNNING" } else { "STOPPED" }
 
             Write-Host "[$now] ACTIVE | VNC=$vncState | Websockify=$websockifyState | Cloudflare=$cloudflareState"
 
