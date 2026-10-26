@@ -1,5 +1,5 @@
 
-name: Unreal Engine 5.8 - noVNC and Release Download
+name: Unreal Engine 5.8 - Windows Desktop
 
 on:
   workflow_dispatch:
@@ -8,272 +8,423 @@ permissions:
   contents: read
 
 jobs:
-  unreal:
+  unreal-engine:
     runs-on: windows-latest
     timeout-minutes: 360
 
     steps:
-      - name: Prepare folders and check disk space
-        shell: powershell
+      - name: Prepare folders
+        shell: pwsh
         run: |
-          New-Item -ItemType Directory -Force D:\UE58,D:\UE58\Parts,D:\UE58\Extracted | Out-Null
-          Get-PSDrive D
-          $free = (Get-PSDrive D).Free / 1GB
-          Write-Host "Free D drive: $([math]::Round($free,2)) GB"
-          if ($free -lt 50) {
-            throw "Not enough disk space. Need approximately 50 GB free."
-          }
+          New-Item -ItemType Directory -Force -Path `
+            "D:\UE58\Parts", `
+            "D:\UE58\Extracted", `
+            "D:\UE58\Logs" | Out-Null
 
-      - name: Enable Remote Desktop
-        shell: powershell
+      - name: Configure Windows RDP
+        shell: pwsh
         env:
           RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
         run: |
           if ([string]::IsNullOrWhiteSpace($env:RDP_PASSWORD)) {
-            throw "Add RDP_PASSWORD in repository Actions secrets."
+            throw "Set RDP_PASSWORD in repository Actions secrets."
           }
 
-          $secure = ConvertTo-SecureString $env:RDP_PASSWORD -AsPlainText -Force
-          if (-not (Get-LocalUser -Name "runneradmin" -ErrorAction SilentlyContinue)) {
-            New-LocalUser -Name "runneradmin" -Password $secure -PasswordNeverExpires
-          } else {
-            Set-LocalUser -Name "runneradmin" -Password $secure
-          }
+          $password = ConvertTo-SecureString `
+            $env:RDP_PASSWORD -AsPlainText -Force
 
-          Add-LocalGroupMember -Group "Administrators" -Member "runneradmin" -ErrorAction SilentlyContinue
-          Set-ItemProperty "HKLM:\System\CurrentControlSet\Control\Terminal Server" -Name fDenyTSConnections -Value 0
-          Enable-NetFirewallRule -DisplayGroup "Remote Desktop" -ErrorAction SilentlyContinue
+          Set-LocalUser -Name "runneradmin" -Password $password
+
+          Set-ItemProperty `
+            -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server" `
+            -Name "fDenyTSConnections" -Value 0
+
+          Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
+
           Set-Service -Name TermService -StartupType Automatic
-          Start-Service TermService
+          Start-Service -Name TermService
+
+          Write-Host "RDP service configured."
 
       - name: Install TightVNC
-        shell: powershell
+        shell: pwsh
         env:
           VNC_PASSWORD: ${{ secrets.VNC_PASSWORD }}
         run: |
           if ([string]::IsNullOrWhiteSpace($env:VNC_PASSWORD)) {
-            throw "Add VNC_PASSWORD in repository Actions secrets."
+            throw "Set VNC_PASSWORD in repository Actions secrets."
           }
+
           if ($env:VNC_PASSWORD.Length -gt 8) {
-            throw "TightVNC password must be 8 characters or fewer."
+            throw "TightVNC password must be at most 8 characters."
           }
 
-          $msi = "$env:TEMP\tightvnc.msi"
+          $installer = "D:\UE58\tightvnc.msi"
+
           Invoke-WebRequest `
-            "https://www.tightvnc.com/download/2.8.84/tightvnc-2.8.84-gpl-setup-64bit.msi" `
-            -OutFile $msi
+            -Uri "https://www.tightvnc.com/download/2.8.85/tightvnc-2.8.85-gpl-setup-64bit.msi" `
+            -OutFile $installer
 
-          $args = "/i `"$msi`" /quiet /norestart ADDLOCAL=Server SERVER_REGISTER_AS_SERVICE=1 SERVER_ADD_FIREWALL_EXCEPTION=1 SET_USEVNCAUTHENTICATION=1 VALUE_OF_USEVNCAUTHENTICATION=1 SET_PASSWORD=$($env:VNC_PASSWORD) SET_USECONTROLAUTHENTICATION=0"
-          $p = Start-Process msiexec.exe -ArgumentList $args -Wait -PassThru
-          if ($p.ExitCode -notin @(0,3010)) {
-            throw "TightVNC installer failed with exit code $($p.ExitCode)"
+          $arguments = @(
+            "/i"
+            "`"$installer`""
+            "/quiet"
+            "/norestart"
+            "ADDLOCAL=Server"
+            "SERVER_REGISTER_AS_SERVICE=1"
+            "SERVER_ADD_FIREWALL_EXCEPTION=1"
+            "SET_USEVNCAUTHENTICATION=1"
+            "VALUE_OF_USEVNCAUTHENTICATION=1"
+            "SET_PASSWORD=$env:VNC_PASSWORD"
+          )
+
+          $process = Start-Process `
+            -FilePath "msiexec.exe" `
+            -ArgumentList $arguments `
+            -Wait -PassThru
+
+          if ($process.ExitCode -notin @(0, 3010)) {
+            throw "TightVNC installation failed: $($process.ExitCode)"
           }
 
-          Get-Service *vnc* | Format-Table Name,Status
-          Get-Service tvnserver -ErrorAction SilentlyContinue |
-            Set-Service -StartupType Automatic
-          Start-Service tvnserver -ErrorAction SilentlyContinue
+          $service = Get-Service |
+            Where-Object {
+              $_.Name -match "tvnserver"
+            } |
+            Select-Object -First 1
+
+          if ($service) {
+            Set-Service -Name $service.Name -StartupType Automatic
+            Start-Service -Name $service.Name
+          }
+
+          Write-Host "TightVNC installation completed."
 
       - name: Install noVNC and websockify
-        shell: powershell
+        shell: pwsh
         run: |
           $base = "D:\UE58\noVNC"
-          New-Item -ItemType Directory -Force $base | Out-Null
+          $zip = "D:\UE58\novnc.zip"
+          $temp = "D:\UE58\novnc-temp"
 
           Invoke-WebRequest `
-            "https://github.com/novnc/noVNC/archive/refs/tags/v1.6.0.zip" `
-            -OutFile "$env:TEMP\novnc.zip"
+            -Uri "https://github.com/novnc/noVNC/archive/refs/tags/v1.6.0.zip" `
+            -OutFile $zip
 
-          Expand-Archive "$env:TEMP\novnc.zip" "$env:TEMP\novnc-src" -Force
-          Copy-Item "$env:TEMP\novnc-src\noVNC-1.6.0\*" $base -Recurse -Force
+          Expand-Archive -Path $zip -DestinationPath $temp -Force
 
+          $source = Get-ChildItem $temp -Directory |
+            Where-Object { $_.Name -like "noVNC-*" } |
+            Select-Object -First 1
+
+          if (-not $source) {
+            throw "Could not locate the extracted noVNC directory."
+          }
+
+          New-Item -ItemType Directory -Force -Path $base | Out-Null
+          Copy-Item "$($source.FullName)\*" $base -Recurse -Force
+
+          # Install websockify using the same Python selected by py.
           py -m pip install --upgrade pip
           py -m pip install websockify
 
-          $sock = Get-NetTCPConnection -LocalPort 5900 -State Listen -ErrorAction SilentlyContinue
-          if (-not $sock) {
-            throw "TightVNC is not listening on port 5900."
+          # Locate websockify.exe without depending on PATH.
+          $scripts = (& py -c `
+            "import sysconfig; print(sysconfig.get_path('scripts'))").Trim()
+
+          $ws = Join-Path $scripts "websockify.exe"
+
+          if (-not (Test-Path $ws)) {
+            $pythonExe = (& py -c `
+              "import sys; print(sys.executable)").Trim()
+
+            $ws = Join-Path (Split-Path $pythonExe) `
+              "Scripts\websockify.exe"
           }
 
-          $ws = (Get-Command websockify.exe -ErrorAction SilentlyContinue).Source
-          if (-not $ws) {
-            $ws = (Get-Command websockify -ErrorAction Stop).Source
+          if (-not (Test-Path $ws)) {
+            $ws = Get-ChildItem `
+              "C:\hostedtoolcache\windows\Python" `
+              -Filter "websockify.exe" `
+              -Recurse -ErrorAction SilentlyContinue |
+              Select-Object -First 1 -ExpandProperty FullName
           }
 
-          Start-Process -FilePath $ws `
-            -ArgumentList @("--web", $base, "6080", "127.0.0.1:5900") `
-            -WindowStyle Hidden
+          if (-not $ws -or -not (Test-Path $ws)) {
+            throw "websockify.exe not found after installation."
+          }
+
+          Write-Host "Using websockify: $ws"
+
+          $webLog = "D:\UE58\Logs\websockify.log"
+          $webErr = "D:\UE58\Logs\websockify-error.log"
+
+          $arguments = @(
+            "--web"
+            "`"$base`""
+            "6080"
+            "127.0.0.1:5900"
+          ) -join " "
+
+          $proc = Start-Process `
+            -FilePath $ws `
+            -ArgumentList $arguments `
+            -WorkingDirectory $base `
+            -RedirectStandardOutput $webLog `
+            -RedirectStandardError $webErr `
+            -WindowStyle Hidden `
+            -PassThru
 
           Start-Sleep -Seconds 5
-          $port = Get-NetTCPConnection -LocalPort 6080 -State Listen -ErrorAction SilentlyContinue
-          if (-not $port) {
-            throw "noVNC websockify failed to start."
+
+          if ($proc.HasExited) {
+            Get-Content $webErr -ErrorAction SilentlyContinue
+            throw "websockify exited unexpectedly."
           }
 
-          $r = curl.exe -s -o NUL -w "%{http_code}" http://127.0.0.1:6080/vnc.html
-          Write-Host "noVNC HTTP status: $r"
+          Write-Host "noVNC/websockify is running on port 6080."
 
-      - name: Start Cloudflare Quick Tunnel
-        shell: powershell
+      - name: Start Cloudflare Tunnel
+        shell: pwsh
         run: |
-          $cf = "D:\UE58\cloudflared.exe"
-          Invoke-WebRequest `
-            "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe" `
-            -OutFile $cf
+          $cloudflared = "D:\UE58\cloudflared.exe"
 
-          $log = "D:\UE58\cloudflared.log"
-          Start-Process -FilePath $cf `
-            -ArgumentList @("tunnel","--no-autoupdate","--url","http://127.0.0.1:6080") `
-            -RedirectStandardOutput $log `
-            -RedirectStandardError $log `
-            -WindowStyle Hidden
+          Invoke-WebRequest `
+            -Uri "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe" `
+            -OutFile $cloudflared
+
+          $outLog = "D:\UE58\Logs\cloudflared.log"
+          $errLog = "D:\UE58\Logs\cloudflared-error.log"
+
+          $proc = Start-Process `
+            -FilePath $cloudflared `
+            -ArgumentList @(
+              "tunnel",
+              "--url",
+              "http://127.0.0.1:6080",
+              "--no-autoupdate"
+            ) `
+            -RedirectStandardOutput $outLog `
+            -RedirectStandardError $errLog `
+            -WindowStyle Hidden `
+            -PassThru
 
           $url = $null
+
           for ($i = 0; $i -lt 60; $i++) {
             Start-Sleep -Seconds 2
-            if (Test-Path $log) {
-              $match = Select-String -Path $log `
-                -Pattern 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' `
-                -AllMatches
-              if ($match) {
-                $url = $match.Matches[-1].Value
-                break
-              }
+
+            $logs = @()
+            if (Test-Path $outLog) {
+              $logs += Get-Content $outLog -Raw
+            }
+            if (Test-Path $errLog) {
+              $logs += Get-Content $errLog -Raw
+            }
+
+            $match = [regex]::Match(
+              ($logs -join "`n"),
+              'https://[a-zA-Z0-9-]+\.trycloudflare\.com'
+            )
+
+            if ($match.Success) {
+              $url = $match.Value
+              break
+            }
+
+            if ($proc.HasExited) {
+              break
             }
           }
 
           if (-not $url) {
-            Get-Content $log -ErrorAction SilentlyContinue
-            throw "Cloudflare tunnel URL was not found."
+            Write-Host "Cloudflare logs:"
+            Get-Content $outLog -ErrorAction SilentlyContinue
+            Get-Content $errLog -ErrorAction SilentlyContinue
+            throw "Could not obtain the Cloudflare Tunnel URL."
           }
 
-          Write-Host "======================================"
-          Write-Host "noVNC URL: $url/vnc.html"
-          Write-Host "======================================"
+          "NOVNC_URL=$url/vnc.html?autoconnect=true&resize=scale" |
+            Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
-      - name: Download all parts from GitHub Release
-        shell: powershell
+          Write-Host ""
+          Write-Host "========================================"
+          Write-Host "noVNC URL: $url/vnc.html?autoconnect=true&resize=scale"
+          Write-Host "========================================"
+          Write-Host "Keep this URL private."
+
+      - name: Download the 8 ZIP parts from GitHub Release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          $api = "https://api.github.com/repos/forgotenmywin/Windows_with_no_vnc/releases/tags/ue5.8"
-          $release = Invoke-RestMethod -Uri $api -Headers @{
-            "Accept" = "application/vnd.github+json"
-            "User-Agent" = "UE58-Workflow"
+          $repo = "forgotenmywin/Windows_with_no_vnc"
+          $tag = "ue5.8"
+          $partsDir = "D:\UE58\Parts"
+
+          $headers = @{
+            Authorization = "Bearer $env:GH_TOKEN"
+            "X-GitHub-Api-Version" = "2022-11-28"
+            Accept = "application/vnd.github+json"
           }
 
-          $parts = @($release.assets |
-            Where-Object { $_.name -match '^UE_5\.8\.zip\.\d{3}$' } |
-            Sort-Object name)
+          $releaseUrl = "https://api.github.com/repos/$repo/releases/tags/$tag"
 
-          if ($parts.Count -ne 8) {
-            Write-Host "Assets found:"
-            $release.assets | ForEach-Object { Write-Host $_.name }
-            throw "Expected 8 UE_5.8.zip.001 through .008 assets; found $($parts.Count)."
+          $release = Invoke-RestMethod `
+            -Uri $releaseUrl `
+            -Headers $headers
+
+          $expectedNames = 1..8 | ForEach-Object {
+            "UE_5.8.zip.{0:D3}" -f $_
           }
 
-          for ($i = 0; $i -lt $parts.Count; $i++) {
-            $expected = "UE_5.8.zip.{0:D3}" -f ($i + 1)
-            if ($parts[$i].name -ne $expected) {
-              throw "Missing part: $expected"
+          foreach ($name in $expectedNames) {
+            $asset = $release.assets |
+              Where-Object { $_.name -eq $name } |
+              Select-Object -First 1
+
+            if (-not $asset) {
+              throw "Missing release asset: $name"
             }
-          }
 
-          foreach ($asset in $parts) {
-            $out = Join-Path "D:\UE58\Parts" $asset.name
-            Write-Host "Downloading $($asset.name) ($([math]::Round($asset.size / 1GB,2)) GB)"
-            curl.exe -L --fail --retry 5 --retry-delay 3 `
-              --output $out $asset.browser_download_url
+            $destination = Join-Path $partsDir $name
+
+            Write-Host "Downloading $name ($($asset.size) bytes)..."
+
+            & curl.exe `
+              --fail `
+              --location `
+              --retry 5 `
+              --retry-delay 3 `
+              --retry-all-errors `
+              --output $destination `
+              $asset.browser_download_url
+
             if ($LASTEXITCODE -ne 0) {
-              throw "Download failed: $($asset.name)"
+              throw "Download failed: $name (curl exit $LASTEXITCODE)"
             }
-            if ((Get-Item $out).Length -ne $asset.size) {
-              throw "Size mismatch for $($asset.name)"
+
+            $actualSize = (Get-Item $destination).Length
+
+            if ($actualSize -ne [long]$asset.size) {
+              throw "Size mismatch for $name. Expected $($asset.size), got $actualSize"
             }
+
+            Write-Host "Verified $name : $actualSize bytes"
           }
 
-      - name: Rebuild original ZIP
-        shell: powershell
+      - name: Reconstruct and verify UE_5.8.zip
+        shell: pwsh
         run: |
-          $output = "D:\UE58\UE_5.8.zip"
-          $streamOut = [System.IO.File]::Open(
-            $output,
-            [System.IO.FileMode]::Create,
-            [System.IO.FileAccess]::Write
-          )
-
-          try {
-            for ($i = 1; $i -le 8; $i++) {
-              $part = "D:\UE58\Parts\UE_5.8.zip.{0:D3}" -f $i
-              if (-not (Test-Path $part)) {
-                throw "Missing part: $part"
-              }
-
-              $streamIn = [System.IO.File]::OpenRead($part)
-              try {
-                $streamIn.CopyTo($streamOut)
-              } finally {
-                $streamIn.Dispose()
-              }
-            }
-          } finally {
-            $streamOut.Dispose()
-          }
-
-          $zip = Get-Item $output
-          Write-Host "Rebuilt ZIP size: $($zip.Length) bytes"
-
-          $fs = [System.IO.File]::OpenRead($output)
-          try {
-            $b = New-Object byte[] 4
-            [void]$fs.Read($b, 0, 4)
-            $sig = [BitConverter]::ToString($b)
-            Write-Host "ZIP signature: $sig"
-            if ($sig -ne "50-4B-03-04") {
-              throw "The reconstructed file does not begin with a ZIP signature."
-            }
-          } finally {
-            $fs.Dispose()
-          }
-
-      - name: Install 7-Zip
-        shell: powershell
-        run: |
-          $installer = "$env:TEMP\7zip.exe"
-          Invoke-WebRequest `
-            "https://www.7-zip.org/a/7z2409-x64.exe" `
-            -OutFile $installer
-
-          $p = Start-Process $installer `
-            -ArgumentList "/S" -Wait -PassThru
-          $seven = "C:\Program Files\7-Zip\7z.exe"
-          if (-not (Test-Path $seven)) {
-            throw "7-Zip installation failed."
-          }
-
-      - name: Extract Unreal Engine archive
-        shell: powershell
-        run: |
-          $seven = "C:\Program Files\7-Zip\7z.exe"
+          $parts = "D:\UE58\Parts"
           $zip = "D:\UE58\UE_5.8.zip"
-          $dest = "D:\UE58\Extracted"
 
-          & $seven t $zip
-          if ($LASTEXITCODE -ne 0) {
-            throw "ZIP integrity test failed. Do not extract a damaged archive."
+          $ordered = 1..8 | ForEach-Object {
+            Join-Path $parts ("UE_5.8.zip.{0:D3}" -f $_)
           }
 
-          & $seven x $zip "-o$dest" -y
+          foreach ($part in $ordered) {
+            if (-not (Test-Path $part)) {
+              throw "Part is missing: $part"
+            }
+          }
+
+          $copyArgs = @("/d", "/c", "copy", "/b")
+          $joined = ($ordered | ForEach-Object {
+            '"' + $_ + '"'
+          }) -join "+"
+
+          $command = "copy /b $joined `"$zip`""
+
+          Write-Host "Joining parts into the original ZIP..."
+          & cmd.exe /d /c $command
+
           if ($LASTEXITCODE -ne 0) {
-            throw "Extraction failed."
+            throw "Failed to join ZIP parts."
+          }
+
+          $file = Get-Item $zip
+          Write-Host "Reconstructed ZIP size: $($file.Length) bytes"
+
+          $stream = [System.IO.File]::OpenRead($zip)
+          try {
+            $signature = New-Object byte[] 4
+            [void]$stream.Read($signature, 0, 4)
+          }
+          finally {
+            $stream.Dispose()
+          }
+
+          $hex = [BitConverter]::ToString($signature)
+          Write-Host "ZIP signature: $hex"
+
+          if ($hex -ne "50-4B-03-04") {
+            throw "Reconstructed file does not have a normal ZIP signature."
+          }
+
+      - name: Install 7-Zip and test archive
+        shell: pwsh
+        run: |
+          $sevenZip = "C:\Program Files\7-Zip\7z.exe"
+
+          if (-not (Test-Path $sevenZip)) {
+            choco install 7zip -y --no-progress
+
+            if ($LASTEXITCODE -ne 0) {
+              throw "Could not install 7-Zip."
+            }
+          }
+
+          if (-not (Test-Path $sevenZip)) {
+            throw "7z.exe was not found after installation."
+          }
+
+          & $sevenZip t "D:\UE58\UE_5.8.zip"
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Archive test failed. The ZIP may be incomplete or damaged."
+          }
+
+      - name: Extract Unreal Engine 5.8
+        shell: pwsh
+        run: |
+          $sevenZip = "C:\Program Files\7-Zip\7z.exe"
+          $zip = "D:\UE58\UE_5.8.zip"
+          $destination = "D:\UE58\Extracted"
+
+          Write-Host "Extracting Unreal Engine. This may take a long time..."
+
+          & $sevenZip x $zip "-o$destination" -y
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Unreal Engine extraction failed."
           }
 
           Write-Host "Extraction completed."
-          Get-ChildItem $dest | Select-Object Name,Mode
 
-      - name: Keep session alive
-        shell: powershell
+          Get-ChildItem $destination -Force |
+            Select-Object Name, FullName
+
+      - name: Keep runner alive
+        if: always()
+        shell: pwsh
         run: |
-          Write-Host "Session is ACTIVE. noVNC URL is in the earlier logs."
+          Write-Host "Runner keepalive started."
+          Write-Host "If extraction failed, inspect earlier steps and D:\UE58\Logs."
+
           while ($true) {
-            Write-Host "ACTIVE - $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
+            $now = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+
+            $vnc = Get-Process -Name "tvnserver" `
+              -ErrorAction SilentlyContinue
+
+            $ws = Get-Process -Name "websockify" `
+              -ErrorAction SilentlyContinue
+
+            $cf = Get-Process -Name "cloudflared" `
+              -ErrorAction SilentlyContinue
+
+            Write-Host "[$now] ACTIVE - VNC=$([bool]$vnc) websockify=$([bool]$ws) cloudflared=$([bool]$cf)"
+
             Start-Sleep -Seconds 60
-          }
+          
