@@ -34,7 +34,6 @@ jobs:
           $fileId = "1MTby51iqiUNSUOxLxLUs-oaKhJfgyV2Y"
           $zip = "D:\UE58\UE_5.8.zip"
 
-          # Pass the Google Drive file ID directly.
           python -m gdown $fileId -O $zip
           if ($LASTEXITCODE -ne 0) {
             throw "Google Drive download failed. Check file sharing permissions."
@@ -203,6 +202,7 @@ jobs:
 
           $root = "D:\RemoteDesktop"
           $zip = Join-Path $root "novnc.zip"
+          $novnc = Join-Path $root "noVNC-1.6.0"
 
           Invoke-WebRequest `
             -Uri "https://github.com/novnc/noVNC/archive/refs/tags/v1.6.0.zip" `
@@ -210,10 +210,8 @@ jobs:
 
           Expand-Archive -Path $zip -DestinationPath $root -Force
 
-          $novnc = Join-Path $root "noVNC-1.6.0"
-
           if (-not (Test-Path (Join-Path $novnc "vnc.html"))) {
-            throw "noVNC web files were not found."
+            throw "noVNC vnc.html was not found."
           }
 
           python -m pip install websockify
@@ -221,8 +219,8 @@ jobs:
             throw "websockify installation failed."
           }
 
-          $rootOut = Join-Path $root "websockify-out.log"
-          $rootErr = Join-Path $root "websockify-error.log"
+          $outLog = Join-Path $root "websockify-out.log"
+          $errLog = Join-Path $root "websockify-error.log"
 
           $proc = Start-Process -FilePath "python" `
             -ArgumentList @(
@@ -231,22 +229,32 @@ jobs:
               "6080", "127.0.0.1:5900"
             ) `
             -PassThru `
-            -RedirectStandardOutput $rootOut `
-            -RedirectStandardError $rootErr
+            -RedirectStandardOutput $outLog `
+            -RedirectStandardError $errLog
 
-          Start-Sleep -Seconds 5
+          Start-Sleep -Seconds 8
 
           if ($proc.HasExited) {
-            Get-Content $rootErr -ErrorAction SilentlyContinue
-            throw "websockify exited unexpectedly."
+            Write-Host "websockify exited. Error log:"
+            Get-Content $errLog -ErrorAction SilentlyContinue
+            throw "websockify did not stay running."
           }
 
-          $response = Invoke-WebRequest `
-            -Uri "http://127.0.0.1:6080/vnc.html" `
-            -TimeoutSec 15
+          $tcp = Test-NetConnection 127.0.0.1 -Port 6080 `
+            -WarningAction SilentlyContinue
 
-          if ($response.StatusCode -ne 200) {
-            throw "noVNC HTTP check failed."
+          if (-not $tcp.TcpTestSucceeded) {
+            Get-Content $errLog -ErrorAction SilentlyContinue
+            throw "Port 6080 is not listening."
+          }
+
+          $status = & curl.exe -sS -o NUL -w "%{http_code}" `
+            --max-time 15 "http://127.0.0.1:6080/vnc.html"
+
+          if ($LASTEXITCODE -ne 0 -or "$status" -ne "200") {
+            Write-Host "HTTP status: $status"
+            Get-Content $errLog -ErrorAction SilentlyContinue
+            throw "noVNC HTTP test failed."
           }
 
           Write-Host "NOVNC_READY"
