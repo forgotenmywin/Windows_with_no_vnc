@@ -1,3 +1,4 @@
+
 name: Unreal Engine 5.8 - Windows RDP + noVNC
 
 on:
@@ -121,134 +122,10 @@ jobs:
           Get-Service -Name tvnserver -ErrorAction SilentlyContinue |
             Format-Table -AutoSize
 
-      - name: Install noVNC and websockify
-        shell: pwsh
-        run: |
-          $noVncDir = "D:\UE58\noVNC"
-          $zip = "D:\UE58\novnc.zip"
-
-          New-Item -ItemType Directory -Force -Path $noVncDir |
-            Out-Null
-
-          Invoke-WebRequest `
-            -Uri "https://github.com/novnc/noVNC/archive/refs/tags/v1.6.0.zip" `
-            -OutFile $zip
-
-          Expand-Archive `
-            -Path $zip `
-            -DestinationPath "D:\UE58" `
-            -Force
-
-          $sourceDir = "D:\UE58\noVNC-1.6.0"
-
-          if (-not (Test-Path $sourceDir)) {
-            throw "noVNC source directory not found."
-          }
-
-          Copy-Item `
-            "$sourceDir\*" `
-            $noVncDir `
-            -Recurse `
-            -Force
-
-          py -m pip install --upgrade pip
-          py -m pip install websockify
-
-          $scripts = (py -c "import sysconfig; print(sysconfig.get_path('scripts'))").Trim()
-          $websockify = Join-Path $scripts "websockify.exe"
-
-          if (-not (Test-Path $websockify)) {
-            throw "websockify.exe not found: $websockify"
-          }
-
-          Start-Process `
-            -FilePath $websockify `
-            -ArgumentList @(
-              "--web", $noVncDir,
-              "6080",
-              "127.0.0.1:5900"
-            ) `
-            -RedirectStandardOutput "D:\UE58\Logs\websockify.log" `
-            -RedirectStandardError "D:\UE58\Logs\websockify-error.log" `
-            -WindowStyle Hidden
-
-          Start-Sleep -Seconds 5
-
-          $listener = Get-NetTCPConnection `
-            -LocalPort 6080 `
-            -State Listen `
-            -ErrorAction SilentlyContinue
-
-          if (-not $listener) {
-            Get-Content "D:\UE58\Logs\websockify-error.log" `
-              -ErrorAction SilentlyContinue
-
-            throw "websockify did not start on port 6080."
-          }
-
-          Write-Host "noVNC and websockify started."
-
-      - name: Start Cloudflare tunnel
-        shell: pwsh
-        run: |
-          $cf = "D:\UE58\cloudflared.exe"
-
-          Invoke-WebRequest `
-            -Uri "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe" `
-            -OutFile $cf
-
-          Start-Process `
-            -FilePath $cf `
-            -ArgumentList @(
-              "tunnel",
-              "--url",
-              "http://127.0.0.1:6080"
-            ) `
-            -RedirectStandardOutput "D:\UE58\Logs\cloudflared.log" `
-            -RedirectStandardError "D:\UE58\Logs\cloudflared-error.log" `
-            -WindowStyle Hidden
-
-          $tunnelUrl = $null
-
-          for ($i = 0; $i -lt 60; $i++) {
-            Start-Sleep -Seconds 2
-
-            $logPath = "D:\UE58\Logs\cloudflared-error.log"
-
-            $logs = Get-Content $logPath `
-              -ErrorAction SilentlyContinue
-
-            $match = $logs |
-              Select-String -Pattern 'https://[a-zA-Z0-9-]+\.trycloudflare\.com'
-
-            if ($match) {
-              $line = ($match | Select-Object -Last 1).Line
-
-              $tunnelUrl = [regex]::Match(
-                $line,
-                'https://[a-zA-Z0-9-]+\.trycloudflare\.com'
-              ).Value
-
-              if ($tunnelUrl) {
-                break
-              }
-            }
-          }
-
-          if ($tunnelUrl) {
-            Write-Host "noVNC URL: $tunnelUrl/vnc.html?autoconnect=true&resize=scale"
-          }
-          else {
-            Write-Host "Tunnel URL not detected yet."
-            Get-Content "D:\UE58\Logs\cloudflared-error.log" `
-              -Tail 30 `
-              -ErrorAction SilentlyContinue
-          }
-
       - name: Download Unreal Engine ZIP parts
         shell: pwsh
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           $owner = "forgotenmywin"
           $repo = "Windows_with_no_vnc"
@@ -281,6 +158,7 @@ jobs:
 
             $destination = "D:\UE58\Parts\$name"
             $expected = [long]$asset.size
+            $success = $false
 
             Write-Host ""
             Write-Host "========================================"
@@ -288,9 +166,7 @@ jobs:
             Write-Host "Expected size: $expected bytes"
             Write-Host "========================================"
 
-            $success = $false
-
-            # Try the direct release download URL first.
+            # Try the direct download URL first.
             for ($attempt = 1; $attempt -le 3; $attempt++) {
               Remove-Item $destination `
                 -Force `
@@ -309,22 +185,19 @@ jobs:
 
               $curlExit = $LASTEXITCODE
 
-              if (
-                $curlExit -eq 0 -and
-                (Test-Path $destination)
-              ) {
+              if ($curlExit -eq 0 -and (Test-Path $destination)) {
                 $actual = (Get-Item $destination).Length
 
                 if ($actual -eq $expected) {
                   $success = $true
-                  Write-Host "Direct download verified: $actual bytes"
+                  Write-Host "Verified direct download: $actual bytes"
                   break
                 }
 
                 Write-Host "Incorrect size: $actual bytes"
               }
               else {
-                Write-Host "Direct download failed. curl exit: $curlExit"
+                Write-Host "Direct download failed: curl exit $curlExit"
               }
 
               Remove-Item $destination `
@@ -334,11 +207,11 @@ jobs:
               Start-Sleep -Seconds 5
             }
 
-            # If direct download failed, use the authenticated GitHub API.
+            # Retry through the authenticated GitHub API if needed.
             if (-not $success) {
-              Write-Host "Trying GitHub API binary download."
+              Write-Host "Trying GitHub API asset download."
 
-              $apiDownloadHeaders = @{
+              $downloadHeaders = @{
                 Authorization = "Bearer $env:GH_TOKEN"
                 Accept = "application/octet-stream"
                 "X-GitHub-Api-Version" = "2022-11-28"
@@ -354,7 +227,7 @@ jobs:
                 try {
                   Invoke-WebRequest `
                     -Uri $asset.url `
-                    -Headers $apiDownloadHeaders `
+                    -Headers $downloadHeaders `
                     -OutFile $destination `
                     -MaximumRedirection 10 `
                     -TimeoutSec 1800 `
@@ -365,7 +238,7 @@ jobs:
 
                     if ($actual -eq $expected) {
                       $success = $true
-                      Write-Host "API download verified: $actual bytes"
+                      Write-Host "Verified API download: $actual bytes"
                       break
                     }
 
@@ -385,13 +258,13 @@ jobs:
             }
 
             if (-not $success) {
-              throw "Unable to download and verify $name. Check release visibility and asset URL."
+              throw "Failed to download and verify $name."
             }
 
             Write-Host "VERIFIED: $name ($expected bytes)"
           }
 
-          Write-Host "All eight parts downloaded and verified."
+          Write-Host "All eight ZIP parts downloaded and verified."
 
       - name: Rebuild and test ZIP
         shell: pwsh
@@ -432,12 +305,12 @@ jobs:
 
           Write-Host "Reconstructed ZIP size: $((Get-Item $output).Length) bytes"
 
-          $sevenZipCandidates = @(
+          $candidates = @(
             "$env:ProgramFiles\7-Zip\7z.exe",
             "${env:ProgramFiles(x86)}\7-Zip\7z.exe"
           )
 
-          $sevenZip = $sevenZipCandidates |
+          $sevenZip = $candidates |
             Where-Object { Test-Path $_ } |
             Select-Object -First 1
 
@@ -483,8 +356,7 @@ jobs:
           New-Item `
             -ItemType Directory `
             -Force `
-            -Path $destination |
-            Out-Null
+            -Path $destination | Out-Null
 
           & $sevenZip x $archive "-o$destination" -y
 
@@ -492,19 +364,179 @@ jobs:
             throw "Unreal Engine extraction failed."
           }
 
-          Write-Host "Extraction completed."
+          $engineFolder = "$destination\UE_5.8"
 
-          Get-ChildItem $destination -Force |
+          if (-not (Test-Path $engineFolder)) {
+            throw "Expected extracted folder not found: $engineFolder"
+          }
+
+          Write-Host "========================================"
+          Write-Host "UNREAL ENGINE EXTRACTION SUCCESSFUL"
+          Write-Host "Engine folder: $engineFolder"
+          Write-Host "========================================"
+
+          Get-ChildItem $engineFolder -Force |
             Select-Object Name, FullName |
             Format-Table -AutoSize
 
-      - name: Keep runner alive
-        if: always()
+      - name: Start noVNC after extraction and keep runner alive
         shell: pwsh
         run: |
-          Write-Host "Runner keepalive started."
-          Write-Host "Extraction folder: D:\UE58\Extracted"
+          $ErrorActionPreference = "Stop"
 
+          $base = "D:\UE58"
+          $logDir = "$base\Logs"
+          $noVncDir = "$base\noVNC"
+          $engineFolder = "$base\Extracted\UE_5.8"
+
+          New-Item -ItemType Directory -Force -Path $logDir |
+            Out-Null
+
+          # Only start noVNC after successful Unreal Engine extraction.
+          if (-not (Test-Path $engineFolder)) {
+            throw "Unreal Engine extraction folder not found: $engineFolder"
+          }
+
+          Write-Host "Unreal Engine is extracted:"
+          Write-Host $engineFolder
+
+          # Download and install noVNC after extraction.
+          $noVncZip = "$base\novnc.zip"
+
+          Invoke-WebRequest `
+            -Uri "https://github.com/novnc/noVNC/archive/refs/tags/v1.6.0.zip" `
+            -OutFile $noVncZip
+
+          Expand-Archive `
+            -Path $noVncZip `
+            -DestinationPath $base `
+            -Force
+
+          $sourceDir = "$base\noVNC-1.6.0"
+
+          if (-not (Test-Path $sourceDir)) {
+            throw "noVNC source directory not found."
+          }
+
+          New-Item -ItemType Directory -Force -Path $noVncDir |
+            Out-Null
+
+          Copy-Item `
+            "$sourceDir\*" `
+            $noVncDir `
+            -Recurse `
+            -Force
+
+          # Install websockify.
+          py -m pip install websockify
+
+          $scripts = (
+            py -c "import sysconfig; print(sysconfig.get_path('scripts'))"
+          ).Trim()
+
+          $websockify = Join-Path $scripts "websockify.exe"
+
+          if (-not (Test-Path $websockify)) {
+            throw "websockify.exe not found: $websockify"
+          }
+
+          # Start websockify in this persistent step.
+          Start-Process `
+            -FilePath $websockify `
+            -ArgumentList @(
+              "--web", $noVncDir,
+              "6080",
+              "127.0.0.1:5900"
+            ) `
+            -RedirectStandardOutput "$logDir\websockify-live.log" `
+            -RedirectStandardError "$logDir\websockify-live-error.log" `
+            -WindowStyle Hidden
+
+          $websockifyReady = $false
+
+          for ($i = 0; $i -lt 15; $i++) {
+            Start-Sleep -Seconds 2
+
+            $listener = Get-NetTCPConnection `
+              -LocalPort 6080 `
+              -State Listen `
+              -ErrorAction SilentlyContinue
+
+            if ($listener) {
+              $websockifyReady = $true
+              break
+            }
+          }
+
+          if (-not $websockifyReady) {
+            Get-Content "$logDir\websockify-live-error.log" `
+              -ErrorAction SilentlyContinue
+
+            throw "websockify did not listen on port 6080."
+          }
+
+          Write-Host "Websockify is listening on port 6080."
+
+          # Start Cloudflare only after noVNC is ready.
+          $cf = "$base\cloudflared.exe"
+
+          Invoke-WebRequest `
+            -Uri "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe" `
+            -OutFile $cf
+
+          Start-Process `
+            -FilePath $cf `
+            -ArgumentList @(
+              "tunnel",
+              "--url",
+              "http://127.0.0.1:6080"
+            ) `
+            -RedirectStandardOutput "$logDir\cloudflared-live.log" `
+            -RedirectStandardError "$logDir\cloudflared-live-error.log" `
+            -WindowStyle Hidden
+
+          # Wait for the public tunnel URL to appear in the log.
+          $tunnelUrl = $null
+
+          for ($i = 0; $i -lt 60; $i++) {
+            Start-Sleep -Seconds 2
+
+            $logs = Get-Content "$logDir\cloudflared-live-error.log" `
+              -ErrorAction SilentlyContinue
+
+            $matches = $logs |
+              Select-String -Pattern 'https://[a-zA-Z0-9-]+\.trycloudflare\.com'
+
+            if ($matches) {
+              $line = ($matches | Select-Object -Last 1).Line
+
+              $tunnelUrl = [regex]::Match(
+                $line,
+                'https://[a-zA-Z0-9-]+\.trycloudflare\.com'
+              ).Value
+
+              if ($tunnelUrl) {
+                break
+              }
+            }
+          }
+
+          if ($tunnelUrl) {
+            Write-Host ""
+            Write-Host "========================================"
+            Write-Host "UNREAL ENGINE EXTRACTED SUCCESSFULLY"
+            Write-Host "noVNC URL:"
+            Write-Host "$tunnelUrl/vnc.html?autoconnect=true&resize=scale"
+            Write-Host "========================================"
+          }
+          else {
+            Write-Host "Tunnel URL was not detected."
+            Get-Content "$logDir\cloudflared-live-error.log" `
+              -Tail 40 `
+              -ErrorAction SilentlyContinue
+          }
+
+          # Keep both the machine and connection processes alive.
           while ($true) {
             $now = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
 
@@ -512,19 +544,20 @@ jobs:
               -Name "tvnserver" `
               -ErrorAction SilentlyContinue
 
-            $ws = Get-Process `
-              -Name "websockify" `
+            $websockifyListener = Get-NetTCPConnection `
+              -LocalPort 6080 `
+              -State Listen `
               -ErrorAction SilentlyContinue
 
-            $cf = Get-Process `
+            $cloudflaredProcess = Get-Process `
               -Name "cloudflared" `
               -ErrorAction SilentlyContinue
 
             $vncState = if ($vnc) { "RUNNING" } else { "STOPPED" }
-            $wsState = if ($ws) { "RUNNING" } else { "STOPPED" }
-            $cfState = if ($cf) { "RUNNING" } else { "STOPPED" }
+            $websockifyState = if ($websockifyListener) { "LISTENING" } else { "STOPPED" }
+            $cloudflareState = if ($cloudflaredProcess) { "RUNNING" } else { "STOPPED" }
 
-            Write-Host "[$now] ACTIVE | VNC=$vncState | Websockify=$wsState | Cloudflare=$cfState"
+            Write-Host "[$now] ACTIVE | VNC=$vncState | Websockify=$websockifyState | Cloudflare=$cloudflareState"
 
             Start-Sleep -Seconds 60
           }
