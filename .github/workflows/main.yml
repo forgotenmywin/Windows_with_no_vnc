@@ -13,16 +13,12 @@ jobs:
     timeout-minutes: 360
 
     steps:
-      - name: Prepare D drive
+      - name: Prepare D Drive
         shell: powershell
         run: |
           $ErrorActionPreference = "Stop"
-
-          New-Item -ItemType Directory -Force `
-            -Path "D:\UE58" | Out-Null
-          New-Item -ItemType Directory -Force `
-            -Path "D:\RemoteDesktop" | Out-Null
-
+          New-Item -ItemType Directory -Force -Path "D:\UE58" | Out-Null
+          New-Item -ItemType Directory -Force -Path "D:\RemoteDesktop" | Out-Null
           Get-PSDrive D
 
       - name: Download Unreal Engine from Google Drive
@@ -35,21 +31,20 @@ jobs:
             throw "Could not install gdown."
           }
 
-          $url = "https://drive.google.com/file/d/1MTby51iqiUNSUOxLxLUs-oaKhJfgyV2Y/view"
+          $fileId = "1MTby51iqiUNSUOxLxLUs-oaKhJfgyV2Y"
           $zip = "D:\UE58\UE_5.8.zip"
 
-          if (-not (Test-Path $zip)) {
-            python -m gdown --fuzzy $url -O $zip
-            if ($LASTEXITCODE -ne 0) {
-              throw "Google Drive download failed."
-            }
+          # Pass the Google Drive file ID directly.
+          python -m gdown $fileId -O $zip
+          if ($LASTEXITCODE -ne 0) {
+            throw "Google Drive download failed. Check file sharing permissions."
           }
 
-          if ((Get-Item $zip).Length -lt 1000000000) {
-            throw "Downloaded file is unexpectedly small."
+          if (-not (Test-Path $zip) -or (Get-Item $zip).Length -lt 1000000000) {
+            throw "Downloaded file is missing or unexpectedly small."
           }
 
-          Write-Host "Download completed:"
+          Write-Host "Download completed."
           Get-Item $zip | Select-Object FullName, Length
 
       - name: Install 7-Zip
@@ -64,7 +59,7 @@ jobs:
           }
 
           if (-not (Test-Path $sevenZip)) {
-            throw "7-Zip was not found after installation."
+            throw "7-Zip was not found."
           }
 
           & $sevenZip i | Select-Object -First 3
@@ -85,8 +80,7 @@ jobs:
             throw "Unreal Engine ZIP was not found."
           }
 
-          New-Item -ItemType Directory -Force `
-            -Path $destination | Out-Null
+          New-Item -ItemType Directory -Force -Path $destination | Out-Null
 
           & $sevenZip t $zip
           if ($LASTEXITCODE -ne 0) {
@@ -113,11 +107,14 @@ jobs:
           }
 
           $user = "runneradmin"
-          $securePassword = ConvertTo-SecureString `
-            $env:RDP_PASSWORD -AsPlainText -Force
+          $account = Get-LocalUser -Name $user -ErrorAction SilentlyContinue
 
-          Set-LocalUser -Name $user `
-            -Password $securePassword
+          if (-not $account) {
+            throw "Local user runneradmin was not found."
+          }
+
+          $securePassword = ConvertTo-SecureString $env:RDP_PASSWORD -AsPlainText -Force
+          Set-LocalUser -Name $user -Password $securePassword
 
           Set-ItemProperty `
             -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server" `
@@ -139,9 +136,11 @@ jobs:
           $ErrorActionPreference = "Stop"
 
           $password = $env:VNC_PASSWORD
+
           if ([string]::IsNullOrWhiteSpace($password)) {
             throw "Add the VNC_PASSWORD repository secret."
           }
+
           if ($password.Length -gt 8) {
             throw "VNC_PASSWORD must be 8 characters or fewer."
           }
@@ -156,6 +155,9 @@ jobs:
           $arguments = @(
             "/i", $msi,
             "/quiet", "/norestart",
+            "ADDLOCAL=Server",
+            "SERVER_REGISTER_AS_SERVICE=1",
+            "SERVER_ADD_FIREWALL_EXCEPTION=0",
             "SET_USEVNCAUTHENTICATION=1",
             "VALUE_OF_USEVNCAUTHENTICATION=1",
             "SET_PASSWORD=1",
@@ -163,21 +165,18 @@ jobs:
             "SET_USECONTROLAUTHENTICATION=1",
             "VALUE_OF_USECONTROLAUTHENTICATION=1",
             "SET_CONTROLPASSWORD=1",
-            "VALUE_OF_CONTROLPASSWORD=$password",
-            "SERVER_ADD_FIREWALL_EXCEPTION=0"
+            "VALUE_OF_CONTROLPASSWORD=$password"
           )
 
           $install = Start-Process msiexec.exe `
             -ArgumentList $arguments -Wait -PassThru
 
           if ($install.ExitCode -notin @(0, 3010)) {
-            throw "TightVNC install failed: $($install.ExitCode)"
+            throw "TightVNC installation failed: $($install.ExitCode)"
           }
 
           $service = Get-Service |
-            Where-Object {
-              $_.Name -match "tvnserver|TightVNC"
-            } |
+            Where-Object { $_.Name -match "tvnserver|TightVNC" } |
             Select-Object -First 1
 
           if (-not $service) {
@@ -197,7 +196,7 @@ jobs:
 
           Write-Host "TightVNC is listening on port 5900."
 
-      - name: Start noVNC Web Interface
+      - name: Install and Start noVNC
         shell: powershell
         run: |
           $ErrorActionPreference = "Stop"
@@ -212,6 +211,7 @@ jobs:
           Expand-Archive -Path $zip -DestinationPath $root -Force
 
           $novnc = Join-Path $root "noVNC-1.6.0"
+
           if (-not (Test-Path (Join-Path $novnc "vnc.html"))) {
             throw "noVNC web files were not found."
           }
@@ -221,6 +221,9 @@ jobs:
             throw "websockify installation failed."
           }
 
+          $rootOut = Join-Path $root "websockify-out.log"
+          $rootErr = Join-Path $root "websockify-error.log"
+
           $proc = Start-Process -FilePath "python" `
             -ArgumentList @(
               "-m", "websockify",
@@ -228,10 +231,15 @@ jobs:
               "6080", "127.0.0.1:5900"
             ) `
             -PassThru `
-            -RedirectStandardOutput "$root\websockify.log" `
-            -RedirectStandardError "$root\websockify-error.log"
+            -RedirectStandardOutput $rootOut `
+            -RedirectStandardError $rootErr
 
           Start-Sleep -Seconds 5
+
+          if ($proc.HasExited) {
+            Get-Content $rootErr -ErrorAction SilentlyContinue
+            throw "websockify exited unexpectedly."
+          }
 
           $response = Invoke-WebRequest `
             -Uri "http://127.0.0.1:6080/vnc.html" `
@@ -251,7 +259,8 @@ jobs:
 
           $root = "D:\RemoteDesktop"
           $cloudflared = Join-Path $root "cloudflared.exe"
-          $log = Join-Path $root "cloudflared.log"
+          $outLog = Join-Path $root "cloudflared-out.log"
+          $errLog = Join-Path $root "cloudflared-error.log"
 
           Invoke-WebRequest `
             -Uri "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe" `
@@ -265,37 +274,41 @@ jobs:
               "http://127.0.0.1:6080"
             ) `
             -PassThru `
-            -RedirectStandardOutput $log `
-            -RedirectStandardError $log
+            -RedirectStandardOutput $outLog `
+            -RedirectStandardError $errLog
 
           $urlFound = $false
 
           for ($i = 0; $i -lt 60; $i++) {
             Start-Sleep -Seconds 5
 
-            if (Test-Path $log) {
-              $content = Get-Content $log -Raw `
-                -ErrorAction SilentlyContinue
-
-              $match = [regex]::Match(
-                $content,
-                'https://[a-zA-Z0-9-]+\.trycloudflare\.com'
-              )
-
-              if ($match.Success) {
-                Write-Host "NOVNC_PUBLIC_URL=$($match.Value)"
-                $urlFound = $true
-                break
+            $content = ""
+            foreach ($log in @($outLog, $errLog)) {
+              if (Test-Path $log) {
+                $content += Get-Content $log -Raw -ErrorAction SilentlyContinue
               }
             }
 
+            $match = [regex]::Match(
+              $content,
+              'https://[a-zA-Z0-9-]+\.trycloudflare\.com'
+            )
+
+            if ($match.Success) {
+              Write-Host "NOVNC_PUBLIC_URL=$($match.Value)/vnc.html"
+              $urlFound = $true
+              break
+            }
+
             if ($proc.HasExited) {
+              Get-Content $errLog -ErrorAction SilentlyContinue
               throw "Cloudflare tunnel exited unexpectedly."
             }
           }
 
           if (-not $urlFound) {
-            Get-Content $log -ErrorAction SilentlyContinue
+            Get-Content $outLog -ErrorAction SilentlyContinue
+            Get-Content $errLog -ErrorAction SilentlyContinue
             throw "Cloudflare tunnel URL was not detected."
           }
 
@@ -307,7 +320,7 @@ jobs:
           $end = (Get-Date).AddHours(5).AddMinutes(40)
 
           Write-Host "Unreal Engine files: D:\UE58\Extracted"
-          Write-Host "Session is active. Do not stop this workflow."
+          Write-Host "Session is active."
 
           while ((Get-Date) -lt $end) {
             Start-Sleep -Seconds 60
