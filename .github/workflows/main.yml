@@ -36,13 +36,15 @@ jobs:
             -Name "fDenyTSConnections" `
             -Value 0
 
-          Enable-NetFirewallRule -DisplayGroup "Remote Desktop" `
+          Enable-NetFirewallRule `
+            -DisplayGroup "Remote Desktop" `
             -ErrorAction SilentlyContinue
 
           $securePassword = ConvertTo-SecureString `
             $env:RDP_PASSWORD -AsPlainText -Force
 
-          $user = Get-LocalUser -Name "runneradmin" `
+          $user = Get-LocalUser `
+            -Name "runneradmin" `
             -ErrorAction SilentlyContinue
 
           if ($null -eq $user) {
@@ -50,10 +52,15 @@ jobs:
               -Name "ueadmin" `
               -Password $securePassword `
               -AccountNeverExpires
-            Add-LocalGroupMember -Group "Administrators" -Member "ueadmin"
+
+            Add-LocalGroupMember `
+              -Group "Administrators" `
+              -Member "ueadmin"
           }
           else {
-            Set-LocalUser -Name "runneradmin" -Password $securePassword
+            Set-LocalUser `
+              -Name "runneradmin" `
+              -Password $securePassword
           }
 
           Restart-Service -Name TermService -Force
@@ -73,6 +80,7 @@ jobs:
           }
 
           $installer = "D:\UE58\tightvnc-installer.msi"
+
           $url = "https://www.tightvnc.com/download/2.8.85/tightvnc-2.8.85-gpl-setup-64bit.msi"
 
           try {
@@ -97,7 +105,8 @@ jobs:
             "VALUE_OF_PASSWORD=$($env:VNC_PASSWORD)"
           ) -join " "
 
-          $process = Start-Process msiexec.exe `
+          $process = Start-Process `
+            -FilePath "msiexec.exe" `
             -ArgumentList $arguments `
             -Wait `
             -PassThru
@@ -116,31 +125,41 @@ jobs:
         shell: pwsh
         run: |
           $noVncDir = "D:\UE58\noVNC"
-          New-Item -ItemType Directory -Force -Path $noVncDir | Out-Null
-
           $zip = "D:\UE58\novnc.zip"
+
+          New-Item -ItemType Directory -Force -Path $noVncDir |
+            Out-Null
+
           Invoke-WebRequest `
             -Uri "https://github.com/novnc/noVNC/archive/refs/tags/v1.6.0.zip" `
             -OutFile $zip
 
-          Expand-Archive -Path $zip -DestinationPath "D:\UE58" -Force
+          Expand-Archive `
+            -Path $zip `
+            -DestinationPath "D:\UE58" `
+            -Force
 
           $sourceDir = "D:\UE58\noVNC-1.6.0"
-          if (Test-Path $sourceDir) {
-            Copy-Item "$sourceDir\*" $noVncDir -Recurse -Force
+
+          if (-not (Test-Path $sourceDir)) {
+            throw "noVNC source directory not found."
           }
+
+          Copy-Item `
+            "$sourceDir\*" `
+            $noVncDir `
+            -Recurse `
+            -Force
 
           py -m pip install --upgrade pip
           py -m pip install websockify
 
-          $scripts = py -c "import sysconfig; print(sysconfig.get_path('scripts'))"
-          $websockify = Join-Path $scripts.Trim() "websockify.exe"
+          $scripts = (py -c "import sysconfig; print(sysconfig.get_path('scripts'))").Trim()
+          $websockify = Join-Path $scripts "websockify.exe"
 
           if (-not (Test-Path $websockify)) {
-            throw "websockify.exe not found at $websockify"
+            throw "websockify.exe not found: $websockify"
           }
-
-          $websockifyLog = "D:\UE58\Logs\websockify.log"
 
           Start-Process `
             -FilePath $websockify `
@@ -149,14 +168,21 @@ jobs:
               "6080",
               "127.0.0.1:5900"
             ) `
-            -RedirectStandardOutput $websockifyLog `
+            -RedirectStandardOutput "D:\UE58\Logs\websockify.log" `
             -RedirectStandardError "D:\UE58\Logs\websockify-error.log" `
             -WindowStyle Hidden
 
           Start-Sleep -Seconds 5
 
-          if (-not (Get-NetTCPConnection -LocalPort 6080 -State Listen -ErrorAction SilentlyContinue)) {
-            Get-Content $websockifyLog -ErrorAction SilentlyContinue
+          $listener = Get-NetTCPConnection `
+            -LocalPort 6080 `
+            -State Listen `
+            -ErrorAction SilentlyContinue
+
+          if (-not $listener) {
+            Get-Content "D:\UE58\Logs\websockify-error.log" `
+              -ErrorAction SilentlyContinue
+
             throw "websockify did not start on port 6080."
           }
 
@@ -173,7 +199,11 @@ jobs:
 
           Start-Process `
             -FilePath $cf `
-            -ArgumentList @("tunnel", "--url", "http://127.0.0.1:6080") `
+            -ArgumentList @(
+              "tunnel",
+              "--url",
+              "http://127.0.0.1:6080"
+            ) `
             -RedirectStandardOutput "D:\UE58\Logs\cloudflared.log" `
             -RedirectStandardError "D:\UE58\Logs\cloudflared-error.log" `
             -WindowStyle Hidden
@@ -183,17 +213,25 @@ jobs:
           for ($i = 0; $i -lt 60; $i++) {
             Start-Sleep -Seconds 2
 
-            $logs = Get-Content "D:\UE58\Logs\cloudflared-error.log" `
+            $logPath = "D:\UE58\Logs\cloudflared-error.log"
+
+            $logs = Get-Content $logPath `
               -ErrorAction SilentlyContinue
 
-            $match = $logs | Select-String -Pattern 'https://[a-zA-Z0-9-]+\.trycloudflare\.com'
+            $match = $logs |
+              Select-String -Pattern 'https://[a-zA-Z0-9-]+\.trycloudflare\.com'
 
             if ($match) {
+              $line = ($match | Select-Object -Last 1).Line
+
               $tunnelUrl = [regex]::Match(
-                ($match | Select-Object -Last 1).Line,
+                $line,
                 'https://[a-zA-Z0-9-]+\.trycloudflare\.com'
               ).Value
-              break
+
+              if ($tunnelUrl) {
+                break
+              }
             }
           }
 
@@ -201,19 +239,21 @@ jobs:
             Write-Host "noVNC URL: $tunnelUrl/vnc.html?autoconnect=true&resize=scale"
           }
           else {
-            Write-Host "Tunnel URL not detected yet. Check cloudflared-error.log."
-            Get-Content "D:\UE58\Logs\cloudflared-error.log" -Tail 30 `
+            Write-Host "Tunnel URL not detected yet."
+            Get-Content "D:\UE58\Logs\cloudflared-error.log" `
+              -Tail 30 `
               -ErrorAction SilentlyContinue
           }
 
       - name: Download Unreal Engine ZIP parts
         shell: pwsh
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           $owner = "forgotenmywin"
           $repo = "Windows_with_no_vnc"
           $tag = "ue5.8"
+
           $api = "https://api.github.com/repos/$owner/$repo/releases/tags/$tag"
 
           $headers = @{
@@ -222,60 +262,145 @@ jobs:
             "X-GitHub-Api-Version" = "2022-11-28"
           }
 
-          $release = Invoke-RestMethod -Uri $api -Headers $headers
+          $release = Invoke-RestMethod `
+            -Uri $api `
+            -Headers $headers
 
-          $expected = @(
-            "UE_5.8.zip.001",
-            "UE_5.8.zip.002",
-            "UE_5.8.zip.003",
-            "UE_5.8.zip.004",
-            "UE_5.8.zip.005",
-            "UE_5.8.zip.006",
-            "UE_5.8.zip.007",
-            "UE_5.8.zip.008"
-          )
+          $names = 1..8 | ForEach-Object {
+            "UE_5.8.zip.{0:D3}" -f $_
+          }
 
-          foreach ($name in $expected) {
+          foreach ($name in $names) {
             $asset = $release.assets |
               Where-Object { $_.name -eq $name } |
               Select-Object -First 1
 
             if ($null -eq $asset) {
-              throw "Release asset missing: $name"
+              throw "Release asset not found: $name"
             }
 
-            $destination = Join-Path "D:\UE58\Parts" $name
+            $destination = "D:\UE58\Parts\$name"
+            $expected = [long]$asset.size
 
-            Write-Host "Downloading $name ($($asset.size) bytes)"
+            Write-Host ""
+            Write-Host "========================================"
+            Write-Host "Asset: $name"
+            Write-Host "Expected size: $expected bytes"
+            Write-Host "========================================"
 
-            curl.exe -L `
-              --fail `
-              --retry 5 `
-              --retry-delay 3 `
-              -H "Authorization: Bearer $env:GH_TOKEN" `
-              -o $destination `
-              $asset.url
+            $success = $false
 
-            if ($LASTEXITCODE -ne 0) {
-              throw "Download failed: $name"
+            # Try the direct release download URL first.
+            for ($attempt = 1; $attempt -le 3; $attempt++) {
+              Remove-Item $destination `
+                -Force `
+                -ErrorAction SilentlyContinue
+
+              Write-Host "Direct download attempt $attempt of 3"
+
+              & curl.exe `
+                -fL `
+                --retry 2 `
+                --retry-delay 3 `
+                --connect-timeout 30 `
+                --max-time 1800 `
+                --output $destination `
+                $asset.browser_download_url
+
+              $curlExit = $LASTEXITCODE
+
+              if (
+                $curlExit -eq 0 -and
+                (Test-Path $destination)
+              ) {
+                $actual = (Get-Item $destination).Length
+
+                if ($actual -eq $expected) {
+                  $success = $true
+                  Write-Host "Direct download verified: $actual bytes"
+                  break
+                }
+
+                Write-Host "Incorrect size: $actual bytes"
+              }
+              else {
+                Write-Host "Direct download failed. curl exit: $curlExit"
+              }
+
+              Remove-Item $destination `
+                -Force `
+                -ErrorAction SilentlyContinue
+
+              Start-Sleep -Seconds 5
             }
 
-            $actualSize = (Get-Item $destination).Length
+            # If direct download failed, use the authenticated GitHub API.
+            if (-not $success) {
+              Write-Host "Trying GitHub API binary download."
 
-            if ($actualSize -ne $asset.size) {
-              throw "Size mismatch for $name. Expected $($asset.size), got $actualSize"
+              $apiDownloadHeaders = @{
+                Authorization = "Bearer $env:GH_TOKEN"
+                Accept = "application/octet-stream"
+                "X-GitHub-Api-Version" = "2022-11-28"
+              }
+
+              for ($attempt = 1; $attempt -le 3; $attempt++) {
+                Remove-Item $destination `
+                  -Force `
+                  -ErrorAction SilentlyContinue
+
+                Write-Host "API download attempt $attempt of 3"
+
+                try {
+                  Invoke-WebRequest `
+                    -Uri $asset.url `
+                    -Headers $apiDownloadHeaders `
+                    -OutFile $destination `
+                    -MaximumRedirection 10 `
+                    -TimeoutSec 1800 `
+                    -ErrorAction Stop
+
+                  if (Test-Path $destination) {
+                    $actual = (Get-Item $destination).Length
+
+                    if ($actual -eq $expected) {
+                      $success = $true
+                      Write-Host "API download verified: $actual bytes"
+                      break
+                    }
+
+                    Write-Host "Incorrect API response size: $actual bytes"
+                  }
+                }
+                catch {
+                  Write-Host "API download error: $($_.Exception.Message)"
+                }
+
+                Remove-Item $destination `
+                  -Force `
+                  -ErrorAction SilentlyContinue
+
+                Start-Sleep -Seconds 5
+              }
             }
 
-            Write-Host "Verified $name : $actualSize bytes"
+            if (-not $success) {
+              throw "Unable to download and verify $name. Check release visibility and asset URL."
+            }
+
+            Write-Host "VERIFIED: $name ($expected bytes)"
           }
+
+          Write-Host "All eight parts downloaded and verified."
 
       - name: Rebuild and test ZIP
         shell: pwsh
         run: |
           $output = "D:\UE58\UE_5.8.zip"
-          if (Test-Path $output) {
-            Remove-Item $output -Force
-          }
+
+          Remove-Item $output `
+            -Force `
+            -ErrorAction SilentlyContinue
 
           $parts = 1..8 | ForEach-Object {
             "D:\UE58\Parts\UE_5.8.zip.{0:D3}" -f $_
@@ -286,10 +411,11 @@ jobs:
           try {
             foreach ($part in $parts) {
               if (-not (Test-Path $part)) {
-                throw "Missing part: $part"
+                throw "Missing ZIP part: $part"
               }
 
               Write-Host "Joining $part"
+
               $inputStream = [System.IO.File]::OpenRead($part)
 
               try {
@@ -304,27 +430,35 @@ jobs:
             $stream.Dispose()
           }
 
-          Write-Host "Rebuilt ZIP size: $((Get-Item $output).Length) bytes"
+          Write-Host "Reconstructed ZIP size: $((Get-Item $output).Length) bytes"
 
-          $sevenZip = @(
+          $sevenZipCandidates = @(
             "$env:ProgramFiles\7-Zip\7z.exe",
             "${env:ProgramFiles(x86)}\7-Zip\7z.exe"
-          ) | Where-Object { Test-Path $_ } | Select-Object -First 1
+          )
+
+          $sevenZip = $sevenZipCandidates |
+            Where-Object { Test-Path $_ } |
+            Select-Object -First 1
 
           if (-not $sevenZip) {
-            $sevenZipInstaller = "D:\UE58\7zip-installer.exe"
+            $installer = "D:\UE58\7zip-installer.exe"
+
             Invoke-WebRequest `
               -Uri "https://www.7-zip.org/a/7z2409-x64.exe" `
-              -OutFile $sevenZipInstaller
+              -OutFile $installer
 
-            Start-Process $sevenZipInstaller `
-              -ArgumentList "/S" -Wait
+            $installProcess = Start-Process `
+              -FilePath $installer `
+              -ArgumentList "/S" `
+              -Wait `
+              -PassThru
 
             $sevenZip = "$env:ProgramFiles\7-Zip\7z.exe"
-          }
 
-          if (-not (Test-Path $sevenZip)) {
-            throw "7-Zip executable not found."
+            if (-not (Test-Path $sevenZip)) {
+              throw "7-Zip installation failed: $($installProcess.ExitCode)"
+            }
           }
 
           & $sevenZip t $output
@@ -342,7 +476,15 @@ jobs:
           $archive = "D:\UE58\UE_5.8.zip"
           $destination = "D:\UE58\Extracted"
 
-          New-Item -ItemType Directory -Force -Path $destination | Out-Null
+          if (-not (Test-Path $archive)) {
+            throw "Archive not found: $archive"
+          }
+
+          New-Item `
+            -ItemType Directory `
+            -Force `
+            -Path $destination |
+            Out-Null
 
           & $sevenZip x $archive "-o$destination" -y
 
@@ -361,14 +503,22 @@ jobs:
         shell: pwsh
         run: |
           Write-Host "Runner keepalive started."
-          Write-Host "Unreal Engine folder: D:\UE58\Extracted"
+          Write-Host "Extraction folder: D:\UE58\Extracted"
 
           while ($true) {
             $now = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
 
-            $vnc = Get-Process -Name "tvnserver" -ErrorAction SilentlyContinue
-            $ws = Get-Process -Name "websockify" -ErrorAction SilentlyContinue
-            $cf = Get-Process -Name "cloudflared" -ErrorAction SilentlyContinue
+            $vnc = Get-Process `
+              -Name "tvnserver" `
+              -ErrorAction SilentlyContinue
+
+            $ws = Get-Process `
+              -Name "websockify" `
+              -ErrorAction SilentlyContinue
+
+            $cf = Get-Process `
+              -Name "cloudflared" `
+              -ErrorAction SilentlyContinue
 
             $vncState = if ($vnc) { "RUNNING" } else { "STOPPED" }
             $wsState = if ($ws) { "RUNNING" } else { "STOPPED" }
