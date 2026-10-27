@@ -236,6 +236,8 @@ jobs:
                       self.reply(200, {
                           "ok": True,
                           "service": "unreal-python-api",
+                          "api_version": "logs-v2-2026-10-27",
+                          "endpoints": ["/health", "/command", "/logs"],
                           "editor_log_configured": bool(LOG_FILE)
                       })
                       return
@@ -402,8 +404,10 @@ jobs:
           start_api()
           '@
 
-          Set-Content "$pythonDir\init_unreal.py" -Value $python -Encoding utf8
-          Write-Host "Python API bridge with /logs endpoint created."
+          $bootstrap = "$pythonDir\init_unreal.py"
+          Set-Content $bootstrap -Value $python -Encoding utf8
+          Write-Host "Python API bridge with /logs endpoint created: $bootstrap"
+          Write-Host "API version: logs-v2-2026-10-27"
 
       - name: Start Unreal and Cloudflare Quick Tunnel
         shell: pwsh
@@ -431,13 +435,18 @@ jobs:
 
           $env:UE_COMMAND_TOKEN = $env:COMMAND_TOKEN
           $env:UE_EDITOR_LOG_FILE = $log
+          $startupScript = "$root\UEControl\Content\Python\init_unreal.py"
+
+          if (!(Test-Path $startupScript)) {
+            throw "Python startup script was not created: $startupScript"
+          }
 
           $editorArgs = @(
             "$root\UEControl\UEControl.uproject",
             '-EnablePlugins=PythonScriptPlugin,EditorScriptingUtilities',
             '-AllowSoftwareRendering',
             '-d3d11',
-            "-log=$log"
+            "-abslog=$log"
           )
 
           $editor = Start-Process `
@@ -522,29 +531,58 @@ jobs:
 
           while ((Get-Date) -lt $readyDeadline) {
             if (!(Get-Process -Id $editor.Id -ErrorAction SilentlyContinue)) {
+              if (Test-Path $log) { Get-Content $log -Tail 160 }
               throw "Unreal Editor stopped before the API became ready."
             }
 
             try {
               $health = Invoke-RestMethod `
                 -Uri 'http://127.0.0.1:8765/health' `
-                -TimeoutSec 2
-              if ($health.ok) {
+                -TimeoutSec 3
+              if ($health.ok -and
+                  $health.service -eq 'unreal-python-api' -and
+                  $health.api_version -eq 'logs-v2-2026-10-27') {
                 $ready = $true
                 break
               }
             }
             catch {}
 
-            Start-Sleep -Seconds 5
+            Start-Sleep -Seconds 3
           }
 
           if (!$ready) {
-            Write-Host "WARNING: API health check did not succeed."
-            if (Test-Path $log) { Get-Content $log -Tail 120 }
+            Write-Host "ERROR: Local Unreal Python API health check failed."
+            if (Test-Path $log) { Get-Content $log -Tail 160 }
+            throw "Python API did not start. Check init_unreal.py startup errors in the Unreal log."
+          }
+
+          Write-Host "Local Unreal Python API is ready."
+
+          $publicReady = $false
+          $publicDeadline = (Get-Date).AddMinutes(2)
+          while ((Get-Date) -lt $publicDeadline) {
+            try {
+              $publicHealth = Invoke-RestMethod `
+                -Uri "$url/health" `
+                -TimeoutSec 10
+              if ($publicHealth.ok -and
+                  $publicHealth.service -eq 'unreal-python-api' -and
+                  $publicHealth.api_version -eq 'logs-v2-2026-10-27') {
+                $publicReady = $true
+                break
+              }
+            }
+            catch {}
+            Start-Sleep -Seconds 4
+          }
+
+          if (!$publicReady) {
+            Write-Host "WARNING: Local API works, but public tunnel health check failed."
+            if (Test-Path $tunnelLog) { Get-Content $tunnelLog -Tail 80 }
           }
           else {
-            Write-Host "Unreal Python API is ready."
+            Write-Host "PUBLIC API HEALTH CHECK PASSED."
           }
 
           while (
