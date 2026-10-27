@@ -36,7 +36,8 @@ jobs:
             -Name "fDenyTSConnections" `
             -Value 0
 
-          Enable-NetFirewallRule -DisplayGroup "Remote Desktop" `
+          Enable-NetFirewallRule `
+            -DisplayGroup "Remote Desktop" `
             -ErrorAction SilentlyContinue
 
           $securePassword = ConvertTo-SecureString `
@@ -45,7 +46,11 @@ jobs:
           $user = Get-LocalUser -Name "runneradmin" `
             -ErrorAction SilentlyContinue
 
-          if ($null -eq $user) {
+          if ($null -ne $user) {
+            Set-LocalUser -Name "runneradmin" -Password $securePassword
+            $rdpUser = "runneradmin"
+          }
+          else {
             $user = Get-LocalUser -Name "ueadmin" `
               -ErrorAction SilentlyContinue
 
@@ -63,13 +68,16 @@ jobs:
               -Group "Administrators" `
               -Member "ueadmin" `
               -ErrorAction SilentlyContinue
-          }
-          else {
-            Set-LocalUser -Name "runneradmin" -Password $securePassword
+
+            $rdpUser = "ueadmin"
           }
 
+          "RDP_USER=$rdpUser" |
+            Set-Content "D:\UE58\Logs\rdp-user.txt"
+
           Restart-Service -Name TermService -Force
-          Write-Host "RDP configured."
+
+          Write-Host "RDP configured. Username: $rdpUser"
 
       - name: Install TightVNC
         shell: pwsh
@@ -85,14 +93,26 @@ jobs:
           }
 
           $installer = "D:\UE58\tightvnc-installer.msi"
-          $url = "https://www.tightvnc.com/download/2.8.85/tightvnc-2.8.85-gpl-setup-64bit.msi"
+          $urls = @(
+            "https://www.tightvnc.com/download/2.8.85/tightvnc-2.8.85-gpl-setup-64bit.msi",
+            "https://www.tightvnc.com/download/2.8.81/tightvnc-2.8.81-gpl-setup-64bit.msi"
+          )
 
-          try {
-            Invoke-WebRequest -Uri $url -OutFile $installer
+          $downloaded = $false
+
+          foreach ($url in $urls) {
+            try {
+              Invoke-WebRequest -Uri $url -OutFile $installer
+              $downloaded = $true
+              break
+            }
+            catch {
+              Write-Host "Download failed: $url"
+            }
           }
-          catch {
-            $url = "https://www.tightvnc.com/download/2.8.81/tightvnc-2.8.81-gpl-setup-64bit.msi"
-            Invoke-WebRequest -Uri $url -OutFile $installer
+
+          if (-not $downloaded) {
+            throw "Could not download the TightVNC installer."
           }
 
           $arguments = @(
@@ -109,7 +129,8 @@ jobs:
             "VALUE_OF_PASSWORD=$($env:VNC_PASSWORD)"
           ) -join " "
 
-          $process = Start-Process msiexec.exe `
+          $process = Start-Process `
+            -FilePath "msiexec.exe" `
             -ArgumentList $arguments `
             -Wait `
             -PassThru
@@ -118,126 +139,14 @@ jobs:
             throw "TightVNC installation failed: $($process.ExitCode)"
           }
 
+          Set-Service -Name tvnserver -StartupType Automatic `
+            -ErrorAction SilentlyContinue
+
           Start-Service -Name tvnserver -ErrorAction SilentlyContinue
           Start-Sleep -Seconds 5
 
           Get-Service -Name tvnserver -ErrorAction SilentlyContinue |
             Format-Table -AutoSize
-
-      - name: Install noVNC and websockify
-        shell: pwsh
-        run: |
-          $noVncDir = "D:\UE58\noVNC"
-
-          New-Item -ItemType Directory -Force -Path $noVncDir | Out-Null
-
-          $zip = "D:\UE58\novnc.zip"
-
-          Invoke-WebRequest `
-            -Uri "https://github.com/novnc/noVNC/archive/refs/tags/v1.6.0.zip" `
-            -OutFile $zip
-
-          Expand-Archive -Path $zip -DestinationPath "D:\UE58" -Force
-
-          $sourceDir = "D:\UE58\noVNC-1.6.0"
-
-          if (Test-Path $sourceDir) {
-            Copy-Item "$sourceDir\*" $noVncDir -Recurse -Force
-          }
-          else {
-            throw "noVNC source folder was not found."
-          }
-
-          py -m pip install --upgrade pip
-          if ($LASTEXITCODE -ne 0) {
-            throw "pip upgrade failed."
-          }
-
-          py -m pip install websockify
-          if ($LASTEXITCODE -ne 0) {
-            throw "websockify installation failed."
-          }
-
-          $scripts = (py -c "import sysconfig; print(sysconfig.get_path('scripts'))").Trim()
-          $websockify = Join-Path $scripts "websockify.exe"
-
-          if (-not (Test-Path $websockify)) {
-            throw "websockify.exe not found: $websockify"
-          }
-
-          Start-Process `
-            -FilePath $websockify `
-            -ArgumentList @(
-              "--web", $noVncDir,
-              "6080",
-              "127.0.0.1:5900"
-            ) `
-            -RedirectStandardOutput "D:\UE58\Logs\websockify.log" `
-            -RedirectStandardError "D:\UE58\Logs\websockify-error.log" `
-            -WindowStyle Hidden
-
-          Start-Sleep -Seconds 5
-
-          if (-not (Get-NetTCPConnection -LocalPort 6080 -State Listen -ErrorAction SilentlyContinue)) {
-            Get-Content "D:\UE58\Logs\websockify-error.log" `
-              -ErrorAction SilentlyContinue
-            throw "websockify did not start on port 6080."
-          }
-
-          Write-Host "noVNC and websockify started."
-
-      - name: Start temporary Cloudflare tunnel
-        shell: pwsh
-        run: |
-          $cf = "D:\UE58\cloudflared.exe"
-
-          Invoke-WebRequest `
-            -Uri "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe" `
-            -OutFile $cf
-
-          Start-Process `
-            -FilePath $cf `
-            -ArgumentList @(
-              "tunnel",
-              "--url",
-              "http://127.0.0.1:6080"
-            ) `
-            -RedirectStandardOutput "D:\UE58\Logs\cloudflared.log" `
-            -RedirectStandardError "D:\UE58\Logs\cloudflared-error.log" `
-            -WindowStyle Hidden
-
-          $tunnelUrl = $null
-
-          for ($i = 0; $i -lt 60; $i++) {
-            Start-Sleep -Seconds 2
-
-            $logs = Get-Content "D:\UE58\Logs\cloudflared-error.log" `
-              -ErrorAction SilentlyContinue
-
-            $match = $logs | Select-String `
-              -Pattern 'https://[a-zA-Z0-9-]+\.trycloudflare\.com'
-
-            if ($match) {
-              $tunnelUrl = [regex]::Match(
-                ($match | Select-Object -Last 1).Line,
-                'https://[a-zA-Z0-9-]+\.trycloudflare\.com'
-              ).Value
-
-              break
-            }
-          }
-
-          if ($tunnelUrl) {
-            $url = "$tunnelUrl/vnc.html?autoconnect=true&resize=scale"
-            Write-Host "=========================================="
-            Write-Host "noVNC URL: $url"
-            Write-Host "=========================================="
-          }
-          else {
-            Write-Host "Tunnel URL was not detected."
-            Get-Content "D:\UE58\Logs\cloudflared-error.log" `
-              -Tail 50 -ErrorAction SilentlyContinue
-          }
 
       - name: Download Unreal Engine ZIP parts
         shell: pwsh
@@ -287,6 +196,7 @@ jobs:
               --retry 5 `
               --retry-delay 3 `
               -H "Authorization: Bearer $env:GH_TOKEN" `
+              -H "Accept: application/octet-stream" `
               -o $destination `
               $asset.url
 
@@ -325,7 +235,6 @@ jobs:
               }
 
               Write-Host "Joining $part"
-
               $inputStream = [System.IO.File]::OpenRead($part)
 
               try {
@@ -350,13 +259,16 @@ jobs:
             Select-Object -First 1
 
           if (-not $sevenZip) {
-            $sevenZipInstaller = "D:\UE58\7zip-installer.exe"
+            $installer = "D:\UE58\7zip-installer.exe"
 
             Invoke-WebRequest `
               -Uri "https://www.7-zip.org/a/7z2409-x64.exe" `
-              -OutFile $sevenZipInstaller
+              -OutFile $installer
 
-            Start-Process $sevenZipInstaller -ArgumentList "/S" -Wait
+            Start-Process `
+              -FilePath $installer `
+              -ArgumentList "/S" `
+              -Wait
 
             $sevenZip = "$env:ProgramFiles\7-Zip\7z.exe"
           }
@@ -371,12 +283,17 @@ jobs:
             throw "ZIP integrity test failed."
           }
 
+          "SEVENZIP=$sevenZip" |
+            Set-Content "D:\UE58\Logs\sevenzip.txt"
+
           Write-Host "ZIP integrity test passed."
 
       - name: Extract Unreal Engine
         shell: pwsh
         run: |
-          $sevenZip = "$env:ProgramFiles\7-Zip\7z.exe"
+          $sevenZip = Get-Content "D:\UE58\Logs\sevenzip.txt" |
+            ForEach-Object { $_ -replace '^SEVENZIP=', '' }
+
           $archive = "D:\UE58\UE_5.8.zip"
           $destination = "D:\UE58\Extracted"
 
@@ -394,9 +311,18 @@ jobs:
             Select-Object Name, FullName |
             Format-Table -AutoSize
 
-      - name: Start Unreal Engine and record PID
+      - name: Start Unreal Engine
+        if: always()
+        continue-on-error: true
         shell: pwsh
         run: |
+          $pidFile = "D:\UE58\Logs\unreal-process.txt"
+          $engineLog = "D:\UE58\Logs\unreal-headless.log"
+          $stdoutLog = "D:\UE58\Logs\stdout.log"
+          $stderrLog = "D:\UE58\Logs\stderr.log"
+
+          "PID=0" | Set-Content $pidFile
+
           $root = "D:\UE58\Extracted"
 
           $engineFile = Get-ChildItem `
@@ -418,75 +344,256 @@ jobs:
           }
 
           if (-not $engineFile) {
-            throw "UnrealEditor executable was not found under $root"
+            Write-Host "Unreal executable was not found."
+            Get-ChildItem $root -Force -ErrorAction SilentlyContinue |
+              Select-Object Name, FullName |
+              Format-Table -AutoSize
+            exit 0
           }
 
           Write-Host "Engine executable: $engineFile"
 
-          $engineLog = "D:\UE58\Logs\unreal-headless.log"
-          $stdoutLog = "D:\UE58\Logs\stdout.log"
-          $stderrLog = "D:\UE58\Logs\stderr.log"
-          $pidFile = "D:\UE58\Logs\unreal-process.txt"
+          try {
+            $engine = Start-Process `
+              -FilePath $engineFile `
+              -ArgumentList @(
+                "-nullrhi",
+                "-unattended",
+                "-nop4",
+                "-nosplash",
+                "-stdout",
+                "-FullStdOutLogOutput",
+                "-log=$engineLog"
+              ) `
+              -RedirectStandardOutput $stdoutLog `
+              -RedirectStandardError $stderrLog `
+              -PassThru `
+              -WindowStyle Hidden
 
-          $engine = Start-Process `
-            -FilePath $engineFile `
-            -ArgumentList @(
-              "-nullrhi",
-              "-unattended",
-              "-nop4",
-              "-nosplash",
-              "-stdout",
-              "-FullStdOutLogOutput",
-              "-log=$engineLog"
-            ) `
-            -RedirectStandardOutput $stdoutLog `
-            -RedirectStandardError $stderrLog `
-            -PassThru `
-            -WindowStyle Hidden
+            "PID=$($engine.Id)" | Set-Content $pidFile
 
-          "PID=$($engine.Id)" | Set-Content $pidFile
+            Write-Host "Started Unreal process PID=$($engine.Id)"
+            Start-Sleep -Seconds 30
 
-          Write-Host "Started Unreal process PID=$($engine.Id)"
-          Start-Sleep -Seconds 30
-
-          $stillRunning = Get-Process -Id $engine.Id -ErrorAction SilentlyContinue
-
-          if ($stillRunning) {
-            Write-Host "Unreal process is still running after 30 seconds."
+            if (Get-Process -Id $engine.Id -ErrorAction SilentlyContinue) {
+              Write-Host "Unreal process is still running."
+            }
+            else {
+              Write-Host "Unreal exited during startup."
+              Get-Content $engineLog -Tail 100 -ErrorAction SilentlyContinue
+              Get-Content $stdoutLog -Tail 50 -ErrorAction SilentlyContinue
+              Get-Content $stderrLog -Tail 50 -ErrorAction SilentlyContinue
+            }
           }
-          else {
-            Write-Host "Unreal exited during startup. Recent logs:"
-            Get-Content $engineLog -Tail 100 -ErrorAction SilentlyContinue
-            Get-Content $stdoutLog -Tail 50 -ErrorAction SilentlyContinue
-            Get-Content $stderrLog -Tail 50 -ErrorAction SilentlyContinue
+          catch {
+            Write-Host "Failed to start Unreal: $_"
+            $_ | Out-String |
+              Set-Content "D:\UE58\Logs\unreal-start-error.log"
           }
 
-      - name: Keep runner alive and monitor Unreal
+      - name: Start noVNC and Cloudflare; keep runner alive
         if: always()
         shell: pwsh
         run: |
-          Write-Host "Runner keepalive started."
-          Write-Host "Engine directory: D:\UE58\Extracted"
+          $logDir = "D:\UE58\Logs"
+          $noVncDir = "D:\UE58\noVNC"
+          $pidFile = "$logDir\unreal-process.txt"
+          $engineLog = "$logDir\unreal-headless.log"
+          $stdoutLog = "$logDir\stdout.log"
+          $stderrLog = "$logDir\stderr.log"
 
-          $pidFile = "D:\UE58\Logs\unreal-process.txt"
-          $engineLog = "D:\UE58\Logs\unreal-headless.log"
-          $stdoutLog = "D:\UE58\Logs\stdout.log"
-          $stderrLog = "D:\UE58\Logs\stderr.log"
+          New-Item -ItemType Directory -Force -Path $logDir | Out-Null
+
+          Write-Host "Preparing noVNC..."
+
+          if (-not (Test-Path "$noVncDir\vnc.html")) {
+            $zip = "D:\UE58\novnc.zip"
+
+            Invoke-WebRequest `
+              -Uri "https://github.com/novnc/noVNC/archive/refs/tags/v1.6.0.zip" `
+              -OutFile $zip
+
+            Expand-Archive -Path $zip -DestinationPath "D:\UE58" -Force
+
+            $sourceDir = "D:\UE58\noVNC-1.6.0"
+
+            if (Test-Path $sourceDir) {
+              New-Item -ItemType Directory -Force -Path $noVncDir | Out-Null
+              Copy-Item "$sourceDir\*" $noVncDir -Recurse -Force
+            }
+          }
+
+          if (-not (Test-Path "$noVncDir\vnc.html")) {
+            throw "noVNC files are missing."
+          }
+
+          Write-Host "Installing/checking websockify..."
+
+          py -m pip install websockify
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "websockify installation failed."
+          }
+
+          $scripts = (py -c "import sysconfig; print(sysconfig.get_path('scripts'))").Trim()
+          $websockify = Join-Path $scripts "websockify.exe"
+
+          if (-not (Test-Path $websockify)) {
+            throw "websockify executable not found: $websockify"
+          }
+
+          Start-Service -Name tvnserver -ErrorAction SilentlyContinue
+          Start-Sleep -Seconds 3
+
+          $vncPort = Get-NetTCPConnection `
+            -LocalPort 5900 `
+            -State Listen `
+            -ErrorAction SilentlyContinue
+
+          if (-not $vncPort) {
+            Write-Host "WARNING: Nothing is listening on VNC port 5900."
+            Get-Service tvnserver -ErrorAction SilentlyContinue |
+              Format-Table -AutoSize
+          }
+
+          $wsProcess = Start-Process `
+            -FilePath $websockify `
+            -ArgumentList @(
+              "--web", $noVncDir,
+              "6080",
+              "127.0.0.1:5900"
+            ) `
+            -RedirectStandardOutput "$logDir\websockify.log" `
+            -RedirectStandardError "$logDir\websockify-error.log" `
+            -PassThru `
+            -WindowStyle Hidden
+
+          "PID=$($wsProcess.Id)" |
+            Set-Content "$logDir\websockify-process.txt"
+
+          $websockifyReady = $false
+
+          for ($i = 0; $i -lt 20; $i++) {
+            Start-Sleep -Seconds 1
+
+            if (Get-NetTCPConnection `
+              -LocalPort 6080 `
+              -State Listen `
+              -ErrorAction SilentlyContinue) {
+              $websockifyReady = $true
+              break
+            }
+          }
+
+          if ($websockifyReady) {
+            Write-Host "Websockify is listening on port 6080."
+          }
+          else {
+            Write-Host "WARNING: Websockify is not listening on port 6080."
+            Get-Content "$logDir\websockify-error.log" `
+              -Tail 80 -ErrorAction SilentlyContinue
+          }
+
+          Write-Host "Starting temporary Cloudflare tunnel..."
+
+          $cf = "D:\UE58\cloudflared.exe"
+
+          Invoke-WebRequest `
+            -Uri "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe" `
+            -OutFile $cf
+
+          $cfProcess = Start-Process `
+            -FilePath $cf `
+            -ArgumentList @(
+              "tunnel",
+              "--no-autoupdate",
+              "--url",
+              "http://127.0.0.1:6080"
+            ) `
+            -RedirectStandardOutput "$logDir\cloudflared.log" `
+            -RedirectStandardError "$logDir\cloudflared-error.log" `
+            -PassThru `
+            -WindowStyle Hidden
+
+          "PID=$($cfProcess.Id)" |
+            Set-Content "$logDir\cloudflared-process.txt"
+
+          $tunnelUrl = $null
+
+          for ($i = 0; $i -lt 60; $i++) {
+            Start-Sleep -Seconds 2
+
+            $cfLogs = @()
+
+            $cfLogs += Get-Content "$logDir\cloudflared.log" `
+              -ErrorAction SilentlyContinue
+
+            $cfLogs += Get-Content "$logDir\cloudflared-error.log" `
+              -ErrorAction SilentlyContinue
+
+            $match = $cfLogs |
+              Select-String -Pattern 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' |
+              Select-Object -Last 1
+
+            if ($match) {
+              $found = [regex]::Match(
+                $match.Line,
+                'https://[a-zA-Z0-9-]+\.trycloudflare\.com'
+              )
+
+              if ($found.Success) {
+                $tunnelUrl = $found.Value
+                break
+              }
+            }
+
+            if (-not (Get-Process -Id $cfProcess.Id -ErrorAction SilentlyContinue)) {
+              Write-Host "WARNING: cloudflared exited during startup."
+              break
+            }
+          }
+
+          if ($tunnelUrl) {
+            $url = "$tunnelUrl/vnc.html?autoconnect=true&resize=scale"
+
+            Write-Host "=============================================="
+            Write-Host "OPEN THIS noVNC URL:"
+            Write-Host $url
+            Write-Host "=============================================="
+
+            $url | Set-Content "$logDir\novnc-url.txt"
+          }
+          else {
+            Write-Host "Tunnel URL was not detected."
+            Get-Content "$logDir\cloudflared.log" `
+              -Tail 80 -ErrorAction SilentlyContinue
+            Get-Content "$logDir\cloudflared-error.log" `
+              -Tail 80 -ErrorAction SilentlyContinue
+          }
+
+          Write-Host "Monitor started. Runner will stay active until timeout."
 
           $exitReported = $false
+          $urlReported = [bool]$tunnelUrl
 
           while ($true) {
             Start-Sleep -Seconds 30
 
             $now = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
 
-            $vnc = Get-Process -Name "tvnserver" -ErrorAction SilentlyContinue
-            $ws = Get-Process -Name "websockify" -ErrorAction SilentlyContinue
-            $cf = Get-Process -Name "cloudflared" -ErrorAction SilentlyContinue
+            $vncPort = [bool](Get-NetTCPConnection `
+              -LocalPort 5900 `
+              -State Listen `
+              -ErrorAction SilentlyContinue)
 
-            $vncState = if ($vnc) { "RUNNING" } else { "STOPPED" }
-            $wsState = if ($ws) { "RUNNING" } else { "STOPPED" }
-            $cfState = if ($cf) { "RUNNING" } else { "STOPPED" }
+            $webPort = [bool](Get-NetTCPConnection `
+              -LocalPort 6080 `
+              -State Listen `
+              -ErrorAction SilentlyContinue)
+
+            $cfAlive = [bool](Get-Process `
+              -Id $cfProcess.Id `
+              -ErrorAction SilentlyContinue)
 
             $engineState = "UNKNOWN"
             $enginePid = 0
@@ -496,32 +603,82 @@ jobs:
             if ($pidLine -match "PID=(\d+)") {
               $enginePid = [int]$Matches[1]
 
-              $engineProcess = Get-Process `
-                -Id $enginePid `
-                -ErrorAction SilentlyContinue
-
-              if ($engineProcess) {
-                $engineState = "RUNNING"
+              if ($enginePid -gt 0) {
+                $engineState = if (
+                  Get-Process -Id $enginePid -ErrorAction SilentlyContinue
+                ) {
+                  "RUNNING"
+                }
+                else {
+                  "STOPPED"
+                }
               }
               else {
-                $engineState = "STOPPED"
+                $engineState = "NOT_STARTED"
               }
             }
 
-            Write-Host "[$now] ACTIVE | Unreal=$engineState | VNC=$vncState | Websockify=$wsState | Cloudflare=$cfState"
+            Write-Host "[$now] Unreal=$engineState | VNC5900=$vncPort | Websockify6080=$webPort | Cloudflare=$cfAlive"
 
-            if ($engineState -eq "STOPPED" -and -not $exitReported) {
+            if (-not $urlReported) {
+              $cfLogs = @()
+              $cfLogs += Get-Content "$logDir\cloudflared.log" `
+                -ErrorAction SilentlyContinue
+              $cfLogs += Get-Content "$logDir\cloudflared-error.log" `
+                -ErrorAction SilentlyContinue
+
+              $match = $cfLogs |
+                Select-String -Pattern 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' |
+                Select-Object -Last 1
+
+              if ($match) {
+                $found = [regex]::Match(
+                  $match.Line,
+                  'https://[a-zA-Z0-9-]+\.trycloudflare\.com'
+                )
+
+                if ($found.Success) {
+                  $url = "$($found.Value)/vnc.html?autoconnect=true&resize=scale"
+
+                  Write-Host "noVNC URL: $url"
+                  $url | Set-Content "$logDir\novnc-url.txt"
+                  $urlReported = $true
+                }
+              }
+            }
+
+            if (
+              ($engineState -eq "STOPPED" -or $engineState -eq "NOT_STARTED") `
+              -and -not $exitReported
+            ) {
               $exitReported = $true
 
-              Write-Host "========== UNREAL EXITED: ENGINE LOG =========="
-              Get-Content $engineLog -Tail 200 -ErrorAction SilentlyContinue
+              Write-Host "========== UNREAL STATUS/LOGS =========="
+              Get-Content "$logDir\unreal-start-error.log" `
+                -Tail 80 -ErrorAction SilentlyContinue
+              Get-Content $engineLog -Tail 200 `
+                -ErrorAction SilentlyContinue
 
               Write-Host "========== STDOUT =========="
-              Get-Content $stdoutLog -Tail 100 -ErrorAction SilentlyContinue
+              Get-Content $stdoutLog -Tail 100 `
+                -ErrorAction SilentlyContinue
 
               Write-Host "========== STDERR =========="
-              Get-Content $stderrLog -Tail 100 -ErrorAction SilentlyContinue
+              Get-Content $stderrLog -Tail 100 `
+                -ErrorAction SilentlyContinue
 
-              Write-Host "========== END OF ENGINE LOGS =========="
+              Write-Host "========== END ENGINE LOGS =========="
+            }
+
+            if (-not $webPort) {
+              Write-Host "WARNING: Port 6080 is no longer listening."
+              Get-Content "$logDir\websockify-error.log" `
+                -Tail 30 -ErrorAction SilentlyContinue
+            }
+
+            if (-not $cfAlive) {
+              Write-Host "WARNING: Cloudflare process has stopped."
+              Get-Content "$logDir\cloudflared-error.log" `
+                -Tail 30 -ErrorAction SilentlyContinue
             }
           }
