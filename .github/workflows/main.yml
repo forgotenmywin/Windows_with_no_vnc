@@ -24,8 +24,8 @@ jobs:
         env:
           RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
         run: |
-          if (-not $env:RDP_PASSWORD) {
-            throw "Configure the RDP_PASSWORD secret."
+          if ([string]::IsNullOrWhiteSpace($env:RDP_PASSWORD)) {
+            throw "Configure the RDP_PASSWORD repository secret."
           }
 
           $secure = ConvertTo-SecureString $env:RDP_PASSWORD -AsPlainText -Force
@@ -34,19 +34,16 @@ jobs:
 
           if ($user) {
             Set-LocalUser -Name "runneradmin" -Password $secure
-            $username = "runneradmin"
           } else {
             $user = Get-LocalUser -Name "ueadmin" -ErrorAction SilentlyContinue
+
             if (-not $user) {
               New-LocalUser -Name "ueadmin" -Password $secure -PasswordNeverExpires
               Add-LocalGroupMember -Group "Administrators" -Member "ueadmin"
             } else {
               Set-LocalUser -Name "ueadmin" -Password $secure
             }
-            $username = "ueadmin"
           }
-
-          Write-Host "RDP user configured: $username"
 
           Set-ItemProperty `
             -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server" `
@@ -63,8 +60,8 @@ jobs:
         env:
           VNC_PASSWORD: ${{ secrets.VNC_PASSWORD }}
         run: |
-          if (-not $env:VNC_PASSWORD) {
-            throw "Configure the VNC_PASSWORD secret."
+          if ([string]::IsNullOrWhiteSpace($env:VNC_PASSWORD)) {
+            throw "Configure the VNC_PASSWORD repository secret."
           }
 
           if ($env:VNC_PASSWORD.Length -lt 6) {
@@ -78,8 +75,7 @@ jobs:
             -OutFile $installer
 
           $arguments = @(
-            "/i", $installer,
-            "/qn", "/norestart",
+            "/i", $installer, "/qn", "/norestart",
             "ADDLOCAL=Server",
             "SERVER_REGISTER_AS_SERVICE=1",
             "SERVER_ADD_FIREWALL_EXCEPTION=1",
@@ -109,6 +105,7 @@ jobs:
           $owner = "forgotenmywin"
           $repo = "Windows_with_no_vnc"
           $tag = "ue5.8"
+
           $headers = @{
             Authorization = "Bearer $env:GH_TOKEN"
             Accept = "application/vnd.github+json"
@@ -121,6 +118,7 @@ jobs:
 
           for ($i = 1; $i -le 8; $i++) {
             $name = "UE_5.8.zip.{0:D3}" -f $i
+
             $asset = $release.assets |
               Where-Object { $_.name -eq $name } |
               Select-Object -First 1
@@ -138,6 +136,7 @@ jobs:
               -OutFile $destination
 
             $actual = (Get-Item $destination).Length
+
             if ($actual -ne $asset.size) {
               throw "Size mismatch for $name. Expected $($asset.size), got $actual"
             }
@@ -147,11 +146,15 @@ jobs:
         shell: pwsh
         run: |
           $zip = "D:\UE58\UE_5.8.zip"
+
           if (Test-Path $zip) {
             Remove-Item $zip -Force
           }
 
-          $output = [System.IO.File]::OpenWrite($zip)
+          $output = [System.IO.File]::Open(
+            $zip,
+            [System.IO.FileMode]::CreateNew
+          )
 
           try {
             for ($i = 1; $i -le 8; $i++) {
@@ -159,10 +162,11 @@ jobs:
               $path = "D:\UE58\Parts\$name"
 
               if (-not (Test-Path $path)) {
-                throw "Missing part: $name"
+                throw "Missing ZIP part: $name"
               }
 
               $input = [System.IO.File]::OpenRead($path)
+
               try {
                 $input.CopyTo($output)
               } finally {
@@ -173,48 +177,54 @@ jobs:
             $output.Dispose()
           }
 
-          Write-Host "Joined ZIP size: $((Get-Item $zip).Length) bytes"
+          Write-Host "Combined ZIP size: $((Get-Item $zip).Length) bytes"
 
       - name: Install 7-Zip and test archive
         shell: pwsh
         run: |
-          $sevenZip = "C:\Program Files\7-Zip\7z.exe"
+          $sevenZip = @(
+            "C:\Program Files\7-Zip\7z.exe",
+            "C:\Program Files (x86)\7-Zip\7z.exe"
+          ) | Where-Object { Test-Path $_ } | Select-Object -First 1
 
-          if (-not (Test-Path $sevenZip)) {
-            winget install --id 7zip.7zip `
-              --exact --silent `
-              --accept-package-agreements `
-              --accept-source-agreements
+          if (-not $sevenZip) {
+            $installer = "D:\UE58\7zip-installer.exe"
 
-            $candidates = @(
+            Invoke-WebRequest `
+              "https://www.7-zip.org/a/7zr.exe" `
+              -OutFile "D:\UE58\7zr.exe"
+
+            # Try installing through winget on the hosted runner.
+            winget install --id 7zip.7zip --exact --silent `
+              --accept-package-agreements --accept-source-agreements
+
+            $sevenZip = @(
               "C:\Program Files\7-Zip\7z.exe",
               "C:\Program Files (x86)\7-Zip\7z.exe"
-            )
-
-            $sevenZip = $candidates |
-              Where-Object { Test-Path $_ } |
-              Select-Object -First 1
+            ) | Where-Object { Test-Path $_ } | Select-Object -First 1
           }
 
           if (-not $sevenZip) {
-            throw "7-Zip executable not found."
+            throw "7-Zip was not found. Install 7-Zip before extracting."
           }
 
           $sevenZip | Set-Content D:\UE58\Logs\7zip-path.txt
 
           & $sevenZip t "D:\UE58\UE_5.8.zip"
+
           if ($LASTEXITCODE -ne 0) {
-            throw "Archive integrity test failed."
+            throw "ZIP integrity test failed."
           }
 
       - name: Extract Unreal Engine
         shell: pwsh
         run: |
-          $sevenZip = Get-Content D:\UE58\Logs\7zip-path.txt
+          $sevenZip = (Get-Content D:\UE58\Logs\7zip-path.txt).Trim()
           $zip = "D:\UE58\UE_5.8.zip"
           $destination = "D:\UE58\Extracted"
 
           & $sevenZip x $zip "-o$destination" -y
+
           if ($LASTEXITCODE -ne 0) {
             throw "Unreal extraction failed."
           }
@@ -257,16 +267,18 @@ jobs:
           $process.Refresh()
 
           if ($process.HasExited) {
-            Write-Host "Unreal exited with code $($process.ExitCode)"
+            Write-Host "Unreal exit code: $($process.ExitCode)"
+
             Get-Content $logFile -Tail 200 `
               -ErrorAction SilentlyContinue
+
             throw "Unreal exited during startup."
           }
 
           "PID=$($process.Id)" |
             Set-Content D:\UE58\Logs\unreal-process.txt
 
-          Write-Host "Unreal process started. PID=$($process.Id)"
+          Write-Host "Unreal started. PID=$($process.Id)"
 
       - name: Start noVNC
         shell: pwsh
@@ -274,10 +286,19 @@ jobs:
           $noVncDir = "D:\UE58\noVNC"
 
           if (-not (Test-Path "$noVncDir\vnc.html")) {
-            git clone --depth 1 https://github.com/novnc/noVNC.git $noVncDir
+            git clone --depth 1 `
+              https://github.com/novnc/noVNC.git $noVncDir
+
+            if ($LASTEXITCODE -ne 0) {
+              throw "Could not download noVNC."
+            }
           }
 
           python -m pip install websockify
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "websockify installation failed."
+          }
 
           $python = (Get-Command python).Source
 
@@ -295,11 +316,15 @@ jobs:
           Write-Host "noVNC websockify started on port 6080."
 
       - name: Start Cloudflare Tunnel (optional)
-        if: ${{ secrets.CF_TUNNEL_TOKEN != '' }}
         shell: pwsh
         env:
           CF_TUNNEL_TOKEN: ${{ secrets.CF_TUNNEL_TOKEN }}
         run: |
+          if ([string]::IsNullOrWhiteSpace($env:CF_TUNNEL_TOKEN)) {
+            Write-Host "CF_TUNNEL_TOKEN not configured; tunnel skipped."
+            exit 0
+          }
+
           $cloudflared = "D:\UE58\cloudflared.exe"
 
           Invoke-WebRequest `
@@ -308,7 +333,10 @@ jobs:
 
           Start-Process `
             -FilePath $cloudflared `
-            -ArgumentList @("tunnel", "--no-autoupdate", "run", "--token", $env:CF_TUNNEL_TOKEN) `
+            -ArgumentList @(
+              "tunnel", "--no-autoupdate", "run",
+              "--token", $env:CF_TUNNEL_TOKEN
+            ) `
             -RedirectStandardOutput "D:\UE58\Logs\cloudflared.log" `
             -RedirectStandardError "D:\UE58\Logs\cloudflared-error.log"
 
@@ -318,31 +346,35 @@ jobs:
         shell: pwsh
         run: |
           $logFile = "D:\UE58\Logs\unreal-headless.log"
-          $exitReported = $false
+          $reported = $false
 
           while ($true) {
             Start-Sleep -Seconds 30
 
-            $process = Get-Content D:\UE58\Logs\unreal-process.txt `
+            $pidLine = Get-Content `
+              "D:\UE58\Logs\unreal-process.txt" `
               -ErrorAction SilentlyContinue
 
             $pidValue = 0
-            if ($process -match 'PID=(\d+)') {
+
+            if ($pidLine -match 'PID=(\d+)') {
               $pidValue = [int]$Matches[1]
             }
 
             $engine = Get-Process -Id $pidValue `
               -ErrorAction SilentlyContinue
 
-            if (-not $engine -and -not $exitReported) {
-              $exitReported = $true
-              Write-Host "Unreal has exited. Recent log output:"
+            if (-not $engine -and -not $reported) {
+              $reported = $true
+
+              Write-Host "Unreal has exited. Recent logs:"
               Get-Content $logFile -Tail 200 `
                 -ErrorAction SilentlyContinue
-              Write-Host "Unreal is not being restarted automatically."
+
+              Write-Host "Unreal will not be restarted automatically."
             }
 
-            Write-Host "Runner is alive: $(Get-Date -Format o)"
+            Write-Host "Runner alive: $(Get-Date -Format o)"
           }
 
       - name: Upload diagnostic logs
