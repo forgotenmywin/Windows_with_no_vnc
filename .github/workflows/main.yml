@@ -1,5 +1,4 @@
-
-name: Unreal Engine 5.8 - Windows RDP + noVNC
+name: Unreal Engine 5.8 - Windows noVNC Headless
 
 on:
   workflow_dispatch:
@@ -8,539 +7,298 @@ permissions:
   contents: read
 
 jobs:
-  unreal-engine:
+  unreal:
     runs-on: windows-latest
     timeout-minutes: 360
 
     steps:
-      - name: Prepare folders
+      - name: Prepare directories
         shell: pwsh
         run: |
-          New-Item -ItemType Directory -Force -Path `
-            "D:\UE58\Parts", `
-            "D:\UE58\Extracted", `
-            "D:\UE58\Logs" | Out-Null
-
-          Write-Host "Folders ready."
+          New-Item -ItemType Directory -Force D:\UE58\Parts | Out-Null
+          New-Item -ItemType Directory -Force D:\UE58\Extracted | Out-Null
+          New-Item -ItemType Directory -Force D:\UE58\Logs | Out-Null
 
       - name: Configure RDP
         shell: pwsh
         env:
           RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
         run: |
-          if ([string]::IsNullOrWhiteSpace($env:RDP_PASSWORD)) {
-            throw "Set RDP_PASSWORD in repository Actions secrets."
+          if (-not $env:RDP_PASSWORD) {
+            throw "Set RDP_PASSWORD in GitHub Actions secrets."
+          }
+
+          $secure = ConvertTo-SecureString $env:RDP_PASSWORD -AsPlainText -Force
+
+          if (Get-LocalUser -Name "runneradmin" -ErrorAction SilentlyContinue) {
+            Set-LocalUser -Name "runneradmin" -Password $secure
+          } else {
+            New-LocalUser -Name "ueadmin" -Password $secure -PasswordNeverExpires
+            Add-LocalGroupMember -Group "Administrators" -Member "ueadmin"
           }
 
           Set-ItemProperty `
             -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server" `
-            -Name "fDenyTSConnections" `
-            -Value 0
+            -Name "fDenyTSConnections" -Value 0
 
-          Enable-NetFirewallRule `
-            -DisplayGroup "Remote Desktop" `
+          Enable-NetFirewallRule -DisplayGroup "Remote Desktop" `
             -ErrorAction SilentlyContinue
 
-          $securePassword = ConvertTo-SecureString `
-            $env:RDP_PASSWORD -AsPlainText -Force
+          Set-Service -Name TermService -StartupType Automatic
+          Start-Service -Name TermService
 
-          $user = Get-LocalUser `
-            -Name "runneradmin" `
-            -ErrorAction SilentlyContinue
-
-          if ($null -eq $user) {
-            New-LocalUser `
-              -Name "ueadmin" `
-              -Password $securePassword `
-              -AccountNeverExpires
-
-            Add-LocalGroupMember `
-              -Group "Administrators" `
-              -Member "ueadmin"
-          }
-          else {
-            Set-LocalUser `
-              -Name "runneradmin" `
-              -Password $securePassword
-          }
-
-          Restart-Service -Name TermService -Force
-          Write-Host "RDP configured."
-
-      - name: Install TightVNC with loopback enabled
+      - name: Install TightVNC
         shell: pwsh
         env:
           VNC_PASSWORD: ${{ secrets.VNC_PASSWORD }}
         run: |
-          $ErrorActionPreference = "Stop"
-
-          if ([string]::IsNullOrWhiteSpace($env:VNC_PASSWORD)) {
-            throw "Set VNC_PASSWORD in repository Actions secrets."
+          if (-not $env:VNC_PASSWORD) {
+            throw "Set VNC_PASSWORD in GitHub Actions secrets."
           }
 
-          if ($env:VNC_PASSWORD.Length -gt 8) {
-            throw "TightVNC password must be 8 characters or fewer."
+          $installer = "$env:TEMP\tightvnc.msi"
+          Invoke-WebRequest `
+            "https://www.tightvnc.com/download/2.8.85/tightvnc-2.8.85-gpl-setup-64bit.msi" `
+            -OutFile $installer
+
+          $vncPassword = $env:VNC_PASSWORD
+          if ($vncPassword.Length -lt 6) {
+            throw "VNC_PASSWORD must be at least 6 characters."
           }
 
-          $installer = "D:\UE58\tightvnc-installer.msi"
+          $args = @(
+            "/i", $installer, "/qn", "/norestart",
+            "ADDLOCAL=Server",
+            "SERVER_REGISTER_AS_SERVICE=1",
+            "SERVER_ADD_FIREWALL_EXCEPTION=1",
+            "VALUE_OF_PASSWORD=$vncPassword",
+            "VALUE_OF_PASSWORD_VNC=$vncPassword"
+          )
 
-          $url = "https://www.tightvnc.com/download/2.8.85/tightvnc-2.8.85-gpl-setup-64bit.msi"
-
-          try {
-            Invoke-WebRequest -Uri $url -OutFile $installer -ErrorAction Stop
-          }
-          catch {
-            $url = "https://www.tightvnc.com/download/2.8.81/tightvnc-2.8.81-gpl-setup-64bit.msi"
-            Invoke-WebRequest -Uri $url -OutFile $installer -ErrorAction Stop
-          }
-
-          $arguments = @(
-            "/i"
-            "`"$installer`""
-            "/qn"
-            "/norestart"
-            "ADDLOCAL=Server"
-            "SERVER_REGISTER_AS_SERVICE=1"
-            "SERVER_ADD_FIREWALL_EXCEPTION=1"
-            "SET_USEVNCAUTHENTICATION=1"
-            "VALUE_OF_USEVNCAUTHENTICATION=1"
-            "SET_PASSWORD=1"
-            "VALUE_OF_PASSWORD=$($env:VNC_PASSWORD)"
-            "SET_ALLOWLOOPBACK=1"
-            "VALUE_OF_ALLOWLOOPBACK=1"
-            "SET_ACCEPTRFBCONNECTIONS=1"
-            "VALUE_OF_ACCEPTRFBCONNECTIONS=1"
-          ) -join " "
-
-          $process = Start-Process `
-            -FilePath "msiexec.exe" `
-            -ArgumentList $arguments `
-            -Wait `
-            -PassThru
+          $process = Start-Process msiexec.exe `
+            -ArgumentList $args -Wait -PassThru
 
           if ($process.ExitCode -ne 0) {
             throw "TightVNC installation failed: $($process.ExitCode)"
           }
 
-          # Explicitly enable loopback in the 64-bit machine registry.
-          $regPath = "HKLM:\SOFTWARE\TightVNC\Server"
-
-          if (-not (Test-Path $regPath)) {
-            New-Item -Path $regPath -Force | Out-Null
-          }
-
-          New-ItemProperty `
-            -Path $regPath `
-            -Name "AllowLoopback" `
-            -PropertyType DWord `
-            -Value 1 `
-            -Force | Out-Null
-
-          New-ItemProperty `
-            -Path $regPath `
-            -Name "AcceptRfbConnections" `
-            -PropertyType DWord `
-            -Value 1 `
-            -Force | Out-Null
-
-          # Restart the server so it reads the new configuration.
-          Restart-Service -Name tvnserver -Force
-          Start-Sleep -Seconds 5
-
-          $value = Get-ItemPropertyValue `
-            -Path $regPath `
-            -Name "AllowLoopback"
-
-          Write-Host "AllowLoopback registry value: $value"
-
-          if ($value -ne 1) {
-            throw "TightVNC loopback setting was not applied."
-          }
-
-          if ((Get-Service tvnserver).Status -ne "Running") {
-            Start-Service tvnserver
-          }
-
-          Write-Host "TightVNC ready; loopback is enabled."
+          Get-Service *tvn* -ErrorAction SilentlyContinue |
+            Start-Service -ErrorAction SilentlyContinue
 
       - name: Download Unreal Engine ZIP parts
         shell: pwsh
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          $ErrorActionPreference = "Stop"
-
           $owner = "forgotenmywin"
           $repo = "Windows_with_no_vnc"
           $tag = "ue5.8"
-
-          $api = "https://api.github.com/repos/$owner/$repo/releases/tags/$tag"
+          $partsDir = "D:\UE58\Parts"
 
           $headers = @{
             Authorization = "Bearer $env:GH_TOKEN"
-            Accept = "application/vnd.github+json"
             "X-GitHub-Api-Version" = "2022-11-28"
+            Accept = "application/vnd.github+json"
           }
 
-          $release = Invoke-RestMethod -Uri $api -Headers $headers
+          $releaseUrl = "https://api.github.com/repos/$owner/$repo/releases/tags/$tag"
+          $release = Invoke-RestMethod -Uri $releaseUrl -Headers $headers
 
-          $names = 1..8 | ForEach-Object {
-            "UE_5.8.zip.{0:D3}" -f $_
-          }
-
-          foreach ($name in $names) {
+          for ($i = 1; $i -le 8; $i++) {
+            $name = "UE_5.8.zip.{0:D3}" -f $i
             $asset = $release.assets |
               Where-Object { $_.name -eq $name } |
               Select-Object -First 1
 
             if (-not $asset) {
-              throw "Release asset missing: $name"
+              throw "Release asset not found: $name"
             }
 
-            $destination = "D:\UE58\Parts\$name"
-            $expected = [long]$asset.size
-            $success = $false
+            $destination = Join-Path $partsDir $name
+            Write-Host "Downloading $name"
 
-            Write-Host "Downloading $name; expected $expected bytes."
+            Invoke-WebRequest `
+              -Uri $asset.browser_download_url `
+              -Headers $headers `
+              -OutFile $destination
 
-            # Public release URL; verify each part's exact size.
-            for ($attempt = 1; $attempt -le 3; $attempt++) {
-              Remove-Item $destination -Force -ErrorAction SilentlyContinue
-
-              Write-Host "Download attempt $attempt of 3"
-
-              & curl.exe `
-                -fL `
-                --retry 2 `
-                --retry-delay 3 `
-                --connect-timeout 30 `
-                --max-time 1800 `
-                --output $destination `
-                $asset.browser_download_url
-
-              $curlExit = $LASTEXITCODE
-
-              if ($curlExit -eq 0 -and (Test-Path $destination)) {
-                $actual = (Get-Item $destination).Length
-
-                if ($actual -eq $expected) {
-                  $success = $true
-                  Write-Host "VERIFIED: $name ($actual bytes)"
-                  break
-                }
-
-                Write-Host "Incorrect size: $actual bytes"
-              }
-              else {
-                Write-Host "curl failed with exit code $curlExit"
-              }
-
-              Remove-Item $destination -Force -ErrorAction SilentlyContinue
-              Start-Sleep -Seconds 5
-            }
-
-            if (-not $success) {
-              throw "Download failed or size mismatch: $name"
+            if ((Get-Item $destination).Length -ne $asset.size) {
+              throw "File size mismatch: $name"
             }
           }
 
-          Write-Host "All eight ZIP parts verified."
-
-      - name: Rebuild and test ZIP
+      - name: Join ZIP parts and test archive
         shell: pwsh
         run: |
-          $ErrorActionPreference = "Stop"
+          $partsDir = "D:\UE58\Parts"
+          $zipPath = "D:\UE58\UE_5.8.zip"
 
-          $output = "D:\UE58\UE_5.8.zip"
-          Remove-Item $output -Force -ErrorAction SilentlyContinue
-
-          $parts = 1..8 | ForEach-Object {
-            "D:\UE58\Parts\UE_5.8.zip.{0:D3}" -f $_
+          if (Test-Path $zipPath) {
+            Remove-Item $zipPath -Force
           }
 
-          $stream = [System.IO.File]::Create($output)
-
-          try {
-            foreach ($part in $parts) {
-              if (-not (Test-Path $part)) {
-                throw "Missing ZIP part: $part"
-              }
-
-              Write-Host "Joining $part"
-
-              $inputStream = [System.IO.File]::OpenRead($part)
-
-              try {
-                $inputStream.CopyTo($stream)
-              }
-              finally {
-                $inputStream.Dispose()
-              }
-            }
-          }
-          finally {
-            $stream.Dispose()
-          }
-
-          Write-Host "ZIP size: $((Get-Item $output).Length) bytes"
-
-          $candidates = @(
-            "$env:ProgramFiles\7-Zip\7z.exe",
-            "${env:ProgramFiles(x86)}\7-Zip\7z.exe"
+          $output = [System.IO.File]::Open(
+            $zipPath,
+            [System.IO.FileMode]::CreateNew
           )
 
-          $sevenZip = $candidates |
-            Where-Object { Test-Path $_ } |
+          try {
+            for ($i = 1; $i -le 8; $i++) {
+              $name = "UE_5.8.zip.{0:D3}" -f $i
+              $path = Join-Path $partsDir $name
+
+              if (-not (Test-Path $path)) {
+                throw "Missing part: $name"
+              }
+
+              $input = [System.IO.File]::OpenRead($path)
+              try {
+                $input.CopyTo($output)
+              } finally {
+                $input.Dispose()
+              }
+            }
+          } finally {
+            $output.Dispose()
+          }
+
+          $sevenZip = @(
+            "$env:ProgramFiles\7-Zip\7z.exe",
+            "${env:ProgramFiles(x86)}\7-Zip\7z.exe"
+          ) | Where-Object { Test-Path $_ } |
             Select-Object -First 1
 
           if (-not $sevenZip) {
-            $installer = "D:\UE58\7zip-installer.exe"
-
+            $sevenZip = "D:\UE58\7za.exe"
             Invoke-WebRequest `
-              -Uri "https://www.7-zip.org/a/7z2409-x64.exe" `
-              -OutFile $installer
-
-            Start-Process `
-              -FilePath $installer `
-              -ArgumentList "/S" `
-              -Wait
-
-            $sevenZip = "$env:ProgramFiles\7-Zip\7z.exe"
+              "https://www.7-zip.org/a/7zr.exe" `
+              -OutFile $sevenZip
           }
 
-          if (-not (Test-Path $sevenZip)) {
-            throw "7-Zip executable not found."
-          }
-
-          & $sevenZip t $output
-
+          & $sevenZip t $zipPath
           if ($LASTEXITCODE -ne 0) {
-            throw "ZIP integrity test failed."
+            throw "ZIP archive test failed."
           }
-
-          Write-Host "ZIP integrity test passed."
 
       - name: Extract Unreal Engine
         shell: pwsh
         run: |
-          $ErrorActionPreference = "Stop"
-
-          $sevenZip = "$env:ProgramFiles\7-Zip\7z.exe"
-          $archive = "D:\UE58\UE_5.8.zip"
+          $zipPath = "D:\UE58\UE_5.8.zip"
           $destination = "D:\UE58\Extracted"
+          $sevenZip = @(
+            "$env:ProgramFiles\7-Zip\7z.exe",
+            "${env:ProgramFiles(x86)}\7-Zip\7z.exe",
+            "D:\UE58\7za.exe"
+          ) | Where-Object { Test-Path $_ } |
+            Select-Object -First 1
 
-          if (-not (Test-Path $archive)) {
-            throw "Archive not found: $archive"
+          if (-not $sevenZip) {
+            throw "7-Zip executable not found."
           }
 
-          New-Item `
-            -ItemType Directory `
-            -Force `
-            -Path $destination | Out-Null
-
-          & $sevenZip x $archive "-o$destination" -y
-
+          & $sevenZip x $zipPath "-o$destination" -y
           if ($LASTEXITCODE -ne 0) {
-            throw "Unreal Engine extraction failed."
+            throw "Unreal extraction failed."
           }
 
-          $engineFolder = "$destination\UE_5.8"
+          $engine = Get-ChildItem $destination `
+            -Filter UnrealEditor-Cmd.exe -Recurse -File |
+            Select-Object -First 1
 
-          if (-not (Test-Path "$engineFolder\Engine")) {
-            throw "Unreal Engine Engine folder not found."
+          if (-not $engine) {
+            throw "UnrealEditor-Cmd.exe was not found after extraction."
           }
 
-          Write-Host "UNREAL ENGINE EXTRACTION SUCCESSFUL"
-          Write-Host "Engine path: $engineFolder"
+          $engine.FullName |
+            Set-Content D:\UE58\Logs\engine-path.txt
 
-      - name: Start noVNC after extraction and keep runner alive
+          Write-Host "Found engine: $($engine.FullName)"
+
+      - name: Start Unreal without rendering
         shell: pwsh
         run: |
-          $ErrorActionPreference = "Stop"
+          $engineFile = Get-Content D:\UE58\Logs\engine-path.txt
+          $engineDir = Split-Path $engineFile -Parent
+          $logFile = "D:\UE58\Logs\unreal-headless.log"
 
-          $base = "D:\UE58"
-          $logDir = "$base\Logs"
-          $noVncDir = "$base\noVNC"
-          $engineFolder = "$base\Extracted\UE_5.8"
+          Set-Location $engineDir
 
-          if (-not (Test-Path "$engineFolder\Engine")) {
-            throw "Unreal Engine was not extracted correctly."
-          }
+          Write-Host "Starting Unreal Engine with null rendering..."
 
-          Write-Host "Extraction confirmed. Starting noVNC."
-
-          # Download noVNC only after Unreal Engine extraction.
-          $noVncZip = "$base\novnc.zip"
-
-          Invoke-WebRequest `
-            -Uri "https://github.com/novnc/noVNC/archive/refs/tags/v1.6.0.zip" `
-            -OutFile $noVncZip
-
-          Expand-Archive `
-            -Path $noVncZip `
-            -DestinationPath $base `
-            -Force
-
-          $sourceDir = "$base\noVNC-1.6.0"
-
-          if (-not (Test-Path $sourceDir)) {
-            throw "noVNC source directory not found."
-          }
-
-          New-Item -ItemType Directory -Force -Path $noVncDir |
-            Out-Null
-
-          Copy-Item "$sourceDir\*" $noVncDir -Recurse -Force
-
-          py -m pip install websockify
-
-          $scripts = (
-            py -c "import sysconfig; print(sysconfig.get_path('scripts'))"
-          ).Trim()
-
-          $websockify = Join-Path $scripts "websockify.exe"
-
-          if (-not (Test-Path $websockify)) {
-            throw "websockify.exe not found."
-          }
-
-          # Ensure TightVNC loopback remains enabled before starting bridge.
-          $regPath = "HKLM:\SOFTWARE\TightVNC\Server"
-
-          New-ItemProperty `
-            -Path $regPath `
-            -Name "AllowLoopback" `
-            -PropertyType DWord `
-            -Value 1 `
-            -Force | Out-Null
-
-          Restart-Service -Name tvnserver -Force
-          Start-Sleep -Seconds 5
-
-          $loopback = Get-ItemPropertyValue `
-            -Path $regPath `
-            -Name "AllowLoopback"
-
-          if ($loopback -ne 1) {
-            throw "TightVNC loopback is not enabled."
-          }
-
-          # Start websockify in this persistent step.
-          Start-Process `
-            -FilePath $websockify `
+          $process = Start-Process `
+            -FilePath $engineFile `
             -ArgumentList @(
+              "-nullrhi",
+              "-unattended",
+              "-nop4",
+              "-nosplash",
+              "-stdout",
+              "-FullStdOutLogOutput",
+              "-log=$logFile"
+            ) `
+            -RedirectStandardOutput "D:\UE58\Logs\stdout.log" `
+            -RedirectStandardError "D:\UE58\Logs\stderr.log" `
+            -PassThru
+
+          Start-Sleep -Seconds 30
+
+          if ($process.HasExited) {
+            Write-Host "Unreal process exited with code $($process.ExitCode)"
+            Get-Content $logFile -Tail 100 -ErrorAction SilentlyContinue
+            throw "Unreal exited. Check the log above."
+          }
+
+          Write-Host "Unreal is running without rendering."
+          Write-Host "PID: $($process.Id)"
+
+      - name: Start noVNC and Cloudflare tunnel
+        shell: pwsh
+        env:
+          CF_TUNNEL_TOKEN: ${{ secrets.CF_TUNNEL_TOKEN }}
+        run: |
+          # Install noVNC/websockify
+          $python = Get-Command python -ErrorAction SilentlyContinue
+          if (-not $python) {
+            throw "Python is not installed on the runner."
+          }
+
+          python -m pip install --upgrade pip
+          python -m pip install websockify
+
+          $noVncDir = "D:\UE58\noVNC"
+          git clone --depth 1 https://github.com/novnc/noVNC.git $noVncDir
+
+          $websockify = (Get-Command websockify).Source
+          Start-Process -FilePath $python.Source `
+            -ArgumentList @(
+              "-m", "websockify",
               "--web", $noVncDir,
-              "6080",
-              "127.0.0.1:5900"
+              "6080", "localhost:5900"
             ) `
-            -RedirectStandardOutput "$logDir\websockify-live.log" `
-            -RedirectStandardError "$logDir\websockify-live-error.log" `
-            -WindowStyle Hidden
+            -RedirectStandardOutput "D:\UE58\Logs\novnc.log" `
+            -RedirectStandardError "D:\UE58\Logs\novnc-error.log"
 
-          $websockifyReady = $false
+          if ($env:CF_TUNNEL_TOKEN) {
+            $cloudflared = "D:\UE58\cloudflared.exe"
+            Invoke-WebRequest `
+              "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe" `
+              -OutFile $cloudflared
 
-          for ($i = 0; $i -lt 15; $i++) {
-            Start-Sleep -Seconds 2
-
-            $listener = Get-NetTCPConnection `
-              -LocalPort 6080 `
-              -State Listen `
-              -ErrorAction SilentlyContinue
-
-            if ($listener) {
-              $websockifyReady = $true
-              break
-            }
+            Start-Process $cloudflared `
+              -ArgumentList @("tunnel", "run", "--token", $env:CF_TUNNEL_TOKEN) `
+              -RedirectStandardOutput "D:\UE58\Logs\cloudflared.log" `
+              -RedirectStandardError "D:\UE58\Logs\cloudflared-error.log"
+          } else {
+            Write-Host "CF_TUNNEL_TOKEN not configured; Cloudflare tunnel skipped."
           }
 
-          if (-not $websockifyReady) {
-            Get-Content "$logDir\websockify-live-error.log" `
-              -ErrorAction SilentlyContinue
-
-            throw "websockify did not listen on port 6080."
-          }
-
-          Write-Host "Websockify is listening on port 6080."
-
-          # Start Cloudflare tunnel after noVNC is ready.
-          $cf = "$base\cloudflared.exe"
-
-          Invoke-WebRequest `
-            -Uri "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe" `
-            -OutFile $cf
-
-          Start-Process `
-            -FilePath $cf `
-            -ArgumentList @(
-              "tunnel",
-              "--url",
-              "http://127.0.0.1:6080"
-            ) `
-            -RedirectStandardOutput "$logDir\cloudflared-live.log" `
-            -RedirectStandardError "$logDir\cloudflared-live-error.log" `
-            -WindowStyle Hidden
-
-          $tunnelUrl = $null
-
-          for ($i = 0; $i -lt 60; $i++) {
-            Start-Sleep -Seconds 2
-
-            $logs = Get-Content "$logDir\cloudflared-live-error.log" `
-              -ErrorAction SilentlyContinue
-
-            $matches = $logs |
-              Select-String -Pattern 'https://[a-zA-Z0-9-]+\.trycloudflare\.com'
-
-            if ($matches) {
-              $line = ($matches | Select-Object -Last 1).Line
-
-              $tunnelUrl = [regex]::Match(
-                $line,
-                'https://[a-zA-Z0-9-]+\.trycloudflare\.com'
-              ).Value
-
-              if ($tunnelUrl) {
-                break
-              }
-            }
-          }
-
-          if ($tunnelUrl) {
-            Write-Host ""
-            Write-Host "========================================"
-            Write-Host "UNREAL ENGINE EXTRACTED SUCCESSFULLY"
-            Write-Host "noVNC URL:"
-            Write-Host "$tunnelUrl/vnc.html?autoconnect=true&resize=scale"
-            Write-Host "========================================"
-          }
-          else {
-            Write-Host "Tunnel URL not detected."
-            Get-Content "$logDir\cloudflared-live-error.log" `
-              -Tail 40 `
-              -ErrorAction SilentlyContinue
-          }
-
+          Write-Host "Runner is ready. Job remains alive until timeout."
           while ($true) {
-            $now = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
-
-            $vnc = Get-Process `
-              -Name "tvnserver" `
-              -ErrorAction SilentlyContinue
-
-            $listener = Get-NetTCPConnection `
-              -LocalPort 6080 `
-              -State Listen `
-              -ErrorAction SilentlyContinue
-
-            $cloudflare = Get-Process `
-              -Name "cloudflared" `
-              -ErrorAction SilentlyContinue
-
-            $vncState = if ($vnc) { "RUNNING" } else { "STOPPED" }
-            $websockifyState = if ($listener) { "LISTENING" } else { "STOPPED" }
-            $cloudflareState = if ($cloudflare) { "RUNNING" } else { "STOPPED" }
-
-            Write-Host "[$now] ACTIVE | VNC=$vncState | Websockify=$websockifyState | Cloudflare=$cloudflareState"
-
             Start-Sleep -Seconds 60
+            $p = Get-Process UnrealEditor-Cmd -ErrorAction SilentlyContinue
+            if (-not $p) {
+              Write-Host "UnrealEditor-Cmd is no longer running."
+              Get-Content "D:\UE58\Logs\unreal-headless.log" -Tail 60 `
+                -ErrorAction SilentlyContinue
+            }
           }
