@@ -13,7 +13,7 @@ jobs:
     timeout-minutes: 360
 
     steps:
-      - name: Configure Windows RDP
+      - name: Configure RDP
         shell: powershell
         env:
           RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
@@ -21,34 +21,31 @@ jobs:
           $ErrorActionPreference = 'Stop'
 
           if ([string]::IsNullOrWhiteSpace($env:RDP_PASSWORD)) {
-            throw "Add RDP_PASSWORD in GitHub Actions secrets."
+            throw "Set RDP_PASSWORD in repository Actions secrets."
           }
 
-          $account = Get-LocalUser -Name "runneradmin" -ErrorAction SilentlyContinue
-
+          $account = Get-LocalUser -Name runneradmin -ErrorAction SilentlyContinue
           if ($null -eq $account) {
-            $accountName = $env:USERNAME
-          } else {
-            $accountName = "runneradmin"
+            throw "The runneradmin account was not found."
           }
 
-          $securePassword = ConvertTo-SecureString $env:RDP_PASSWORD -AsPlainText -Force
-          Set-LocalUser -Name $accountName -Password $securePassword
+          $password = ConvertTo-SecureString $env:RDP_PASSWORD -AsPlainText -Force
+          Set-LocalUser -Name runneradmin -Password $password
 
           Set-ItemProperty `
-            -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server' `
-            -Name 'fDenyTSConnections' -Value 0
+            'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server' `
+            -Name fDenyTSConnections -Value 0
 
           Get-NetFirewallRule |
             Where-Object { $_.DisplayGroup -eq 'Remote Desktop' } |
             Enable-NetFirewallRule -ErrorAction SilentlyContinue
 
-          Set-Service -Name TermService -StartupType Automatic
-          Start-Service -Name TermService
+          Set-Service TermService -StartupType Automatic
+          Start-Service TermService
 
-          Write-Host "RDP configured for account: $accountName"
+          Write-Host "RDP configured."
 
-      - name: Install TightVNC with Loopback enabled
+      - name: Install TightVNC
         shell: powershell
         env:
           VNC_PASSWORD: ${{ secrets.VNC_PASSWORD }}
@@ -56,11 +53,11 @@ jobs:
           $ErrorActionPreference = 'Stop'
 
           if ([string]::IsNullOrWhiteSpace($env:VNC_PASSWORD)) {
-            throw "Add VNC_PASSWORD in GitHub Actions secrets."
+            throw "Set VNC_PASSWORD in repository Actions secrets."
           }
 
           if ($env:VNC_PASSWORD.Length -gt 8) {
-            throw "For TightVNC 2.8, use a VNC password of 8 characters or fewer."
+            throw "Use a VNC password of 8 characters or fewer."
           }
 
           $work = 'D:\UE58'
@@ -71,100 +68,78 @@ jobs:
 
           Invoke-WebRequest -Uri $url -OutFile $msi
 
-          $msiArgs = @(
-            '/i'
-            "`"$msi`""
-            '/quiet'
-            '/norestart'
-            'ADDLOCAL=Server'
-            'SERVER_REGISTER_AS_SERVICE=1'
-            'SERVER_ADD_FIREWALL_EXCEPTION=1'
-            'SET_ACCEPTRFBCONNECTIONS=1'
-            'VALUE_OF_ACCEPTRFBCONNECTIONS=1'
-            'SET_USEVNCAUTHENTICATION=1'
-            'VALUE_OF_USEVNCAUTHENTICATION=1'
-            'SET_PASSWORD=1'
+          $args = @(
+            '/i', "`"$msi`"",
+            '/quiet', '/norestart',
+            'ADDLOCAL=Server',
+            'SERVER_REGISTER_AS_SERVICE=1',
+            'SERVER_ADD_FIREWALL_EXCEPTION=1',
+            'SET_ACCEPTRFBCONNECTIONS=1',
+            'VALUE_OF_ACCEPTRFBCONNECTIONS=1',
+            'SET_ALLOWLOOPBACK=1',
+            'VALUE_OF_ALLOWLOOPBACK=1',
+            'SET_LOOPBACKONLY=1',
+            'VALUE_OF_LOOPBACKONLY=1',
+            'SET_USEVNCAUTHENTICATION=1',
+            'VALUE_OF_USEVNCAUTHENTICATION=1',
+            'SET_PASSWORD=1',
             "VALUE_OF_PASSWORD=$($env:VNC_PASSWORD)"
-            'SET_ALLOWLOOPBACK=1'
-            'VALUE_OF_ALLOWLOOPBACK=1'
-            'SET_LOOPBACKONLY=1'
-            'VALUE_OF_LOOPBACKONLY=1'
           )
 
-          $install = Start-Process `
-            -FilePath 'msiexec.exe' `
-            -ArgumentList $msiArgs `
-            -Wait -PassThru
+          $install = Start-Process msiexec.exe `
+            -ArgumentList $args -Wait -PassThru
 
           if ($install.ExitCode -notin @(0, 3010)) {
-            throw "TightVNC installation failed. Exit code: $($install.ExitCode)"
+            throw "TightVNC installation failed: $($install.ExitCode)"
           }
 
-          # Apply the loopback settings explicitly as well.
-          $regPath = 'HKLM:\SOFTWARE\TightVNC\Server'
-          if (-not (Test-Path $regPath)) {
-            New-Item -Path $regPath -Force | Out-Null
+          $reg = 'HKLM:\SOFTWARE\TightVNC\Server'
+          if (-not (Test-Path $reg)) {
+            New-Item -Path $reg -Force | Out-Null
           }
 
-          New-ItemProperty -Path $regPath -Name 'AllowLoopback' `
+          New-ItemProperty $reg -Name AllowLoopback `
             -PropertyType DWord -Value 1 -Force | Out-Null
 
-          New-ItemProperty -Path $regPath -Name 'LoopbackOnly' `
+          New-ItemProperty $reg -Name LoopbackOnly `
             -PropertyType DWord -Value 1 -Force | Out-Null
 
-          New-ItemProperty -Path $regPath -Name 'AcceptRfbConnections' `
+          New-ItemProperty $reg -Name AcceptRfbConnections `
             -PropertyType DWord -Value 1 -Force | Out-Null
 
           $tvn = 'C:\Program Files\TightVNC\tvnserver.exe'
-
           if (-not (Test-Path $tvn)) {
-            throw "TightVNC server executable was not found."
+            throw "tvnserver.exe was not found."
           }
 
-          # Reload the configuration and restart the service.
-          & $tvn -reload
-          Start-Sleep -Seconds 2
-
-          $service = Get-Service -Name 'tvnserver' -ErrorAction SilentlyContinue
-
-          if ($null -ne $service) {
+          $service = Get-Service tvnserver -ErrorAction SilentlyContinue
+          if ($service) {
             if ($service.Status -eq 'Running') {
-              Restart-Service -Name 'tvnserver' -Force
+              Restart-Service tvnserver -Force
             } else {
-              Start-Service -Name 'tvnserver'
+              Start-Service tvnserver
             }
           } else {
             & $tvn -start
           }
 
-          Start-Sleep -Seconds 5
-
-          $listening = $false
+          $ready = $false
           for ($i = 0; $i -lt 30; $i++) {
-            $socket = Get-NetTCPConnection `
-              -LocalPort 5900 -State Listen -ErrorAction SilentlyContinue
-
-            if ($socket) {
-              $listening = $true
+            Start-Sleep -Seconds 1
+            if (Get-NetTCPConnection -LocalPort 5900 -State Listen `
+                -ErrorAction SilentlyContinue) {
+              $ready = $true
               break
             }
-
-            Start-Sleep -Seconds 1
           }
 
-          if (-not $listening) {
-            Write-Host "TightVNC is not listening on port 5900."
-            Get-Service | Where-Object {
-              $_.Name -match 'tvnserver|tightvnc'
-            } | Format-Table -AutoSize
-
-            throw "VNC port 5900 did not start."
+          if (-not $ready) {
+            throw "TightVNC is not listening on port 5900."
           }
 
           Write-Host "TightVNC is listening on port 5900."
-          Write-Host "AllowLoopback=1; LoopbackOnly=1"
 
-      - name: Install noVNC and start Websockify
+      - name: Install noVNC and Python dependencies
         shell: powershell
         run: |
           $ErrorActionPreference = 'Stop'
@@ -177,133 +152,18 @@ jobs:
 
           if (-not (Test-Path $noVnc)) {
             git clone --depth 1 https://github.com/novnc/noVNC.git $noVnc
+            if ($LASTEXITCODE -ne 0) {
+              throw "Could not clone noVNC."
+            }
           }
 
           python -m pip install --upgrade pip websockify
 
-          $python = (Get-Command python).Source
-          $scripts = Join-Path (Split-Path $python) 'Scripts'
-          $websockify = Join-Path $scripts 'websockify.exe'
-
-          if (-not (Test-Path $websockify)) {
-            $websockifyCommand = Get-Command websockify -ErrorAction SilentlyContinue
-
-            if ($null -eq $websockifyCommand) {
-              throw "Could not find the websockify executable."
-            }
-
-            $websockify = $websockifyCommand.Source
+          if ($LASTEXITCODE -ne 0) {
+            throw "Could not install websockify."
           }
 
-          $outLog = Join-Path $logs 'websockify-out.log'
-          $errLog = Join-Path $logs 'websockify-err.log'
-
-          $proxy = Start-Process `
-            -FilePath $websockify `
-            -ArgumentList @('--web', $noVnc, '6080', '127.0.0.1:5900') `
-            -WorkingDirectory $work `
-            -RedirectStandardOutput $outLog `
-            -RedirectStandardError $errLog `
-            -PassThru
-
-          Set-Content -Path (Join-Path $work 'websockify.pid') `
-            -Value $proxy.Id
-
-          $ready = $false
-
-          for ($i = 0; $i -lt 30; $i++) {
-            Start-Sleep -Seconds 1
-
-            $port = Get-NetTCPConnection `
-              -LocalPort 6080 -State Listen -ErrorAction SilentlyContinue
-
-            if ($port) {
-              $ready = $true
-              break
-            }
-          }
-
-          if (-not $ready) {
-            if (Test-Path $outLog) { Get-Content $outLog -Tail 50 }
-            if (Test-Path $errLog) { Get-Content $errLog -Tail 50 }
-            throw "Websockify did not start on port 6080."
-          }
-
-          Write-Host "Websockify is listening on port 6080."
-          Write-Host "VNC target: 127.0.0.1:5900"
-
-      - name: Start temporary Cloudflare tunnel
-        shell: powershell
-        run: |
-          $ErrorActionPreference = 'Stop'
-
-          $work = 'D:\UE58'
-          $logs = Join-Path $work 'Logs'
-          New-Item -ItemType Directory -Force -Path $logs | Out-Null
-
-          $cloudflared = Join-Path $work 'cloudflared.exe'
-          $url = 'https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe'
-
-          Invoke-WebRequest -Uri $url -OutFile $cloudflared
-
-          $stdout = Join-Path $logs 'cloudflared-out.log'
-          $stderr = Join-Path $logs 'cloudflared-err.log'
-
-          $tunnel = Start-Process `
-            -FilePath $cloudflared `
-            -ArgumentList @('tunnel', '--url', 'http://127.0.0.1:6080', '--no-autoupdate') `
-            -WorkingDirectory $work `
-            -RedirectStandardOutput $stdout `
-            -RedirectStandardError $stderr `
-            -PassThru
-
-          Set-Content -Path (Join-Path $work 'cloudflared.pid') `
-            -Value $tunnel.Id
-
-          $publicUrl = $null
-
-          for ($i = 0; $i -lt 90; $i++) {
-            Start-Sleep -Seconds 2
-
-            $combined = ''
-
-            if (Test-Path $stdout) {
-              $combined += Get-Content $stdout -Raw
-            }
-
-            if (Test-Path $stderr) {
-              $combined += Get-Content $stderr -Raw
-            }
-
-            $match = [regex]::Match(
-              $combined,
-              'https://[a-zA-Z0-9-]+\.trycloudflare\.com'
-            )
-
-            if ($match.Success) {
-              $publicUrl = $match.Value
-              break
-            }
-
-            if ($tunnel.HasExited) {
-              throw "Cloudflare tunnel exited before providing a URL."
-            }
-          }
-
-          if (-not $publicUrl) {
-            if (Test-Path $stdout) { Get-Content $stdout -Tail 60 }
-            if (Test-Path $stderr) { Get-Content $stderr -Tail 60 }
-            throw "Cloudflare did not provide a public URL."
-          }
-
-          $novncUrl = "$publicUrl/vnc.html?autoconnect=true&resize=scale"
-
-          Write-Host ""
-          Write-Host "=============================================="
-          Write-Host "OPEN THIS noVNC URL:"
-          Write-Host $novncUrl
-          Write-Host "=============================================="
-          Write-Host "The tunnel is temporary and lasts only while this job runs."
+          python -c "import websockify; print('websockify module OK')"
 
       - name: Download and extract Unreal Engine 5.8
         shell: powershell
@@ -318,7 +178,8 @@ jobs:
           $dest = Join-Path $work 'Extracted'
           $logs = Join-Path $work 'Logs'
 
-          New-Item -ItemType Directory -Force -Path $partsDir, $dest, $logs | Out-Null
+          New-Item -ItemType Directory -Force `
+            -Path $partsDir, $dest, $logs | Out-Null
 
           gh release download ue5.8 `
             --repo forgotenmywin/Windows_with_no_vnc `
@@ -326,118 +187,84 @@ jobs:
             --dir $partsDir
 
           if ($LASTEXITCODE -ne 0) {
-            throw "Could not download the Unreal Engine ZIP parts from release ue5.8."
+            throw "Could not download the release assets."
           }
 
-          $files = @(
+          $parts = @(
             1..8 | ForEach-Object {
               Join-Path $partsDir ('UE_5.8.zip.{0:D3}' -f $_)
             }
           )
 
-          foreach ($file in $files) {
-            if (-not (Test-Path $file)) {
-              throw "Missing ZIP part: $file"
+          foreach ($part in $parts) {
+            if (-not (Test-Path $part)) {
+              throw "Missing archive part: $part"
             }
           }
 
-          Write-Host "Joining the eight ZIP parts..."
-
-          $expectedSize = (
-            Get-Item $files |
-              Measure-Object -Property Length -Sum
-          ).Sum
+          $expected = (Get-Item $parts |
+            Measure-Object Length -Sum).Sum
 
           $output = [System.IO.File]::Create($zip)
-
           try {
-            foreach ($file in $files) {
-              Write-Host "Joining $([System.IO.Path]::GetFileName($file))"
-
-              $inputStream = [System.IO.File]::OpenRead($file)
-
+            foreach ($part in $parts) {
+              Write-Host "Joining $(Split-Path $part -Leaf)"
+              $inputStream = [System.IO.File]::OpenRead($part)
               try {
                 $inputStream.CopyTo($output)
-              }
-              finally {
+              } finally {
                 $inputStream.Dispose()
               }
             }
-          }
-          finally {
+          } finally {
             $output.Dispose()
           }
 
-          if ((Get-Item $zip).Length -ne $expectedSize) {
-            throw "The joined ZIP size does not match the combined part sizes."
+          if ((Get-Item $zip).Length -ne $expected) {
+            throw "Joined ZIP size mismatch."
           }
 
-          # Free space before extracting the large archive.
-          Remove-Item -Path $partsDir -Recurse -Force
+          Remove-Item $partsDir -Recurse -Force
 
           $sevenZip = 'C:\Program Files\7-Zip\7z.exe'
-
           if (-not (Test-Path $sevenZip)) {
-            $sevenZipCommand = Get-Command 7z.exe -ErrorAction SilentlyContinue
-
-            if ($null -ne $sevenZipCommand) {
-              $sevenZip = $sevenZipCommand.Source
-            } else {
-              choco install 7zip -y --no-progress
-
-              if ($LASTEXITCODE -ne 0) {
-                throw "Could not install 7-Zip."
-              }
+            choco install 7zip -y --no-progress
+            if ($LASTEXITCODE -ne 0) {
+              throw "Could not install 7-Zip."
             }
           }
 
           if (-not (Test-Path $sevenZip)) {
-            $sevenZip = 'C:\Program Files\7-Zip\7z.exe'
+            throw "7-Zip executable not found."
           }
 
-          if (-not (Test-Path $sevenZip)) {
-            throw "7-Zip executable was not found."
-          }
-
-          Write-Host "Testing the joined archive..."
-
-          $testLog = Join-Path $logs 'zip-test.log'
-          $testError = Join-Path $logs 'zip-test-error.log'
-
-          $test = Start-Process `
-            -FilePath $sevenZip `
+          $test = Start-Process $sevenZip `
             -ArgumentList @('t', $zip) `
             -Wait -PassThru `
-            -RedirectStandardOutput $testLog `
-            -RedirectStandardError $testError
+            -RedirectStandardOutput (Join-Path $logs 'zip-test.log') `
+            -RedirectStandardError (Join-Path $logs 'zip-test-error.log')
 
           if ($test.ExitCode -ne 0) {
-            if (Test-Path $testLog) { Get-Content $testLog -Tail 80 }
-            if (Test-Path $testError) { Get-Content $testError -Tail 80 }
+            Get-Content (Join-Path $logs 'zip-test.log') -Tail 60
+            Get-Content (Join-Path $logs 'zip-test-error.log') -Tail 60
             throw "ZIP integrity test failed."
           }
 
-          Write-Host "Extracting Unreal Engine..."
-
-          $extractLog = Join-Path $logs 'extract.log'
-          $extractError = Join-Path $logs 'extract-error.log'
-
-          $extract = Start-Process `
-            -FilePath $sevenZip `
+          $extract = Start-Process $sevenZip `
             -ArgumentList @('x', $zip, "-o$dest", '-y') `
             -Wait -PassThru `
-            -RedirectStandardOutput $extractLog `
-            -RedirectStandardError $extractError
+            -RedirectStandardOutput (Join-Path $logs 'extract.log') `
+            -RedirectStandardError (Join-Path $logs 'extract-error.log')
 
           if ($extract.ExitCode -ne 0) {
-            if (Test-Path $extractLog) { Get-Content $extractLog -Tail 100 }
-            if (Test-Path $extractError) { Get-Content $extractError -Tail 100 }
+            Get-Content (Join-Path $logs 'extract.log') -Tail 80
+            Get-Content (Join-Path $logs 'extract-error.log') -Tail 80
             throw "Unreal Engine extraction failed."
           }
 
           Write-Host "Unreal Engine extraction completed."
 
-      - name: Start Unreal Editor
+      - name: Launch Unreal Editor
         shell: powershell
         continue-on-error: true
         run: |
@@ -445,82 +272,203 @@ jobs:
 
           $dest = 'D:\UE58\Extracted'
           $logs = 'D:\UE58\Logs'
-          New-Item -ItemType Directory -Force -Path $logs | Out-Null
 
-          $editor = Get-ChildItem -Path $dest `
-            -Filter 'UnrealEditor.exe' -File -Recurse `
-            -ErrorAction SilentlyContinue |
+          $editor = Get-ChildItem $dest -Filter UnrealEditor.exe `
+            -File -Recurse -ErrorAction SilentlyContinue |
             Where-Object {
               $_.FullName -match '\\Engine\\Binaries\\Win64\\UnrealEditor\.exe$'
             } |
             Select-Object -First 1
 
-          if ($null -eq $editor) {
-            Write-Host "UnrealEditor.exe was not found in the extracted files."
-            Get-ChildItem -Path $dest -Filter 'UnrealEditor-Cmd.exe' `
+          if (-not $editor) {
+            Write-Host "UnrealEditor.exe not found."
+            Get-ChildItem $dest -Filter UnrealEditor-Cmd.exe `
               -File -Recurse -ErrorAction SilentlyContinue |
-              Select-Object -First 5 -ExpandProperty FullName
+              Select-Object -First 10 -ExpandProperty FullName
             exit 0
           }
 
-          Write-Host "Editor path: $($editor.FullName)"
+          Write-Host "Editor: $($editor.FullName)"
 
-          $editorLog = Join-Path $logs 'unreal-editor.log'
-
-          $process = Start-Process `
-            -FilePath $editor.FullName `
-            -ArgumentList @('-AllowSoftwareRendering', '-d3d11', "-log=$editorLog") `
+          $log = Join-Path $logs 'unreal-editor.log'
+          $p = Start-Process $editor.FullName `
+            -ArgumentList @('-AllowSoftwareRendering', '-d3d11', "-log=$log") `
             -WorkingDirectory $editor.DirectoryName `
             -PassThru
 
-          Set-Content -Path 'D:\UE58\unreal-editor.pid' -Value $process.Id
+          Set-Content 'D:\UE58\unreal-editor.pid' $p.Id
+          Write-Host "Unreal Editor PID: $($p.Id)"
 
-          Write-Host "Unreal Editor launched with PID $($process.Id)."
-          Write-Host "If no project is supplied, the editor may display the project browser."
-
-      - name: Keep remote machine alive and report status
+      - name: Start and maintain noVNC and Cloudflare
         shell: powershell
+        timeout-minutes: 350
         run: |
           $ErrorActionPreference = 'Continue'
 
           $work = 'D:\UE58'
           $logs = Join-Path $work 'Logs'
+          $noVnc = Join-Path $work 'noVNC'
+          $cloudflared = Join-Path $work 'cloudflared.exe'
 
-          while ($true) {
-            $vnc = Get-NetTCPConnection `
-              -LocalPort 5900 -State Listen -ErrorAction SilentlyContinue
+          $outProxy = Join-Path $logs 'websockify-out.log'
+          $errProxy = Join-Path $logs 'websockify-err.log'
+          $outTunnel = Join-Path $logs 'cloudflared-out.log'
+          $errTunnel = Join-Path $logs 'cloudflared-err.log'
 
-            $proxy = Get-NetTCPConnection `
-              -LocalPort 6080 -State Listen -ErrorAction SilentlyContinue
+          Invoke-WebRequest `
+            'https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe' `
+            -OutFile $cloudflared
 
-            $editor = Get-Process -Name 'UnrealEditor' `
+          function Start-Websockify {
+            Write-Host "Starting Websockify..."
+
+            # Avoid duplicate proxy processes.
+            Get-CimInstance Win32_Process |
+              Where-Object {
+                $_.CommandLine -match 'websockify' -and
+                $_.CommandLine -match '6080'
+              } |
+              ForEach-Object {
+                Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue
+              }
+
+            Start-Sleep -Seconds 2
+
+            $p = Start-Process -FilePath (Get-Command python).Source `
+              -ArgumentList @(
+                '-u', '-m', 'websockify',
+                '--web', $noVnc,
+                '6080', '127.0.0.1:5900'
+              ) `
+              -WorkingDirectory $work `
+              -RedirectStandardOutput $outProxy `
+              -RedirectStandardError $errProxy `
+              -PassThru
+
+            Set-Content (Join-Path $work 'websockify.pid') $p.Id
+            Start-Sleep -Seconds 5
+
+            $port = Get-NetTCPConnection -LocalPort 6080 -State Listen `
               -ErrorAction SilentlyContinue
 
-            $tunnel = Get-Process -Name 'cloudflared' `
-              -ErrorAction SilentlyContinue
+            if ($port) {
+              Write-Host "Websockify is listening on 6080."
+            } else {
+              Write-Host "ERROR: Websockify failed to bind port 6080."
+              if (Test-Path $errProxy) {
+                Get-Content $errProxy -Tail 80
+              }
+            }
+          }
 
-            $vncStatus = if ($vnc) { 'LISTENING' } else { 'STOPPED' }
-            $proxyStatus = if ($proxy) { 'LISTENING' } else { 'STOPPED' }
-            $editorStatus = if ($editor) { 'RUNNING' } else { 'STOPPED' }
-            $tunnelStatus = if ($tunnel) { 'RUNNING' } else { 'STOPPED' }
+          function Start-Cloudflare {
+            Write-Host "Starting Cloudflare quick tunnel..."
 
-            Write-Host "VNC=$vncStatus | Websockify=$proxyStatus | Unreal=$editorStatus | Cloudflare=$tunnelStatus"
+            # Stop old tunnel processes before starting a replacement.
+            Get-Process cloudflared -ErrorAction SilentlyContinue |
+              Stop-Process -Force -ErrorAction SilentlyContinue
 
-            if (-not $proxy) {
-              Write-Host "Websockify is no longer listening. Check websockify logs."
-              if (Test-Path (Join-Path $logs 'websockify-err.log')) {
-                Get-Content (Join-Path $logs 'websockify-err.log') -Tail 30
+            Start-Sleep -Seconds 2
+
+            Remove-Item $outTunnel, $errTunnel `
+              -Force -ErrorAction SilentlyContinue
+
+            $p = Start-Process $cloudflared `
+              -ArgumentList @(
+                'tunnel', '--url',
+                'http://127.0.0.1:6080',
+                '--no-autoupdate'
+              ) `
+              -WorkingDirectory $work `
+              -RedirectStandardOutput $outTunnel `
+              -RedirectStandardError $errTunnel `
+              -PassThru
+
+            Set-Content (Join-Path $work 'cloudflared.pid') $p.Id
+
+            $urlFound = $false
+
+            for ($i = 0; $i -lt 30; $i++) {
+              Start-Sleep -Seconds 2
+
+              $combined = ''
+              if (Test-Path $outTunnel) {
+                $combined += Get-Content $outTunnel -Raw
+              }
+              if (Test-Path $errTunnel) {
+                $combined += Get-Content $errTunnel -Raw
+              }
+
+              $match = [regex]::Match(
+                $combined,
+                'https://[a-zA-Z0-9-]+\.trycloudflare\.com'
+              )
+
+              if ($match.Success) {
+                Write-Host "============================================"
+                Write-Host "OPEN THIS NEW noVNC URL:"
+                Write-Host "$($match.Value)/vnc.html?autoconnect=true&resize=scale"
+                Write-Host "============================================"
+                $urlFound = $true
+                break
+              }
+
+              if ($p.HasExited) {
+                Write-Host "Cloudflare exited with code $($p.ExitCode)."
+                break
               }
             }
 
+            if (-not $urlFound) {
+              Write-Host "Could not find a Cloudflare URL. Tunnel logs:"
+              if (Test-Path $outTunnel) {
+                Get-Content $outTunnel -Tail 50
+              }
+              if (Test-Path $errTunnel) {
+                Get-Content $errTunnel -Tail 50
+              }
+            }
+          }
+
+          # Run both services from this long-lived step.
+          # This avoids depending on background processes started by prior steps.
+          Start-Websockify
+          Start-Cloudflare
+
+          while ($true) {
+            $vnc = Get-NetTCPConnection -LocalPort 5900 -State Listen `
+              -ErrorAction SilentlyContinue
+
+            $proxy = Get-NetTCPConnection -LocalPort 6080 -State Listen `
+              -ErrorAction SilentlyContinue
+
+            $tunnel = Get-Process cloudflared -ErrorAction SilentlyContinue
+            $editor = Get-Process UnrealEditor -ErrorAction SilentlyContinue
+
+            Write-Host "VNC=$([bool]$vnc) | Websockify=$([bool]$proxy) | Cloudflare=$([bool]$tunnel) | Unreal=$([bool]$editor)"
+
             if (-not $vnc) {
-              Write-Host "TightVNC is no longer listening on port 5900."
+              Write-Host "WARNING: VNC port 5900 is down."
             }
 
-            if (-not $editor -and (Test-Path (Join-Path $logs 'unreal-editor.log'))) {
-              Write-Host "Recent Unreal Editor log:"
-              Get-Content (Join-Path $logs 'unreal-editor.log') -Tail 40
+            if (-not $proxy) {
+              Write-Host "Websockify stopped. Last error:"
+              if (Test-Path $errProxy) {
+                Get-Content $errProxy -Tail 40
+              }
+              Start-Websockify
             }
 
-            Start-Sleep -Seconds 60
+            if (-not $tunnel) {
+              Write-Host "Cloudflare stopped. Restarting tunnel."
+              Start-Cloudflare
+            }
+
+            if (-not $editor -and
+                (Test-Path (Join-Path $logs 'unreal-editor.log'))) {
+              Write-Host "Unreal Editor is not running. Recent log:"
+              Get-Content (Join-Path $logs 'unreal-editor.log') -Tail 30
+            }
+
+            Start-Sleep -Seconds 30
           }
