@@ -523,11 +523,281 @@ jobs:
                       chunks.append("===== " + candidates[0].name + " =====\n" + candidates[0].read_text(encoding="utf-8", errors="replace")[-50000:])
               return app.response_class("\n\n".join(chunks) or "No logs yet.", mimetype="text/plain")
 
+          # ---- MCP Server: expose Unreal/API tools to any compatible MCP client ----
+          import base64
+          import secrets
+          from contextlib import asynccontextmanager
+          from starlette.applications import Starlette
+          from starlette.middleware.wsgi import WSGIMiddleware
+          from starlette.routing import Mount
+          from starlette.responses import JSONResponse
+          from mcp.server import MCPServer
+          from mcp.server.transport_security import TransportSecuritySettings
+          import uvicorn
+
+          mcp_server = MCPServer(
+              "unreal-engine-remote-control",
+              instructions=(
+                  "Tools for controlling the active Unreal Editor 5.8.4 instance. "
+                  "The user has authorized this server. Use unreal_execute_python for editor-side Python; "
+                  "use project/file/Google Drive tools for the explicitly requested tasks. "
+                  "File paths are restricted to the D:\\UE58 workspace. Destructive edits should be confirmed with the user."
+              ),
+          )
+
+          def mcp_json(value):
+              return json.dumps(value, ensure_ascii=False, default=str)
+
+          def mcp_submit_unreal_code(code, timeout_seconds=60):
+              if not bridge_connected():
+                  return {"ok": False, "error": "unreal_bridge_not_connected",
+                          "detail": "Unreal Python bridge is offline; check the GitHub Actions log."}
+              if not isinstance(code, str) or not code.strip():
+                  return {"ok": False, "error": "code must be a non-empty string"}
+              if len(code) > 100000:
+                  return {"ok": False, "error": "code exceeds 100000 characters"}
+              try:
+                  timeout_seconds = max(1, min(300, int(timeout_seconds)))
+              except (TypeError, ValueError):
+                  timeout_seconds = 60
+              job_id = uuid.uuid4().hex
+              event = threading.Event()
+              with lock:
+                  waiting[job_id] = {"event": event, "result": None}
+              jobs.put({"id": job_id, "code": code})
+              if not event.wait(timeout_seconds):
+                  with lock:
+                      waiting.pop(job_id, None)
+                  return {"ok": False, "job_id": job_id, "error": "unreal_command_timeout",
+                          "detail": "Unreal did not return before timeout."}
+              with lock:
+                  row = waiting.pop(job_id, None)
+              result = row.get("result") if row else None
+              if not result:
+                  return {"ok": False, "job_id": job_id, "error": "missing_result"}
+              return {"ok": not bool(result.get("error")), "job_id": job_id,
+                      "output": result.get("output", ""), "error": result.get("error", "")}
+
+          @mcp_server.tool()
+          def unreal_execute_python(code: str, timeout_seconds: int = 60) -> str:
+              """Execute Python inside the running Unreal Editor. Can change the current project and scene."""
+              return mcp_json(mcp_submit_unreal_code(code, timeout_seconds))
+
+          @mcp_server.tool()
+          def unreal_get_engine_version() -> str:
+              """Return the version reported by the active Unreal Editor instance."""
+              return mcp_json(mcp_submit_unreal_code(
+                  "import unreal\nunreal.SystemLibrary.get_engine_version()", 30))
+
+          @mcp_server.tool()
+          def unreal_list_projects() -> str:
+              """List .uproject files in D:\\UE58\\Projects and the control project directory."""
+              found = []
+              for base in (ROOT / "Projects", ROOT / "UEControl"):
+                  if base.exists():
+                      for item in base.rglob("*.uproject"):
+                          found.append({"name": item.stem, "project_file": str(item), "directory": str(item.parent)})
+              found.sort(key=lambda item: item["name"].lower())
+              return mcp_json({"ok": True, "count": len(found), "projects": found})
+
+          @mcp_server.tool()
+          def unreal_rename_project(project_file: str, new_name: str) -> str:
+              """Rename an existing .uproject file within D:\\UE58; does not rename its folder."""
+              try:
+                  source = safe_path(project_file)
+                  if not re.fullmatch(r"[A-Za-z0-9_-]{1,80}", str(new_name).strip()):
+                      return mcp_json({"ok": False, "error": "new_name permits only letters, numbers, _ and -"})
+                  new_name = str(new_name).strip()
+                  if source.suffix.lower() != ".uproject" or not source.is_file():
+                      return mcp_json({"ok": False, "error": "existing .uproject file required"})
+                  target = source.with_name(new_name + ".uproject")
+                  if target.exists() and target != source:
+                      return mcp_json({"ok": False, "error": "target file already exists"})
+                  source.rename(target)
+                  return mcp_json({"ok": True, "old_path": str(source), "project_file": str(target),
+                                    "note": "Only the .uproject file was renamed."})
+              except Exception as exc:
+                  return mcp_json({"ok": False, "error": str(exc)})
+
+          @mcp_server.tool()
+          def unreal_list_files(path: str = "", recursive: bool = False, limit: int = 200) -> str:
+              """List files inside D:\\UE58. Use a relative path or an absolute path under D:\\UE58."""
+              try:
+                  folder = ROOT if not str(path).strip() else safe_path(path)
+                  if not folder.exists() or not folder.is_dir():
+                      return mcp_json({"ok": False, "error": "directory not found", "path": str(folder)})
+                  limit = max(1, min(500, int(limit)))
+                  iterator = folder.rglob("*") if recursive else folder.iterdir()
+                  items = []
+                  for item in iterator:
+                      try:
+                          items.append({"name": item.name, "path": str(item),
+                                        "is_directory": item.is_dir(),
+                                        "size": None if item.is_dir() else item.stat().st_size})
+                      except OSError:
+                          continue
+                      if len(items) >= limit:
+                          break
+                  return mcp_json({"ok": True, "path": str(folder), "count": len(items), "limit": limit,
+                                    "truncated_or_limited": len(items) >= limit, "items": items})
+              except Exception as exc:
+                  return mcp_json({"ok": False, "error": str(exc)})
+
+          @mcp_server.tool()
+          def unreal_read_text_file(path: str, max_chars: int = 20000) -> str:
+              """Read a UTF-8 text file under D:\\UE58. Output is limited to at most 100000 characters."""
+              try:
+                  target = safe_path(path)
+                  if not target.is_file():
+                      return mcp_json({"ok": False, "error": "file not found", "path": str(target)})
+                  max_chars = max(1, min(100000, int(max_chars)))
+                  with target.open("r", encoding="utf-8-sig", errors="replace") as handle:
+                      content = handle.read(max_chars + 1)
+                  truncated = len(content) > max_chars
+                  return mcp_json({"ok": True, "path": str(target), "content": content[:max_chars], "truncated": truncated})
+              except Exception as exc:
+                  return mcp_json({"ok": False, "error": str(exc)})
+
+          @mcp_server.tool()
+          def unreal_write_text_file(path: str, content: str) -> str:
+              """Write UTF-8 text to a file under D:\\UE58, creating parent directories as needed."""
+              try:
+                  if len(content) > 2_000_000:
+                      return mcp_json({"ok": False, "error": "content exceeds 2 MB"})
+                  target = safe_path(path)
+                  target.parent.mkdir(parents=True, exist_ok=True)
+                  target.write_text(content, encoding="utf-8")
+                  return mcp_json({"ok": True, "path": str(target), "size": target.stat().st_size})
+              except Exception as exc:
+                  return mcp_json({"ok": False, "error": str(exc)})
+
+          @mcp_server.tool()
+          def google_drive_list_files(folder_id: str = "root", page_size: int = 100) -> str:
+              """List files in a Google Drive folder accessible to the configured service account."""
+              try:
+                  folder_id = str(folder_id or "root")
+                  page_size = max(1, min(1000, int(page_size)))
+                  query = "trashed = false"
+                  if folder_id != "*":
+                      query += " and '" + folder_id.replace("'", "") + "' in parents"
+                  result = google_drive().files().list(
+                      q=query, pageSize=page_size, orderBy="name",
+                      fields="files(id,name,mimeType,size,modifiedTime,webViewLink,parents)").execute()
+                  files = result.get("files", [])
+                  return mcp_json({"ok": True, "count": len(files), "files": files})
+              except Exception as exc:
+                  log("MCP Drive list error: " + repr(exc))
+                  return mcp_json({"ok": False, "error": str(exc)})
+
+          @mcp_server.tool()
+          def google_drive_download_file(file_id: str, destination: str) -> str:
+              """Download a Google Drive file to a destination inside D:\\UE58."""
+              try:
+                  destination_path = safe_path(destination)
+                  destination_path.parent.mkdir(parents=True, exist_ok=True)
+                  from googleapiclient.http import MediaIoBaseDownload
+                  media = google_drive().files().get_media(fileId=file_id)
+                  with destination_path.open("wb") as handle:
+                      downloader = MediaIoBaseDownload(handle, media, chunksize=8 * 1024 * 1024)
+                      done = False
+                      while not done:
+                          _, done = downloader.next_chunk()
+                  return mcp_json({"ok": True, "file_id": file_id, "destination": str(destination_path),
+                                    "size": destination_path.stat().st_size})
+              except Exception as exc:
+                  log("MCP Drive download error: " + repr(exc))
+                  return mcp_json({"ok": False, "error": str(exc)})
+
+          @mcp_server.tool()
+          def google_drive_upload_file(source: str, drive_folder_id: str = "root", filename: str = "") -> str:
+              """Upload a file from D:\\UE58 to Google Drive."""
+              try:
+                  source_path = safe_path(source)
+                  if not source_path.is_file():
+                      return mcp_json({"ok": False, "error": "source file not found", "source": str(source_path)})
+                  from googleapiclient.http import MediaFileUpload
+                  metadata = {"name": str(filename or source_path.name)}
+                  folder_id = str(drive_folder_id or "root")
+                  if folder_id != "root":
+                      metadata["parents"] = [folder_id]
+                  media = MediaFileUpload(str(source_path), resumable=True, chunksize=8 * 1024 * 1024)
+                  result = google_drive().files().create(body=metadata, media_body=media,
+                      fields="id,name,mimeType,size,webViewLink").execute()
+                  return mcp_json({"ok": True, "file": result})
+              except Exception as exc:
+                  log("MCP Drive upload error: " + repr(exc))
+                  return mcp_json({"ok": False, "error": str(exc)})
+
+          @mcp_server.tool()
+          def unreal_take_screenshot(timeout_seconds: int = 60) -> str:
+              """Capture a 1920x1080 screenshot from the active Unreal Editor and return the saved file path."""
+              out_path = ROOT / "Screenshots" / ("ue_mcp_" + time.strftime("%Y%m%d_%H%M%S") + ".png")
+              out_path.parent.mkdir(parents=True, exist_ok=True)
+              target = str(out_path).replace("\\", "/")
+              code = (
+                  "import unreal\n"
+                  "world = unreal.get_editor_subsystem(unreal.UnrealEditorSubsystem).get_editor_world()\n"
+                  + "unreal.SystemLibrary.execute_console_command(world, 'HighResShot 1920x1080 filename=\\\"" + target + "\\\"')\n"
+                  + repr("SCREENSHOT_REQUESTED " + target)
+              )
+              result = mcp_submit_unreal_code(code, timeout_seconds)
+              if not result.get("ok"):
+                  return mcp_json(result)
+              deadline = time.time() + 30
+              while time.time() < deadline:
+                  if out_path.is_file() and out_path.stat().st_size > 0:
+                      return mcp_json({"ok": True, "path": str(out_path), "size": out_path.stat().st_size,
+                                        "hint": "Use google_drive_upload_file to send this PNG to Drive."})
+                  time.sleep(1)
+              return mcp_json({"ok": False, "error": "screenshot_file_not_created",
+                                "detail": "Unreal did not create the PNG; check viewport/rendering and Editor logs."})
+
+          # MCP SDK v2 uses Streamable HTTP. The public host is a temporary Cloudflare
+          # Quick Tunnel, so host-header validation is delegated to that proxy; every
+          # MCP request is still required to provide the bearer token.
+          mcp_http_app = mcp_server.streamable_http_app(
+              streamable_http_path="/",
+              transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False),
+          )
+
+          class MCPBearerAuth:
+              def __init__(self, downstream):
+                  self.downstream = downstream
+              async def __call__(self, scope, receive, send):
+                  if scope.get("type") == "http":
+                      headers = {key.decode("latin1").lower(): value.decode("latin1")
+                                 for key, value in scope.get("headers", [])}
+                      supplied = headers.get("authorization", "")
+                      expected = "Bearer " + COMMAND_TOKEN
+                      if not COMMAND_TOKEN or not secrets.compare_digest(supplied, expected):
+                          body = json.dumps({"error": "unauthorized"}).encode("utf-8")
+                          await send({"type": "http.response.start", "status": 401,
+                                      "headers": [(b"content-type", b"application/json"),
+                                                  (b"content-length", str(len(body)).encode("ascii"))]})
+                          await send({"type": "http.response.body", "body": body})
+                          return
+                  await self.downstream(scope, receive, send)
+
+          secured_mcp_app = MCPBearerAuth(mcp_http_app)
+
+          @asynccontextmanager
+          async def combined_lifespan(asgi_app):
+              async with mcp_server.session_manager.run():
+                  yield
+
+          combined_app = Starlette(
+              routes=[
+                  Mount("/mcp", app=secured_mcp_app),
+                  Mount("/", app=WSGIMiddleware(app)),
+              ],
+              lifespan=combined_lifespan,
+          )
+
           if __name__ == "__main__":
               if not COMMAND_TOKEN or not BRIDGE_TOKEN:
                   raise RuntimeError("COMMAND_TOKEN and BRIDGE_TOKEN must be set")
-              log("Starting Unreal Remote API at 127.0.0.1:8765")
-              app.run(host="127.0.0.1", port=8765, threaded=True, use_reloader=False)
+              log("Starting Unreal Remote API + MCP at 127.0.0.1:8765; MCP endpoint=/mcp")
+              uvicorn.run(combined_app, host="127.0.0.1", port=8765, log_level="info")
           '@
           Set-Content -LiteralPath "$root\api_server.py" -Value $api -Encoding utf8
           Write-Host 'Created project and bridge scripts.'
@@ -546,7 +816,7 @@ jobs:
           if ([string]::IsNullOrWhiteSpace($env:GG_UE_TOKEN)) { Write-Warning 'GG_UE_TOKEN is empty; Google Drive routes will not work until the service-account JSON is configured.' }
           $env:BRIDGE_TOKEN = [guid]::NewGuid().ToString('N') + [guid]::NewGuid().ToString('N')
           $python = (Get-Command python).Source
-          & $python -m pip install --disable-pip-version-check --upgrade Flask google-api-python-client google-auth
+          & $python -m pip install --disable-pip-version-check --upgrade Flask google-api-python-client google-auth "mcp>=2,<3" uvicorn
           if ($LASTEXITCODE -ne 0) { throw 'Python package installation failed.' }
 
           $apiOut = "$root\Logs\api-stdout.log"
@@ -614,7 +884,9 @@ jobs:
           }
           if ($bridgeReady) { Write-Host 'BRIDGE_READY=true' } else { Write-Warning 'BRIDGE_READY=false; /command will report unreal_bridge_not_connected until Unreal loads init_unreal.py.' }
 
-          Write-Host 'API endpoints: /health /command /projects /projects/rename /files/upload /files/download /drive/list /drive/download /drive/upload /unreal/screenshot /logs'
+          Write-Host 'REST endpoints: /health /command /projects /projects/rename /files/upload /files/download /drive/list /drive/download /drive/upload /unreal/screenshot /logs'
+          Write-Host "MCP_ENDPOINT=$publicUrl/mcp"
+          Write-Host 'MCP tools: unreal_execute_python, unreal_get_engine_version, unreal_list_projects, unreal_rename_project, unreal_list_files, unreal_read_text_file, unreal_write_text_file, google_drive_list_files, google_drive_download_file, google_drive_upload_file, unreal_take_screenshot'
           Write-Host 'Keep this workflow running. Copy PUBLIC_API_URL and use the current COMMAND_TOKEN secret from Termux.'
           while ($true) {
             Start-Sleep -Seconds 60
