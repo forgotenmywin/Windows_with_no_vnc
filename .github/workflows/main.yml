@@ -1,4 +1,4 @@
-name: Unreal Engine 5.8 Remote Control
+name: UE 5.8 Remote Control API
 
 on:
   workflow_dispatch:
@@ -7,703 +7,622 @@ permissions:
   contents: read
 
 jobs:
-  unreal:
+  ue-remote:
     runs-on: windows-latest
     timeout-minutes: 360
 
     steps:
-      - name: Validate Secrets and Prepare Folders
-        shell: pwsh
-        env:
-          COMMAND_TOKEN: ${{ secrets.COMMAND_TOKEN }}
-          GG_UE_TOKEN: ${{ secrets.GG_UE_TOKEN }}
-        run: |
-          $ErrorActionPreference = "Stop"
-
-          if (!$env:COMMAND_TOKEN) {
-            throw "Missing COMMAND_TOKEN secret"
-          }
-
-          if (!$env:GG_UE_TOKEN) {
-            throw "Missing GG_UE_TOKEN secret"
-          }
-
-          $root = "D:\UE58"
-
-          @(
-            $root,
-            "$root\Extracted",
-            "$root\Projects",
-            "$root\Uploads",
-            "$root\Screenshots",
-            "$root\Logs",
-            "$root\UEControl",
-            "$root\UEControl\Content\Python"
-          ) | ForEach-Object {
-            New-Item -ItemType Directory -Path $_ -Force | Out-Null
-          }
-
-          "UE_ROOT=$root" >> $env:GITHUB_ENV
-
-      - name: Setup Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-
-      - name: Install API Dependencies
+      - name: Prepare D drive
         shell: pwsh
         run: |
-          python -m pip install --upgrade pip
-          python -m pip install flask google-api-python-client google-auth
+          $ErrorActionPreference = 'Stop'
+          $root = 'D:\UE58'
+          New-Item -ItemType Directory -Force -Path $root, "$root\parts", "$root\Logs", "$root\Projects", "$root\Screenshots", "$root\Uploads" | Out-Null
+          $drive = Get-PSDrive D -ErrorAction SilentlyContinue
+          if (-not $drive) { throw 'Drive D is not available on this runner.' }
+          Write-Host ("D: available space: {0:N2} GB" -f ($drive.Free / 1GB))
+          "UE_ROOT=$root" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
-      - name: Download Unreal Engine Release Parts
+      - name: Download and extract Unreal Engine 5.8
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          $ErrorActionPreference = "Stop"
-          $root = $env:UE_ROOT
+          $ErrorActionPreference = 'Stop'
+          $root = 'D:\UE58'
+          $partsDir = "$root\parts"
+          $archive = "$root\UE_5.8.zip"
+          $extract = "$root\Extracted"
 
-          gh release download ue5.8 `
-            --repo forgotenmywin/Windows_with_no_vnc `
-            --pattern "UE_5.8.zip.*" `
-            --dir $root
+          gh release download ue5.8 --repo forgotenmywin/Windows_with_no_vnc --pattern 'UE_5.8.zip.*' --dir $partsDir --clobber
+          if ($LASTEXITCODE -ne 0) { throw 'Could not download release assets UE_5.8.zip.*.' }
+          $parts = @(Get-ChildItem -LiteralPath $partsDir -File | Where-Object { $_.Name -like 'UE_5.8.zip.*' } | Sort-Object Name)
+          if ($parts.Count -lt 2) { throw "Expected split ZIP parts; found $($parts.Count). Check release tag/assets." }
 
-          if ($LASTEXITCODE -ne 0) {
-            throw "Could not download Unreal Engine release assets."
-          }
-
-          $parts = @(
-            Get-ChildItem $root -File |
-              Where-Object {
-                $_.Name -match '^UE_5\.8\.zip\.\d+$'
-              } |
-              Sort-Object Name
-          )
-
-          if ($parts.Count -ne 8) {
-            throw "Expected 8 ZIP parts, found $($parts.Count)."
-          }
-
-          $zip = "$root\UE_5.8.zip"
-          $output = [System.IO.File]::Create($zip)
-
+          if (Test-Path $archive) { Remove-Item -LiteralPath $archive -Force }
+          $destination = [System.IO.File]::Open($archive, [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
           try {
+            $buffer = New-Object byte[] (4MB)
             foreach ($part in $parts) {
-              Write-Host "Joining $($part.Name)"
-
-              $inputStream = [System.IO.File]::OpenRead($part.FullName)
-
-              try {
-                $inputStream.CopyTo($output)
-              }
-              finally {
-                $inputStream.Dispose()
-              }
+              Write-Host ("Joining {0} ({1:N2} GB)" -f $part.Name, ($part.Length / 1GB))
+              $source = [System.IO.File]::OpenRead($part.FullName)
+              try { while (($read = $source.Read($buffer, 0, $buffer.Length)) -gt 0) { $destination.Write($buffer, 0, $read) } }
+              finally { $source.Dispose() }
             }
+          } finally { $destination.Dispose() }
+
+          $sevenZip = (Get-Command 7z.exe -ErrorAction SilentlyContinue).Source
+          if (-not $sevenZip) {
+            $sevenZip = @('C:\Program Files\7-Zip\7z.exe','C:\Program Files (x86)\7-Zip\7z.exe') | Where-Object { Test-Path $_ } | Select-Object -First 1
           }
-          finally {
-            $output.Dispose()
-          }
-
-          if ((Get-Item $zip).Length -lt 1GB) {
-            throw "Combined ZIP is unexpectedly small."
-          }
-
-          "UE_ZIP=$zip" >> $env:GITHUB_ENV
-
-      - name: Extract Unreal Engine
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = "Stop"
-          $root = $env:UE_ROOT
-          $zip = $env:UE_ZIP
-
-          $sevenZip = "$env:ProgramFiles\7-Zip\7z.exe"
-
-          if (!(Test-Path $sevenZip)) {
+          if (-not $sevenZip) {
             choco install 7zip -y --no-progress
-            $sevenZip = "$env:ProgramFiles\7-Zip\7z.exe"
+            if ($LASTEXITCODE -ne 0) { throw '7-Zip installation failed.' }
+            $sevenZip = 'C:\Program Files\7-Zip\7z.exe'
           }
+          if (-not (Test-Path $sevenZip)) { throw '7z.exe was not found.' }
+          & $sevenZip t $archive
+          if ($LASTEXITCODE -ne 0) { throw 'Joined ZIP failed integrity testing.' }
+          if (Test-Path $extract) { Remove-Item -LiteralPath $extract -Recurse -Force }
+          New-Item -ItemType Directory -Force -Path $extract | Out-Null
+          & $sevenZip x $archive "-o$extract" -y
+          if ($LASTEXITCODE -ne 0) { throw 'Unreal Engine extraction failed.' }
+          $editor = Get-ChildItem -LiteralPath $extract -Filter UnrealEditor.exe -File -Recurse -ErrorAction SilentlyContinue | Where-Object { $_.FullName -match '\\Engine\\Binaries\\Win64\\UnrealEditor\.exe$' } | Select-Object -First 1
+          if (-not $editor) { throw 'UnrealEditor.exe was not found.' }
+          Write-Host "EDITOR_EXE=$($editor.FullName)"
+          "UE_EDITOR_EXE=$($editor.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
-          if (!(Test-Path $sevenZip)) {
-            throw "7-Zip executable not found."
-          }
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
 
-          & $sevenZip t $zip
-
-          if ($LASTEXITCODE -ne 0) {
-            throw "ZIP validation failed. Confirm the parts are raw sequential ZIP chunks."
-          }
-
-          & $sevenZip x $zip "-o$root\Extracted" -y
-
-          if ($LASTEXITCODE -ne 0) {
-            throw "Unreal Engine extraction failed."
-          }
-
-          $editor = Get-ChildItem "$root\Extracted" `
-            -Filter UnrealEditor.exe -Recurse -File |
-            Select-Object -First 1
-
-          if (!$editor) {
-            throw "UnrealEditor.exe was not found."
-          }
-
-          "UE_EDITOR=$($editor.FullName)" >> $env:GITHUB_ENV
-
-          Write-Host "Editor: $($editor.FullName)"
-
-      - name: Create Unreal Control Project
+      - name: Create UE project, bridge and API server
         shell: pwsh
         run: |
-          $project = "$env:UE_ROOT\UEControl"
-          $uproject = "$project\UEControl.uproject"
+          $ErrorActionPreference = 'Stop'
+          $root = 'D:\UE58'
+          $project = "$root\UEControl"
+          $pythonDir = "$project\Content\Python"
+          $config = "$project\Config"
+          New-Item -ItemType Directory -Force -Path $pythonDir, $config, "$root\Projects", "$root\Screenshots", "$root\Uploads", "$root\Logs" | Out-Null
 
-          $data = @{
-            FileVersion = 3
-            EngineAssociation = ""
-            Category = ""
-            Description = "Remote Unreal Engine Control"
-            Modules = @()
-            Plugins = @(
-              @{
-                Name = "PythonScriptPlugin"
-                Enabled = $true
-              },
-              @{
-                Name = "EditorScriptingUtilities"
-                Enabled = $true
-              }
-            )
+          $uproject = @'
+          {
+            "FileVersion": 3,
+            "EngineAssociation": "5.8",
+            "Category": "RemoteControl",
+            "Description": "Unreal Editor controlled through an authenticated API bridge",
+            "Plugins": [
+              { "Name": "PythonScriptPlugin", "Enabled": true },
+              { "Name": "EditorScriptingUtilities", "Enabled": true }
+            ]
           }
+          '@
+          Set-Content -LiteralPath "$project\UEControl.uproject" -Value $uproject -Encoding utf8
 
-          $data |
-            ConvertTo-Json -Depth 10 |
-            Set-Content $uproject -Encoding utf8
+          $engineConfig = @'
+          [/Script/EngineSettings.GameMapsSettings]
+          EditorStartupMap=/Engine/Maps/Entry
+          GameDefaultMap=/Engine/Maps/Entry
+          '@
+          Set-Content -LiteralPath "$config\DefaultEngine.ini" -Value $engineConfig -Encoding utf8
 
-      - name: Create Unreal Python Bridge
-        shell: pwsh
-        run: |
-          $path = "$env:UE_ROOT\UEControl\Content\Python\init_unreal.py"
-
-          @'
+          $bridge = @'
+          import ast
+          import contextlib
+          import io
           import json
+          import os
+          import queue
+          import threading
           import time
+          import traceback
           import urllib.request
           import unreal
 
           API = "http://127.0.0.1:8765"
-          TOKEN = __import__("os").environ.get("COMMAND_TOKEN", "")
-          LAST_POLL = 0
-          BUSY = False
+          TOKEN = os.environ.get("BRIDGE_TOKEN", "")
+          ROOT = os.environ.get("UE_ROOT", r"D:\UE58")
+          LOG_FILE = os.path.join(ROOT, "Logs", "unreal_bridge.log")
+          INCOMING = queue.Queue()
+          OUTGOING = queue.Queue()
+          NAMESPACE = {"__name__": "__ue_remote__"}
 
-          def api_request(path, payload=None):
-              headers = {"Authorization": "Bearer " + TOKEN}
-              data = None
-
-              if payload is not None:
-                  data = json.dumps(payload).encode("utf-8")
-                  headers["Content-Type"] = "application/json"
-
-              req = urllib.request.Request(
-                  API + path,
-                  data=data,
-                  headers=headers,
-                  method="POST" if data is not None else "GET"
-              )
-
-              with urllib.request.urlopen(req, timeout=15) as response:
-                  return json.loads(response.read().decode("utf-8"))
-
-          def execute_job(job):
-              job_id = job["id"]
-              code = job["code"]
-              namespace = {"unreal": unreal, "RESULT": None}
-
+          def log(message):
               try:
-                  exec(compile(code, "<remote-command>", "exec"),
-                       namespace, namespace)
-
-                  result = {
-                      "ok": True,
-                      "output": str(namespace.get("RESULT", "Command completed"))
-                  }
-
-              except Exception as exc:
-                  result = {
-                      "ok": False,
-                      "error": str(exc)
-                  }
-                  unreal.log_error("Remote command error: " + str(exc))
-
-              try:
-                  api_request("/internal/result", {
-                      "id": job_id,
-                      "result": result
-                  })
-              except Exception as exc:
-                  unreal.log_error("Could not return result: " + str(exc))
-
-          def editor_tick(delta_seconds):
-              global LAST_POLL, BUSY
-
-              if BUSY or not TOKEN:
-                  return
-
-              now = time.time()
-
-              if now - LAST_POLL < 0.5:
-                  return
-
-              LAST_POLL = now
-
-              try:
-                  response = api_request("/internal/next")
-                  job = response.get("job")
-
-                  if job:
-                      BUSY = True
-                      try:
-                          execute_job(job)
-                      finally:
-                          BUSY = False
-
+                  with open(LOG_FILE, "a", encoding="utf-8") as stream:
+                      stream.write(time.strftime("%Y-%m-%d %H:%M:%S ") + str(message) + "\n")
               except Exception:
-                  # API may still be starting.
                   pass
 
-          unreal.log("Remote Unreal Python bridge loaded.")
-          unreal.register_slate_post_tick_callback(editor_tick)
-          '@ | Set-Content $path -Encoding utf8
+          def request_json(path, payload=None, timeout=5):
+              data = None if payload is None else json.dumps(payload).encode("utf-8")
+              req = urllib.request.Request(
+                  API + path, data=data,
+                  headers={"Authorization": "Bearer " + TOKEN, "Content-Type": "application/json"},
+                  method="GET" if payload is None else "POST"
+              )
+              with urllib.request.urlopen(req, timeout=timeout) as response:
+                  return json.loads(response.read().decode("utf-8"))
 
-      - name: Create API Server
-        shell: pwsh
-        run: |
-          $path = "$env:UE_ROOT\api_server.py"
+          def execute_code(source):
+              captured = io.StringIO()
+              error = ""
+              try:
+                  parsed = ast.parse(source, filename="<remote-unreal-python>", mode="exec")
+                  with contextlib.redirect_stdout(captured), contextlib.redirect_stderr(captured):
+                      if parsed.body and isinstance(parsed.body[-1], ast.Expr):
+                          prefix = ast.Module(body=parsed.body[:-1], type_ignores=[])
+                          if prefix.body:
+                              exec(compile(prefix, "<remote-unreal-python>", "exec"), NAMESPACE, NAMESPACE)
+                          value = eval(compile(ast.Expression(parsed.body[-1].value), "<remote-unreal-python>", "eval"), NAMESPACE, NAMESPACE)
+                          if value is not None:
+                              print(repr(value))
+                      else:
+                          exec(compile(parsed, "<remote-unreal-python>", "exec"), NAMESPACE, NAMESPACE)
+              except Exception as exc:
+                  error = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+              output = captured.getvalue().strip()
+              if not output and not error:
+                  output = "Executed successfully (no output)."
+              return output, error
 
-          @'
-          import os
-          import io
+          def network_worker():
+              log("Bridge network worker started")
+              while True:
+                  try:
+                      while not OUTGOING.empty():
+                          payload = OUTGOING.get_nowait()
+                          try:
+                              request_json("/internal/result", payload, timeout=8)
+                          except Exception as exc:
+                              log("Posting result failed: " + repr(exc))
+                      reply = request_json("/internal/next", {"wait": 1}, timeout=5)
+                      job = reply.get("job") if isinstance(reply, dict) else None
+                      if job:
+                          INCOMING.put(job)
+                  except Exception as exc:
+                      log("Polling error: " + repr(exc))
+                      time.sleep(1)
+
+          def editor_tick(delta_seconds):
+              try:
+                  job = INCOMING.get_nowait()
+              except queue.Empty:
+                  return
+              job_id = job.get("id", "")
+              log("Executing job " + str(job_id))
+              output, error = execute_code(job.get("code", ""))
+              OUTGOING.put({"id": job_id, "output": output, "error": error})
+
+          if not TOKEN:
+              log("ERROR: BRIDGE_TOKEN missing from Unreal process environment")
+              raise RuntimeError("BRIDGE_TOKEN missing")
+
+          threading.Thread(target=network_worker, name="UE-Remote-Network", daemon=True).start()
+          CALLBACK_HANDLE = unreal.register_slate_post_tick_callback(editor_tick)
+          version = unreal.SystemLibrary.get_engine_version()
+          log("Bridge registered; UE_VERSION=" + str(version))
+          print("UE_REMOTE_BRIDGE_READY " + str(version))
+          '@
+          Set-Content -LiteralPath "$pythonDir\init_unreal.py" -Value $bridge -Encoding utf8
+
+          $api = @'
           import json
-          import uuid
-          import time
+          import os
           import queue
+          import re
           import threading
+          import time
+          import uuid
           from pathlib import Path
           from functools import wraps
-
-          from flask import Flask, request, jsonify, send_file
-          from google.oauth2 import service_account
-          from googleapiclient.discovery import build
-          from googleapiclient.http import MediaFileUpload, MediaIoBaseDownload
-
-          ROOT = Path(r"D:\UE58")
-          PROJECTS = ROOT / "Projects"
-          UPLOADS = ROOT / "Uploads"
-          SCREENSHOTS = ROOT / "Screenshots"
-          LOGS = ROOT / "Logs"
-
-          for folder in (PROJECTS, UPLOADS, SCREENSHOTS, LOGS):
-              folder.mkdir(parents=True, exist_ok=True)
-
-          TOKEN = os.environ["COMMAND_TOKEN"]
-          DRIVE_JSON = os.environ["GG_UE_TOKEN"]
+          from flask import Flask, jsonify, request, send_file
 
           app = Flask(__name__)
-          app.config["MAX_CONTENT_LENGTH"] = 20 * 1024 * 1024 * 1024
-
-          jobs = {}
-          job_queue = queue.Queue()
+          app.config["MAX_CONTENT_LENGTH"] = 8 * 1024 * 1024 * 1024
+          ROOT = Path(os.environ.get("UE_ROOT", r"D:\UE58")).resolve()
+          LOG_DIR = ROOT / "Logs"
+          LOG_DIR.mkdir(parents=True, exist_ok=True)
+          LOG_FILE = LOG_DIR / "api.log"
+          COMMAND_TOKEN = os.environ.get("COMMAND_TOKEN", "")
+          BRIDGE_TOKEN = os.environ.get("BRIDGE_TOKEN", "")
+          jobs = queue.Queue()
+          waiting = {}
           lock = threading.Lock()
+          last_bridge_seen = 0.0
 
-          def auth(fn):
+          def log(message):
+              line = time.strftime("%Y-%m-%d %H:%M:%S ") + str(message)
+              try:
+                  with LOG_FILE.open("a", encoding="utf-8") as out:
+                      out.write(line + "\n")
+              except Exception:
+                  pass
+              print(line, flush=True)
+
+          def public_auth(fn):
               @wraps(fn)
               def wrapper(*args, **kwargs):
-                  if request.headers.get("Authorization") != "Bearer " + TOKEN:
-                      return jsonify({"ok": False, "error": "Unauthorized"}), 401
+                  if not COMMAND_TOKEN:
+                      return jsonify(ok=False, error="COMMAND_TOKEN is not configured"), 500
+                  if request.headers.get("Authorization", "") != "Bearer " + COMMAND_TOKEN:
+                      return jsonify(ok=False, error="unauthorized"), 401
                   return fn(*args, **kwargs)
               return wrapper
 
-          def drive():
-              info = json.loads(DRIVE_JSON)
-              credentials = service_account.Credentials.from_service_account_info(
-                  info,
-                  scopes=["https://www.googleapis.com/auth/drive"]
-              )
-              return build(
-                  "drive", "v3",
-                  credentials=credentials,
-                  cache_discovery=False
-              )
+          def bridge_auth(fn):
+              @wraps(fn)
+              def wrapper(*args, **kwargs):
+                  if not BRIDGE_TOKEN or request.headers.get("Authorization", "") != "Bearer " + BRIDGE_TOKEN:
+                      return jsonify(ok=False, error="unauthorized_internal"), 401
+                  return fn(*args, **kwargs)
+              return wrapper
 
-          def submit_command(code, timeout=240):
-              job_id = str(uuid.uuid4())
+          def safe_path(value):
+              if not value:
+                  raise ValueError("path is required")
+              candidate = Path(value)
+              if not candidate.is_absolute():
+                  candidate = ROOT / candidate
+              resolved = candidate.resolve()
+              if resolved != ROOT and ROOT not in resolved.parents:
+                  raise ValueError("path must stay inside D:\\UE58")
+              return resolved
 
-              with lock:
-                  jobs[job_id] = {"done": False}
+          def bridge_connected():
+              return time.time() - last_bridge_seen < 12
 
-              job_queue.put({"id": job_id, "code": code})
-              deadline = time.time() + timeout
-
-              while time.time() < deadline:
-                  with lock:
-                      job = jobs.get(job_id)
-                      if job and job.get("done"):
-                          return job["result"]
-                  time.sleep(0.25)
-
-              return {"ok": False, "error": "Command timed out"}
+          def google_drive():
+              raw = os.environ.get("GG_UE_TOKEN", "")
+              if not raw:
+                  raise RuntimeError("GG_UE_TOKEN is missing from Actions Secrets")
+              from google.oauth2 import service_account
+              from googleapiclient.discovery import build
+              info = json.loads(raw)
+              creds = service_account.Credentials.from_service_account_info(
+                  info, scopes=["https://www.googleapis.com/auth/drive"])
+              return build("drive", "v3", credentials=creds, cache_discovery=False)
 
           @app.get("/health")
-          @auth
+          @public_auth
           def health():
-              return jsonify({
-                  "ok": True,
-                  "service": "Unreal Remote API",
-                  "time": time.time()
-              })
+              return jsonify(ok=True, service="Unreal Remote API", bridge_connected=bridge_connected(),
+                             engine_bridge_last_seen=(last_bridge_seen or None), time=time.time())
 
           @app.post("/command")
-          @auth
+          @public_auth
           def command():
+              if not bridge_connected():
+                  return jsonify(ok=False, error="unreal_bridge_not_connected",
+                                 detail="API is online, but the Unreal Python bridge has not checked in. Check /logs and Actions logs."), 503
               body = request.get_json(silent=True) or {}
               code = body.get("code")
-
               if not isinstance(code, str) or not code.strip():
-                  return jsonify({"ok": False, "error": "Provide code"}), 400
-
-              timeout = min(max(int(body.get("timeout", 240)), 1), 240)
-              return jsonify(submit_command(code, timeout))
-
-          @app.get("/internal/next")
-          def internal_next():
-              if request.headers.get("Authorization") != "Bearer " + TOKEN:
-                  return jsonify({"error": "Unauthorized"}), 401
-
+                  return jsonify(ok=False, error="JSON field 'code' must contain Python source"), 400
+              if len(code) > 100000:
+                  return jsonify(ok=False, error="code exceeds 100000 characters"), 413
               try:
-                  return jsonify({"job": job_queue.get_nowait()})
+                  timeout = max(1, min(300, int(body.get("timeout", 60))))
+              except (ValueError, TypeError):
+                  timeout = 60
+              job_id = uuid.uuid4().hex
+              event = threading.Event()
+              with lock:
+                  waiting[job_id] = {"event": event, "result": None}
+              jobs.put({"id": job_id, "code": code})
+              if not event.wait(timeout):
+                  with lock:
+                      waiting.pop(job_id, None)
+                  return jsonify(ok=False, error="unreal_command_timeout",
+                                 detail="Unreal did not return a result before timeout; inspect the Editor logs."), 504
+              with lock:
+                  row = waiting.pop(job_id, None)
+              result = row["result"] if row else None
+              if not result:
+                  return jsonify(ok=False, error="missing_result"), 500
+              return jsonify(ok=not bool(result.get("error")), output=result.get("output", ""),
+                             error=result.get("error", ""), job_id=job_id)
+
+          @app.post("/internal/next")
+          @bridge_auth
+          def internal_next():
+              global last_bridge_seen
+              last_bridge_seen = time.time()
+              try:
+                  job = jobs.get(timeout=1.5)
               except queue.Empty:
-                  return jsonify({"job": None})
+                  job = None
+              return jsonify(ok=True, job=job)
 
           @app.post("/internal/result")
+          @bridge_auth
           def internal_result():
-              if request.headers.get("Authorization") != "Bearer " + TOKEN:
-                  return jsonify({"error": "Unauthorized"}), 401
-
               body = request.get_json(silent=True) or {}
               job_id = body.get("id")
-
+              if not job_id:
+                  return jsonify(ok=False, error="id is required"), 400
               with lock:
-                  if job_id in jobs:
-                      jobs[job_id] = {
-                          "done": True,
-                          "result": body.get("result", {})
-                      }
-
-              return jsonify({"ok": True})
+                  row = waiting.get(job_id)
+                  if row is None:
+                      return jsonify(ok=False, error="job expired or no longer waiting"), 404
+                  row["result"] = {"output": str(body.get("output", "")), "error": str(body.get("error", ""))}
+                  row["event"].set()
+              return jsonify(ok=True)
 
           @app.get("/projects")
-          @auth
+          @public_auth
           def projects():
               found = []
-
-              for project in ROOT.rglob("*.uproject"):
-                  found.append({
-                      "name": project.stem,
-                      "project_file": str(project),
-                      "directory": str(project.parent)
-                  })
-
-              return jsonify({"ok": True, "projects": found})
-
-          @app.post("/files/upload")
-          @auth
-          def upload_file():
-              file = request.files.get("file")
-
-              if file is None:
-                  return jsonify({"ok": False, "error": "Missing file"}), 400
-
-              filename = Path(file.filename or "upload.bin").name
-              destination = UPLOADS / filename
-              file.save(destination)
-
-              return jsonify({
-                  "ok": True,
-                  "filename": filename,
-                  "path": str(destination),
-                  "size": destination.stat().st_size
-              })
-
-          @app.get("/files/download")
-          @auth
-          def download_file():
-              path = Path(request.args.get("path", ""))
-
-              if not path.is_absolute() or not path.is_file():
-                  return jsonify({"ok": False, "error": "File not found"}), 404
-
-              return send_file(path, as_attachment=True)
-
-          @app.post("/drive/list")
-          @auth
-          def drive_list():
-              body = request.get_json(silent=True) or {}
-              folder_id = body.get("folder_id", "root")
-
-              result = drive().files().list(
-                  q="'" + folder_id.replace("'", "\\'") + "' in parents and trashed = false",
-                  pageSize=min(max(int(body.get("page_size", 100)), 1), 1000),
-                  fields="files(id,name,mimeType,size,webViewLink,modifiedTime)"
-              ).execute()
-
-              return jsonify({"ok": True, "files": result.get("files", [])})
-
-          @app.post("/drive/download")
-          @auth
-          def drive_download():
-              body = request.get_json(silent=True) or {}
-              file_id = body.get("file_id")
-              destination = body.get("destination")
-
-              if not file_id or not destination:
-                  return jsonify({
-                      "ok": False,
-                      "error": "Provide file_id and destination"
-                  }), 400
-
-              path = Path(destination)
-
-              if not path.is_absolute():
-                  return jsonify({"ok": False, "error": "Absolute path required"}), 400
-
-              path.parent.mkdir(parents=True, exist_ok=True)
-              service = drive()
-
-              metadata = service.files().get(
-                  fileId=file_id,
-                  fields="id,name,mimeType"
-              ).execute()
-
-              media = service.files().get_media(fileId=file_id)
-
-              with open(path, "wb") as stream:
-                  downloader = MediaIoBaseDownload(stream, media)
-                  done = False
-
-                  while not done:
-                      _, done = downloader.next_chunk()
-
-              return jsonify({
-                  "ok": True,
-                  "file_id": file_id,
-                  "name": metadata.get("name"),
-                  "path": str(path),
-                  "size": path.stat().st_size
-              })
-
-          @app.post("/drive/upload")
-          @auth
-          def drive_upload():
-              body = request.get_json(silent=True) or {}
-              source = Path(body.get("source", ""))
-
-              if not source.is_absolute() or not source.is_file():
-                  return jsonify({"ok": False, "error": "Source file not found"}), 404
-
-              metadata = {
-                  "name": Path(body.get("filename") or source.name).name
-              }
-
-              folder_id = body.get("drive_folder_id")
-              if folder_id:
-                  metadata["parents"] = [folder_id]
-
-              media = MediaFileUpload(
-                  str(source),
-                  resumable=True,
-                  chunksize=8 * 1024 * 1024
-              )
-
-              result = drive().files().create(
-                  body=metadata,
-                  media_body=media,
-                  fields="id,name,mimeType,webViewLink,size"
-              ).execute()
-
-              return jsonify({"ok": True, "file": result})
-
-          @app.post("/unreal/screenshot")
-          @auth
-          def unreal_screenshot():
-              code = (
-                  "import unreal\n"
-                  "unreal.SystemLibrary.execute_console_command("
-                  "None, 'HighResShot 1920x1080')\n"
-                  "RESULT = 'Screenshot command sent. Check the project Saved/Screenshots folder.'"
-              )
-
-              result = submit_command(code, 90)
-              return jsonify({
-                  "ok": result.get("ok", False),
-                  "result": result,
-                  "note": "The screenshot is written by Unreal to its screenshot output directory."
-              })
-
-          @app.get("/logs")
-          @auth
-          def logs():
-              files = list(LOGS.glob("*.log"))
-
-              if not files:
-                  return jsonify({"ok": True, "logs": []})
-
-              newest = max(files, key=lambda item: item.stat().st_mtime)
-              return send_file(newest, as_attachment=True)
+              for base in [ROOT / "Projects", ROOT / "UEControl"]:
+                  if base.exists():
+                      for item in base.rglob("*.uproject"):
+                          found.append({"name": item.stem, "project_file": str(item), "directory": str(item.parent)})
+              found.sort(key=lambda item: item["name"].lower())
+              return jsonify(ok=True, count=len(found), projects=found)
 
           @app.post("/projects/rename")
-          @auth
+          @public_auth
           def rename_project():
               body = request.get_json(silent=True) or {}
-              project_file = Path(body.get("project_file", ""))
-              new_name = body.get("new_name", "")
+              try:
+                  source = safe_path(body.get("project_file", ""))
+              except ValueError as exc:
+                  return jsonify(ok=False, error=str(exc)), 400
+              new_name = str(body.get("new_name", "")).strip()
+              if not re.fullmatch(r"[A-Za-z0-9_-]{1,80}", new_name):
+                  return jsonify(ok=False, error="new_name permits only letters, numbers, _ and -"), 400
+              if source.suffix.lower() != ".uproject" or not source.is_file():
+                  return jsonify(ok=False, error="project_file must be an existing .uproject file"), 404
+              target = source.with_name(new_name + ".uproject")
+              if target.exists() and target != source:
+                  return jsonify(ok=False, error="target file already exists"), 409
+              try:
+                  source.rename(target)
+                  return jsonify(ok=True, old_path=str(source), project_file=str(target), new_name=new_name,
+                                 note="Only the .uproject file was renamed; the folder name was not changed.")
+              except OSError as exc:
+                  return jsonify(ok=False, error=str(exc)), 500
 
-              if not project_file.is_absolute() or not project_file.is_file():
-                  return jsonify({"ok": False, "error": "Project file not found"}), 404
+          @app.post("/files/upload")
+          @public_auth
+          def file_upload():
+              if "file" not in request.files:
+                  return jsonify(ok=False, error="multipart field 'file' is required"), 400
+              file = request.files["file"]
+              destination_value = request.form.get("path") or file.filename or "upload.bin"
+              try:
+                  destination = safe_path(destination_value)
+                  destination.parent.mkdir(parents=True, exist_ok=True)
+                  file.save(destination)
+                  return jsonify(ok=True, path=str(destination), size=destination.stat().st_size)
+              except (ValueError, OSError) as exc:
+                  return jsonify(ok=False, error=str(exc)), 400
 
-              if project_file.suffix.lower() != ".uproject":
-                  return jsonify({"ok": False, "error": "Expected a .uproject file"}), 400
+          @app.get("/files/download")
+          @public_auth
+          def file_download():
+              try:
+                  path = safe_path(request.args.get("path", ""))
+              except ValueError as exc:
+                  return jsonify(ok=False, error=str(exc)), 400
+              if not path.is_file():
+                  return jsonify(ok=False, error="file not found", path=str(path)), 404
+              return send_file(path, as_attachment=True, download_name=path.name)
 
-              if not new_name or Path(new_name).name != new_name:
-                  return jsonify({"ok": False, "error": "Invalid new name"}), 400
+          @app.post("/drive/list")
+          @public_auth
+          def drive_list():
+              body = request.get_json(silent=True) or {}
+              folder_id = str(body.get("folder_id", "root"))
+              try:
+                  page_size = max(1, min(1000, int(body.get("page_size", 100))))
+                  query = "trashed = false"
+                  if folder_id != "*":
+                      query += " and '" + folder_id.replace("'", "") + "' in parents"
+                  result = google_drive().files().list(
+                      q=query, pageSize=page_size, orderBy="name",
+                      fields="files(id,name,mimeType,size,modifiedTime,webViewLink,parents)").execute()
+                  files = result.get("files", [])
+                  return jsonify(ok=True, count=len(files), files=files)
+              except Exception as exc:
+                  log("Drive list error: " + repr(exc))
+                  return jsonify(ok=False, error=str(exc)), 502
 
-              target = project_file.with_name(new_name + ".uproject")
+          @app.post("/drive/download")
+          @public_auth
+          def drive_download():
+              body = request.get_json(silent=True) or {}
+              file_id = str(body.get("file_id", "")).strip()
+              if not file_id:
+                  return jsonify(ok=False, error="file_id is required"), 400
+              try:
+                  destination = safe_path(body.get("destination", ""))
+                  destination.parent.mkdir(parents=True, exist_ok=True)
+                  from googleapiclient.http import MediaIoBaseDownload
+                  media = google_drive().files().get_media(fileId=file_id)
+                  with destination.open("wb") as handle:
+                      downloader = MediaIoBaseDownload(handle, media, chunksize=8 * 1024 * 1024)
+                      done = False
+                      while not done:
+                          _, done = downloader.next_chunk()
+                  return jsonify(ok=True, file_id=file_id, destination=str(destination), size=destination.stat().st_size)
+              except Exception as exc:
+                  log("Drive download error: " + repr(exc))
+                  return jsonify(ok=False, error=str(exc)), 502
 
-              if target.exists():
-                  return jsonify({"ok": False, "error": "Target already exists"}), 409
+          @app.post("/drive/upload")
+          @public_auth
+          def drive_upload():
+              body = request.get_json(silent=True) or {}
+              try:
+                  source = safe_path(body.get("source", ""))
+                  if not source.is_file():
+                      return jsonify(ok=False, error="source file not found", source=str(source)), 404
+                  from googleapiclient.http import MediaFileUpload
+                  folder_id = str(body.get("drive_folder_id", "root"))
+                  metadata = {"name": str(body.get("filename") or source.name)}
+                  if folder_id and folder_id != "root":
+                      metadata["parents"] = [folder_id]
+                  upload = MediaFileUpload(str(source), resumable=True, chunksize=8 * 1024 * 1024)
+                  result = google_drive().files().create(body=metadata, media_body=upload,
+                      fields="id,name,mimeType,size,webViewLink").execute()
+                  return jsonify(ok=True, file=result)
+              except Exception as exc:
+                  log("Drive upload error: " + repr(exc))
+                  return jsonify(ok=False, error=str(exc)), 502
 
-              project_file.rename(target)
+          @app.post("/unreal/screenshot")
+          @public_auth
+          def screenshot():
+              if not bridge_connected():
+                  return jsonify(ok=False, error="unreal_bridge_not_connected"), 503
+              output = ROOT / "Screenshots" / ("ue_" + time.strftime("%Y%m%d_%H%M%S") + ".png")
+              output.parent.mkdir(parents=True, exist_ok=True)
+              target = str(output).replace("\\", "/")
+              code = (
+                  "import unreal\n"
+                  "world = unreal.get_editor_subsystem(unreal.UnrealEditorSubsystem).get_editor_world()\n"
+                  + "unreal.SystemLibrary.execute_console_command(world, 'HighResShot 1920x1080 filename=\"" + target + "\"')\n"
+                  + repr("SCREENSHOT_REQUESTED " + target)
+              )
+              job_id = uuid.uuid4().hex
+              event = threading.Event()
+              with lock:
+                  waiting[job_id] = {"event": event, "result": None}
+              jobs.put({"id": job_id, "code": code})
+              if not event.wait(45):
+                  with lock:
+                      waiting.pop(job_id, None)
+                  return jsonify(ok=False, error="unreal_command_timeout"), 504
+              with lock:
+                  row = waiting.pop(job_id, None)
+              if row and row["result"] and row["result"].get("error"):
+                  return jsonify(ok=False, error="screenshot_command_failed", detail=row["result"]["error"]), 502
+              deadline = time.time() + 30
+              while time.time() < deadline:
+                  if output.is_file() and output.stat().st_size > 0:
+                      return send_file(output, mimetype="image/png", as_attachment=True, download_name=output.name)
+                  time.sleep(1)
+              return jsonify(ok=False, error="screenshot_file_not_created",
+                             detail="Unreal command finished but no PNG was created. Check rendering and the Unreal log.",
+                             expected_path=str(output)), 502
 
-              return jsonify({
-                  "ok": True,
-                  "project_file": str(target),
-                  "note": "Renamed the .uproject file only."
-              })
+          @app.get("/logs")
+          @public_auth
+          def logs():
+              chunks = []
+              for path in [LOG_FILE, LOG_DIR / "unreal_bridge.log"]:
+                  if path.is_file():
+                      chunks.append("===== " + path.name + " =====\n" + path.read_text(encoding="utf-8", errors="replace")[-50000:])
+              project_logs = ROOT / "UEControl" / "Saved" / "Logs"
+              if project_logs.exists():
+                  candidates = sorted(project_logs.glob("*.log"), key=lambda p: p.stat().st_mtime, reverse=True)
+                  if candidates:
+                      chunks.append("===== " + candidates[0].name + " =====\n" + candidates[0].read_text(encoding="utf-8", errors="replace")[-50000:])
+              return app.response_class("\n\n".join(chunks) or "No logs yet.", mimetype="text/plain")
 
           if __name__ == "__main__":
-              app.run(host="127.0.0.1", port=8765, threaded=True)
-          '@ | Set-Content $path -Encoding utf8
+              if not COMMAND_TOKEN or not BRIDGE_TOKEN:
+                  raise RuntimeError("COMMAND_TOKEN and BRIDGE_TOKEN must be set")
+              log("Starting Unreal Remote API at 127.0.0.1:8765")
+              app.run(host="127.0.0.1", port=8765, threaded=True, use_reloader=False)
+          '@
+          Set-Content -LiteralPath "$root\api_server.py" -Value $api -Encoding utf8
+          Write-Host 'Created project and bridge scripts.'
 
-      - name: Start API, Unreal and Cloudflare Tunnel
+      - name: Launch API, Unreal and Cloudflare tunnel
         shell: pwsh
         env:
           COMMAND_TOKEN: ${{ secrets.COMMAND_TOKEN }}
           GG_UE_TOKEN: ${{ secrets.GG_UE_TOKEN }}
         run: |
-          $ErrorActionPreference = "Stop"
-          $root = $env:UE_ROOT
+          $ErrorActionPreference = 'Stop'
+          $root = 'D:\UE58'
+          $env:UE_ROOT = $root
+          if ([string]::IsNullOrWhiteSpace($env:COMMAND_TOKEN) -or $env:COMMAND_TOKEN.Length -lt 32) { throw 'Set a new COMMAND_TOKEN repository secret of at least 32 characters.' }
+          $commandToken = $env:COMMAND_TOKEN
+          if ([string]::IsNullOrWhiteSpace($env:GG_UE_TOKEN)) { Write-Warning 'GG_UE_TOKEN is empty; Google Drive routes will not work until the service-account JSON is configured.' }
+          $env:BRIDGE_TOKEN = [guid]::NewGuid().ToString('N') + [guid]::NewGuid().ToString('N')
+          $python = (Get-Command python).Source
+          & $python -m pip install --disable-pip-version-check --upgrade Flask google-api-python-client google-auth
+          if ($LASTEXITCODE -ne 0) { throw 'Python package installation failed.' }
 
-          # Child processes inherit these environment variables.
-          $apiLog = "$root\Logs\api-out.log"
-          $apiError = "$root\Logs\api-error.log"
-
-          $api = Start-Process python `
-            -ArgumentList "`"$root\api_server.py`"" `
-            -PassThru `
-            -RedirectStandardOutput $apiLog `
-            -RedirectStandardError $apiError
-
-          Start-Sleep -Seconds 3
-
-          if ($api.HasExited) {
-            Get-Content $apiError -ErrorAction SilentlyContinue
-            throw "API failed to start."
+          $apiOut = "$root\Logs\api-stdout.log"
+          $apiErr = "$root\Logs\api-stderr.log"
+          $apiProc = Start-Process -FilePath $python -ArgumentList @("$root\api_server.py") -WorkingDirectory $root -PassThru -WindowStyle Hidden -RedirectStandardOutput $apiOut -RedirectStandardError $apiErr
+          Write-Host "API_PID=$($apiProc.Id)"
+          $headers = @{ Authorization = "Bearer $commandToken" }
+          $localReady = $false
+          for ($i = 0; $i -lt 45; $i++) {
+            Start-Sleep -Seconds 2
+            try {
+              $health = Invoke-RestMethod -Uri 'http://127.0.0.1:8765/health' -Headers $headers -TimeoutSec 4
+              if ($health.ok) { $localReady = $true; break }
+            } catch { }
+            if ($apiProc.HasExited) { break }
           }
+          if (-not $localReady) {
+            if (Test-Path $apiErr) { Get-Content $apiErr -Tail 100 }
+            if (Test-Path $apiOut) { Get-Content $apiOut -Tail 100 }
+            throw 'Local API did not start.'
+          }
+          Write-Host 'API_LOCAL_READY=true'
 
-          $editorLog = "$root\Logs\unreal-editor.log"
-
-          $editor = Start-Process $env:UE_EDITOR `
-            -ArgumentList @(
-              "$root\UEControl\UEControl.uproject",
-              "-abslog=$editorLog",
-              "-EnablePlugins=PythonScriptPlugin,EditorScriptingUtilities",
-              "-AllowSoftwareRendering",
-              "-d3d11"
-            ) `
-            -PassThru
+          # The API process already inherited the two secrets. Do not pass the public token or Google credentials to Unreal.
+          $env:COMMAND_TOKEN = $null
+          $env:GG_UE_TOKEN = $null
+          $editor = $env:UE_EDITOR_EXE
+          if ([string]::IsNullOrWhiteSpace($editor) -or -not (Test-Path $editor)) { throw 'UE_EDITOR_EXE was not found from the extraction step.' }
+          $ueOut = "$root\Logs\unreal-stdout.log"
+          $ueErr = "$root\Logs\unreal-stderr.log"
+          $args = @("$root\UEControl\UEControl.uproject", '-log', '-stdout', '-FullStdOutLogOutput', '-AllowSoftwareRendering', '-d3d11')
+          $ueProc = Start-Process -FilePath $editor -ArgumentList $args -WorkingDirectory "$root\UEControl" -PassThru -RedirectStandardOutput $ueOut -RedirectStandardError $ueErr
+          Write-Host "UNREAL_PID=$($ueProc.Id)"
 
           $cloudflared = "$root\cloudflared.exe"
-
-          Invoke-WebRequest `
-            "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe" `
-            -OutFile $cloudflared
-
-          $tunnelLog = "$root\Logs\cloudflared.log"
-          $tunnelError = "$root\Logs\cloudflared-error.log"
-
-          $tunnel = Start-Process $cloudflared `
-            -ArgumentList @(
-              "tunnel",
-              "--url",
-              "http://127.0.0.1:8765",
-              "--no-autoupdate"
-            ) `
-            -PassThru `
-            -RedirectStandardOutput $tunnelLog `
-            -RedirectStandardError $tunnelError
+          Invoke-WebRequest -Uri 'https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe' -OutFile $cloudflared
+          $cfOut = "$root\Logs\cloudflared-stdout.log"
+          $cfErr = "$root\Logs\cloudflared-stderr.log"
+          $cfProc = Start-Process -FilePath $cloudflared -ArgumentList @('tunnel', '--url', 'http://127.0.0.1:8765', '--no-autoupdate') -WorkingDirectory $root -PassThru -WindowStyle Hidden -RedirectStandardOutput $cfOut -RedirectStandardError $cfErr
 
           $publicUrl = $null
-
-          for ($i = 0; $i -lt 60; $i++) {
+          for ($i = 0; $i -lt 90; $i++) {
             Start-Sleep -Seconds 2
-
-            if ($tunnel.HasExited) {
-              Get-Content $tunnelError -ErrorAction SilentlyContinue
-              throw "Cloudflare tunnel exited."
-            }
-
-            $text = ""
-
-            if (Test-Path $tunnelLog) {
-              $text += Get-Content $tunnelLog -Raw
-            }
-
-            if (Test-Path $tunnelError) {
-              $text += Get-Content $tunnelError -Raw
-            }
-
-            $match = [regex]::Match(
-              $text,
-              'https://[a-zA-Z0-9-]+\.trycloudflare\.com'
-            )
-
-            if ($match.Success) {
-              $publicUrl = $match.Value
-              break
-            }
+            $combined = ''
+            foreach ($f in @($cfOut, $cfErr)) { if (Test-Path $f) { try { $combined += "`n" + (Get-Content $f -Raw -ErrorAction SilentlyContinue) } catch { } } }
+            $match = [regex]::Match($combined, 'https://[a-zA-Z0-9-]+\.trycloudflare\.com')
+            if ($match.Success) { $publicUrl = $match.Value; break }
+            if ($cfProc.HasExited) { break }
           }
-
-          if ($publicUrl) {
-            Write-Host "PUBLIC_API_URL=$publicUrl"
-            Write-Host "Use this URL from Termux."
+          if (-not $publicUrl) {
+            if (Test-Path $cfErr) { Get-Content $cfErr -Tail 100 }
+            throw 'Cloudflare Quick Tunnel did not provide a public URL.'
           }
-          else {
-            Write-Host "Tunnel URL not found yet. Check cloudflared logs."
-          }
+          Write-Host "PUBLIC_API_URL=$publicUrl"
 
+          Write-Host 'Waiting up to 3 minutes for init_unreal.py to connect...'
+          $bridgeReady = $false
+          for ($i = 0; $i -lt 90; $i++) {
+            Start-Sleep -Seconds 2
+            try {
+              $health = Invoke-RestMethod -Uri 'http://127.0.0.1:8765/health' -Headers $headers -TimeoutSec 4
+              if ($health.bridge_connected) { $bridgeReady = $true; break }
+            } catch { }
+            if ($ueProc.HasExited) { Write-Warning 'Unreal Editor exited before its Python bridge connected.'; break }
+          }
+          if ($bridgeReady) { Write-Host 'BRIDGE_READY=true' } else { Write-Warning 'BRIDGE_READY=false; /command will report unreal_bridge_not_connected until Unreal loads init_unreal.py.' }
+
+          Write-Host 'API endpoints: /health /command /projects /projects/rename /files/upload /files/download /drive/list /drive/download /drive/upload /unreal/screenshot /logs'
+          Write-Host 'Keep this workflow running. Copy PUBLIC_API_URL and use the current COMMAND_TOKEN secret from Termux.'
           while ($true) {
-            if ($api.HasExited) {
-              throw "API server stopped."
-            }
-
-            if ($editor.HasExited) {
-              throw "Unreal Editor stopped."
-            }
-
-            if ($tunnel.HasExited) {
-              throw "Cloudflare tunnel stopped."
-            }
-
-            Start-Sleep -Seconds 30
+            Start-Sleep -Seconds 60
+            if ($apiProc.HasExited) { throw 'API server stopped; inspect D:\UE58\Logs\api-stderr.log.' }
+            if ($cfProc.HasExited) { throw 'Cloudflare tunnel stopped; inspect D:\UE58\Logs\cloudflared-stderr.log.' }
+            if ($ueProc.HasExited) { throw "Unreal Editor stopped with exit code $($ueProc.ExitCode); inspect D:\UE58\Logs\unreal-stdout.log and D:\UE58\UEControl\Saved\Logs." }
+            try {
+              $health = Invoke-RestMethod -Uri 'http://127.0.0.1:8765/health' -Headers $headers -TimeoutSec 4
+              Write-Host ("Heartbeat {0}: API_OK={1} BRIDGE_CONNECTED={2}" -f (Get-Date), $health.ok, $health.bridge_connected)
+            } catch { Write-Warning 'Health check failed.' }
           }
