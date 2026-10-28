@@ -1,4 +1,4 @@
-name: Unreal Engine 5.8 - Python API Quick Tunnel
+name: Unreal Engine 5.8 Remote Control
 
 on:
   workflow_dispatch:
@@ -7,66 +7,95 @@ permissions:
   contents: read
 
 jobs:
-  unreal-python-api:
+  unreal:
     runs-on: windows-latest
     timeout-minutes: 360
 
     steps:
-      - name: Prepare and validate
+      - name: Validate Secrets and Prepare Folders
         shell: pwsh
         env:
           COMMAND_TOKEN: ${{ secrets.COMMAND_TOKEN }}
+          GG_UE_TOKEN: ${{ secrets.GG_UE_TOKEN }}
         run: |
-          $ErrorActionPreference = 'Stop'
+          $ErrorActionPreference = "Stop"
 
-          if ([string]::IsNullOrWhiteSpace($env:COMMAND_TOKEN) -or
-              $env:COMMAND_TOKEN.Length -lt 32) {
-            throw "Create a COMMAND_TOKEN repository secret with at least 32 characters."
+          if (!$env:COMMAND_TOKEN) {
+            throw "Missing COMMAND_TOKEN secret"
           }
 
-          New-Item -ItemType Directory -Force -Path `
-            D:\UE58, D:\UE58\Parts, D:\UE58\Extracted, `
-            D:\UE58\Logs, D:\UE58\Queue, `
-            D:\UE58\UEControl\Config, `
-            D:\UE58\UEControl\Content\Python | Out-Null
+          if (!$env:GG_UE_TOKEN) {
+            throw "Missing GG_UE_TOKEN secret"
+          }
 
-          Write-Host "Prepared Unreal workspace."
+          $root = "D:\UE58"
 
-      - name: Download Unreal Engine release parts
+          @(
+            $root,
+            "$root\Extracted",
+            "$root\Projects",
+            "$root\Uploads",
+            "$root\Screenshots",
+            "$root\Logs",
+            "$root\UEControl",
+            "$root\UEControl\Content\Python"
+          ) | ForEach-Object {
+            New-Item -ItemType Directory -Path $_ -Force | Out-Null
+          }
+
+          "UE_ROOT=$root" >> $env:GITHUB_ENV
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install API Dependencies
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install flask google-api-python-client google-auth
+
+      - name: Download Unreal Engine Release Parts
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          $ErrorActionPreference = 'Stop'
+          $ErrorActionPreference = "Stop"
+          $root = $env:UE_ROOT
 
           gh release download ue5.8 `
             --repo forgotenmywin/Windows_with_no_vnc `
-            --pattern 'UE_5.8.zip.*' `
-            --dir D:\UE58\Parts
+            --pattern "UE_5.8.zip.*" `
+            --dir $root
 
           if ($LASTEXITCODE -ne 0) {
-            throw "Could not download release assets."
+            throw "Could not download Unreal Engine release assets."
           }
 
-          $parts = @(1..8 | ForEach-Object {
-            "D:\UE58\Parts\UE_5.8.zip.{0:D3}" -f $_
-          })
+          $parts = @(
+            Get-ChildItem $root -File |
+              Where-Object {
+                $_.Name -match '^UE_5\.8\.zip\.\d+$'
+              } |
+              Sort-Object Name
+          )
 
-          foreach ($part in $parts) {
-            if (!(Test-Path $part)) {
-              throw "Missing release part: $part"
-            }
+          if ($parts.Count -ne 8) {
+            throw "Expected 8 ZIP parts, found $($parts.Count)."
           }
 
-          $zip = "D:\UE58\UE_5.8.zip"
-          $out = [System.IO.File]::Create($zip)
+          $zip = "$root\UE_5.8.zip"
+          $output = [System.IO.File]::Create($zip)
 
           try {
             foreach ($part in $parts) {
-              Write-Host "Joining $(Split-Path $part -Leaf)"
-              $inputStream = [System.IO.File]::OpenRead($part)
+              Write-Host "Joining $($part.Name)"
+
+              $inputStream = [System.IO.File]::OpenRead($part.FullName)
+
               try {
-                $inputStream.CopyTo($out)
+                $inputStream.CopyTo($output)
               }
               finally {
                 $inputStream.Dispose()
@@ -74,654 +103,607 @@ jobs:
             }
           }
           finally {
-            $out.Dispose()
+            $output.Dispose()
           }
 
-          Remove-Item D:\UE58\Parts -Recurse -Force
+          if ((Get-Item $zip).Length -lt 1GB) {
+            throw "Combined ZIP is unexpectedly small."
+          }
 
-          Write-Host "Combined ZIP:"
-          Get-Item $zip | Format-List FullName, Length
+          "UE_ZIP=$zip" >> $env:GITHUB_ENV
 
       - name: Extract Unreal Engine
         shell: pwsh
         run: |
-          $ErrorActionPreference = 'Stop'
+          $ErrorActionPreference = "Stop"
+          $root = $env:UE_ROOT
+          $zip = $env:UE_ZIP
 
-          choco install 7zip -y --no-progress
-          if ($LASTEXITCODE -ne 0) {
-            throw "Could not install 7-Zip."
+          $sevenZip = "$env:ProgramFiles\7-Zip\7z.exe"
+
+          if (!(Test-Path $sevenZip)) {
+            choco install 7zip -y --no-progress
+            $sevenZip = "$env:ProgramFiles\7-Zip\7z.exe"
           }
 
-          $sevenZip = "C:\Program Files\7-Zip\7z.exe"
-          $zip = "D:\UE58\UE_5.8.zip"
-          $dest = "D:\UE58\Extracted"
+          if (!(Test-Path $sevenZip)) {
+            throw "7-Zip executable not found."
+          }
 
           & $sevenZip t $zip
+
           if ($LASTEXITCODE -ne 0) {
-            throw "The combined ZIP failed its integrity test."
+            throw "ZIP validation failed. Confirm the parts are raw sequential ZIP chunks."
           }
 
-          & $sevenZip x $zip "-o$dest" -y
+          & $sevenZip x $zip "-o$root\Extracted" -y
+
           if ($LASTEXITCODE -ne 0) {
             throw "Unreal Engine extraction failed."
           }
 
-          Remove-Item $zip -Force
-          Write-Host "Engine extracted."
-
-      - name: Create project and Python API bridge
-        shell: pwsh
-        env:
-          COMMAND_TOKEN: ${{ secrets.COMMAND_TOKEN }}
-        run: |
-          $ErrorActionPreference = 'Stop'
-
-          $project = "D:\UE58\UEControl"
-          $config = "$project\Config"
-          $pythonDir = "$project\Content\Python"
-
-          New-Item -ItemType Directory -Force `
-            -Path $config, $pythonDir | Out-Null
-
-          @'
-          {
-            "FileVersion": 3,
-            "EngineAssociation": "",
-            "Category": "",
-            "Description": "Unreal Python HTTP API",
-            "Plugins": [
-              {
-                "Name": "PythonScriptPlugin",
-                "Enabled": true
-              },
-              {
-                "Name": "EditorScriptingUtilities",
-                "Enabled": true
-              }
-            ]
-          }
-          '@ | Set-Content "$project\UEControl.uproject" -Encoding utf8
-
-          @'
-          [/Script/PythonScriptPlugin.PythonScriptPluginSettings]
-          bRemoteExecution=False
-          '@ | Set-Content "$config\DefaultEngine.ini" -Encoding utf8
-
-          $python = @'
-          import contextlib
-          import hmac
-          import http.server
-          import io
-          import json
-          import os
-          import queue
-          import threading
-          import time
-          import traceback
-          from collections import deque
-          from urllib.parse import urlparse, parse_qs
-
-          import unreal
-
-          HOST = "127.0.0.1"
-          PORT = 8765
-          TOKEN = os.environ.get("UE_COMMAND_TOKEN", "")
-          LOG_FILE = os.environ.get(
-              "UE_EDITOR_LOG_FILE",
-              r"D:\UE58\Logs\unreal-editor.log"
-          )
-
-          jobs = queue.Queue()
-          started = False
-          recent_logs = deque(maxlen=1000)
-          log_lock = threading.Lock()
-
-          def remember(message):
-              entry = {
-                  "time": time.strftime("%Y-%m-%d %H:%M:%S"),
-                  "message": str(message)
-              }
-              with log_lock:
-                  recent_logs.append(entry)
-
-          def get_recent_logs(count):
-              with log_lock:
-                  return list(recent_logs)[-count:]
-
-          def read_editor_log(count):
-              if not os.path.isfile(LOG_FILE):
-                  return [], "Log file does not exist yet"
-
-              try:
-                  with open(LOG_FILE, "rb") as handle:
-                      handle.seek(0, os.SEEK_END)
-                      size = handle.tell()
-                      handle.seek(
-                          max(0, size - 4 * 1024 * 1024),
-                          os.SEEK_SET
-                      )
-                      raw = handle.read()
-
-                  lines = raw.decode(
-                      "utf-8", errors="replace"
-                  ).splitlines()
-
-                  return lines[-count:], None
-              except Exception as exc:
-                  return [], str(exc)
-
-          def authorized(handler):
-              supplied = handler.headers.get("Authorization", "")
-              expected = "Bearer " + TOKEN
-              return bool(TOKEN) and hmac.compare_digest(
-                  supplied, expected
-              )
-
-          class Job:
-              def __init__(self, code):
-                  self.code = code
-                  self.done = threading.Event()
-                  self.result = None
-
-          class Handler(http.server.BaseHTTPRequestHandler):
-              def log_message(self, fmt, *args):
-                  remember("HTTP " + (fmt % args))
-
-              def reply(self, status, data):
-                  body = json.dumps(
-                      data, ensure_ascii=False
-                  ).encode("utf-8")
-
-                  self.send_response(status)
-                  self.send_header(
-                      "Content-Type",
-                      "application/json; charset=utf-8"
-                  )
-                  self.send_header(
-                      "Content-Length", str(len(body))
-                  )
-                  self.send_header("Cache-Control", "no-store")
-                  self.send_header(
-                      "X-Content-Type-Options", "nosniff"
-                  )
-                  self.end_headers()
-                  self.wfile.write(body)
-
-              def do_GET(self):
-                  parsed = urlparse(self.path)
-
-                  if parsed.path == "/health":
-                      self.reply(200, {
-                          "ok": True,
-                          "service": "unreal-python-api",
-                          "api_version": "logs-v3-2026-10-27",
-                          "endpoints": [
-                              "/health", "/command", "/logs"
-                          ],
-                          "editor_log_configured": bool(LOG_FILE)
-                      })
-                      return
-
-                  if parsed.path == "/logs":
-                      if not authorized(self):
-                          self.reply(401, {
-                              "ok": False,
-                              "error": "Unauthorized"
-                          })
-                          return
-
-                      try:
-                          query = parse_qs(parsed.query)
-                          count = int(
-                              query.get("lines", ["200"])[0]
-                          )
-                          count = max(1, min(count, 2000))
-                      except (ValueError, TypeError):
-                          count = 200
-
-                      editor_lines, log_error = read_editor_log(count)
-
-                      self.reply(200, {
-                          "ok": True,
-                          "log_file": LOG_FILE,
-                          "requested_lines": count,
-                          "editor_log": editor_lines,
-                          "api_log": get_recent_logs(count),
-                          "log_file_error": log_error
-                      })
-                      return
-
-                  self.reply(404, {
-                      "ok": False, "error": "Not found"
-                  })
-
-              def do_POST(self):
-                  parsed = urlparse(self.path)
-
-                  if parsed.path != "/command":
-                      self.reply(404, {
-                          "ok": False, "error": "Not found"
-                      })
-                      return
-
-                  if not authorized(self):
-                      self.reply(401, {
-                          "ok": False, "error": "Unauthorized"
-                      })
-                      return
-
-                  try:
-                      length = int(
-                          self.headers.get("Content-Length", "0")
-                      )
-
-                      if length < 1 or length > 1048576:
-                          self.reply(413, {
-                              "ok": False,
-                              "error": "Body must be between 1 byte and 1 MB"
-                          })
-                          return
-
-                      data = json.loads(
-                          self.rfile.read(length).decode("utf-8")
-                      )
-
-                      code = (
-                          data.get("code")
-                          if isinstance(data, dict)
-                          else None
-                      )
-
-                      if not isinstance(code, str) or not code.strip():
-                          self.reply(400, {
-                              "ok": False,
-                              "error": "Provide a non-empty code string"
-                          })
-                          return
-
-                      job = Job(code)
-                      jobs.put(job)
-                      remember("Queued remote Python command")
-
-                      if not job.done.wait(240):
-                          remember(
-                              "Remote command timed out waiting for Unreal Editor"
-                          )
-                          self.reply(504, {
-                              "ok": False,
-                              "error": "Unreal command timed out"
-                          })
-                          return
-
-                      result = job.result or {
-                          "ok": False,
-                          "error": "No result"
-                      }
-
-                      self.reply(
-                          200 if result.get("ok") else 500,
-                          result
-                      )
-
-                  except Exception as exc:
-                      remember("HTTP command error: " + str(exc))
-                      self.reply(400, {
-                          "ok": False,
-                          "error": str(exc)
-                      })
-
-          def editor_tick(delta_seconds):
-              try:
-                  job = jobs.get_nowait()
-              except queue.Empty:
-                  return
-
-              output = io.StringIO()
-              namespace = {"unreal": unreal}
-              remember("Executing remote Python command")
-
-              # Remember the current log file size so we can return
-              # lines written while this command runs.
-              try:
-                  log_offset = (
-                      os.path.getsize(LOG_FILE)
-                      if os.path.isfile(LOG_FILE)
-                      else 0
-                  )
-              except OSError:
-                  log_offset = 0
-
-              try:
-                  with contextlib.redirect_stdout(output):
-                      with contextlib.redirect_stderr(output):
-                          exec(
-                              compile(
-                                  job.code,
-                                  "<remote-command>",
-                                  "exec"
-                              ),
-                              namespace,
-                              namespace
-                          )
-
-                  captured = output.getvalue().strip()
-
-                  # Read only newly appended log lines.
-                  # This may include other Unreal messages written
-                  # during the same time window.
-                  try:
-                      if os.path.isfile(LOG_FILE):
-                          with open(LOG_FILE, "rb") as handle:
-                              handle.seek(log_offset)
-                              new_log = handle.read().decode(
-                                  "utf-8", errors="replace"
-                              ).strip()
-                      else:
-                          new_log = ""
-                  except Exception as exc:
-                      new_log = (
-                          "Could not read new editor log: " + str(exc)
-                      )
-
-                  combined = captured
-                  if new_log:
-                      combined = (
-                          combined + "\n" + new_log
-                      ).strip()
-
-                  if not combined:
-                      combined = (
-                          "Command executed successfully; no output."
-                      )
-
-                  job.result = {
-                      "ok": True,
-                      "output": combined
-                  }
-
-                  remember(
-                      "Command succeeded. Output: " + combined[-4000:]
-                  )
-                  unreal.log("Remote Python command completed.")
-
-              except Exception:
-                  captured = output.getvalue()
-                  error = traceback.format_exc()
-
-                  job.result = {
-                      "ok": False,
-                      "output": captured,
-                      "error": error
-                  }
-
-                  remember("Command failed: " + error)
-                  unreal.log_error(error)
-
-              finally:
-                  job.done.set()
-
-          def start_api():
-              global started
-
-              if started:
-                  return
-
-              if not TOKEN:
-                  unreal.log_error(
-                      "UE_COMMAND_TOKEN is missing; API not started."
-                  )
-                  return
-
-              started = True
-              unreal.register_slate_post_tick_callback(editor_tick)
-
-              def serve():
-                  try:
-                      server = http.server.ThreadingHTTPServer(
-                          (HOST, PORT), Handler
-                      )
-                      server.daemon_threads = True
-
-                      remember(
-                          "HTTP API listening on {}:{}".format(
-                              HOST, PORT
-                          )
-                      )
-                      server.serve_forever()
-
-                  except Exception as exc:
-                      remember("HTTP server failed: " + repr(exc))
-
-              threading.Thread(
-                  target=serve,
-                  name="UEPythonAPI",
-                  daemon=True
-              ).start()
-
-              remember("Unreal Python API initialized")
-              unreal.log("Unreal Python API initialized.")
-
-          start_api()
-          '@
-
-          $bootstrap = "$pythonDir\init_unreal.py"
-          Set-Content $bootstrap -Value $python -Encoding utf8
-
-          Write-Host "Python API bridge created: $bootstrap"
-          Write-Host "API version: logs-v3-2026-10-27"
-
-      - name: Start Unreal and Cloudflare Quick Tunnel
-        shell: pwsh
-        env:
-          COMMAND_TOKEN: ${{ secrets.COMMAND_TOKEN }}
-        run: |
-          $ErrorActionPreference = 'Stop'
-
-          $root = "D:\UE58"
-          $log = "$root\Logs\unreal-editor.log"
-          $tunnelLog = "$root\Logs\cloudflared.log"
-          $tunnelErr = "$root\Logs\cloudflared-error.log"
-
-          $engine = Get-ChildItem "$root\Extracted" `
-            -Filter UnrealEditor.exe -File -Recurse |
-            Where-Object {
-              $_.FullName -match `
-                '\\Engine\\Binaries\\Win64\\UnrealEditor\.exe$'
-            } |
+          $editor = Get-ChildItem "$root\Extracted" `
+            -Filter UnrealEditor.exe -Recurse -File |
             Select-Object -First 1
 
-          if (!$engine) {
+          if (!$editor) {
             throw "UnrealEditor.exe was not found."
           }
 
-          $env:UE_COMMAND_TOKEN = $env:COMMAND_TOKEN
-          $env:UE_EDITOR_LOG_FILE = $log
+          "UE_EDITOR=$($editor.FullName)" >> $env:GITHUB_ENV
 
-          $startupScript = "$root\UEControl\Content\Python\init_unreal.py"
+          Write-Host "Editor: $($editor.FullName)"
 
-          if (!(Test-Path $startupScript)) {
-            throw "Python startup script was not created: $startupScript"
-          }
+      - name: Create Unreal Control Project
+        shell: pwsh
+        run: |
+          $project = "$env:UE_ROOT\UEControl"
+          $uproject = "$project\UEControl.uproject"
 
-          $editorArgs = @(
-            "$root\UEControl\UEControl.uproject",
-            '-EnablePlugins=PythonScriptPlugin,EditorScriptingUtilities',
-            '-AllowSoftwareRendering',
-            '-d3d11',
-            "-abslog=$log"
-          )
-
-          $editor = Start-Process `
-            -FilePath $engine.FullName `
-            -ArgumentList $editorArgs `
-            -WorkingDirectory $engine.DirectoryName `
-            -PassThru
-
-          Set-Content "$root\unreal-editor.pid" $editor.Id
-
-          $cf = "$root\cloudflared.exe"
-
-          Invoke-WebRequest `
-            'https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe' `
-            -OutFile $cf
-
-          $tunnel = Start-Process `
-            -FilePath $cf `
-            -ArgumentList @(
-              'tunnel',
-              '--no-autoupdate',
-              '--url',
-              'http://127.0.0.1:8765',
-              '--logfile',
-              $tunnelLog
-            ) `
-            -PassThru `
-            -RedirectStandardError $tunnelErr `
-            -RedirectStandardOutput "$root\Logs\cloudflared-stdout.log"
-
-          Set-Content "$root\cloudflared.pid" $tunnel.Id
-
-          $deadline = (Get-Date).AddMinutes(5)
-          $url = $null
-
-          while ((Get-Date) -lt $deadline) {
-            if (!(Get-Process -Id $editor.Id -ErrorAction SilentlyContinue)) {
-              if (Test-Path $log) {
-                Get-Content $log -Tail 100
+          $data = @{
+            FileVersion = 3
+            EngineAssociation = ""
+            Category = ""
+            Description = "Remote Unreal Engine Control"
+            Modules = @()
+            Plugins = @(
+              @{
+                Name = "PythonScriptPlugin"
+                Enabled = $true
+              },
+              @{
+                Name = "EditorScriptingUtilities"
+                Enabled = $true
               }
-              throw "Unreal Editor exited during startup."
-            }
-
-            foreach ($file in @(
-              $tunnelLog,
-              $tunnelErr,
-              "$root\Logs\cloudflared-stdout.log"
-            )) {
-              if (Test-Path $file) {
-                $match = Select-String -Path $file `
-                  -Pattern 'https://[a-z0-9-]+\.trycloudflare\.com' `
-                  -AllMatches -ErrorAction SilentlyContinue |
-                  Select-Object -First 1
-
-                if ($match -and $match.Matches.Count -gt 0) {
-                  $url = $match.Matches[0].Value
-                  break
-                }
-              }
-            }
-
-            if ($url) {
-              break
-            }
-
-            Start-Sleep -Seconds 3
-          }
-
-          if (!$url) {
-            if (Test-Path $tunnelLog) {
-              Get-Content $tunnelLog -Tail 80
-            }
-            if (Test-Path $tunnelErr) {
-              Get-Content $tunnelErr -Tail 80
-            }
-            throw "Cloudflare Quick Tunnel URL was not found."
-          }
-
-          Write-Host ""
-          Write-Host "=============================================="
-          Write-Host "PUBLIC API URL: $url"
-          Write-Host "HEALTH URL:     $url/health"
-          Write-Host "COMMAND URL:    $url/command"
-          Write-Host "LOGS URL:       $url/logs?lines=200"
-          Write-Host "LOGS AUTH:      Authorization: Bearer YOUR_TOKEN"
-          Write-Host "METHOD:         POST for /command; GET for /logs"
-          Write-Host 'JSON BODY:      {"code":"print(\"Hi\")"}'
-          Write-Host "=============================================="
-
-          $ready = $false
-          $readyDeadline = (Get-Date).AddMinutes(5)
-
-          while ((Get-Date) -lt $readyDeadline) {
-            if (!(Get-Process -Id $editor.Id -ErrorAction SilentlyContinue)) {
-              if (Test-Path $log) {
-                Get-Content $log -Tail 160
-              }
-              throw "Unreal Editor stopped before the API became ready."
-            }
-
-            try {
-              $health = Invoke-RestMethod `
-                -Uri 'http://127.0.0.1:8765/health' `
-                -TimeoutSec 3
-
-              if ($health.ok -and
-                  $health.service -eq 'unreal-python-api' -and
-                  $health.api_version -eq 'logs-v3-2026-10-27') {
-                $ready = $true
-                break
-              }
-            }
-            catch {}
-
-            Start-Sleep -Seconds 3
-          }
-
-          if (!$ready) {
-            Write-Host "ERROR: Local Unreal Python API health check failed."
-            if (Test-Path $log) {
-              Get-Content $log -Tail 160
-            }
-            throw "Python API did not start. Check init_unreal.py startup errors in the Unreal log."
-          }
-
-          Write-Host "Local Unreal Python API is ready."
-
-          $publicReady = $false
-          $publicDeadline = (Get-Date).AddMinutes(2)
-
-          while ((Get-Date) -lt $publicDeadline) {
-            try {
-              $publicHealth = Invoke-RestMethod `
-                -Uri "$url/health" `
-                -TimeoutSec 10
-
-              if ($publicHealth.ok -and
-                  $publicHealth.service -eq 'unreal-python-api' -and
-                  $publicHealth.api_version -eq 'logs-v3-2026-10-27') {
-                $publicReady = $true
-                break
-              }
-            }
-            catch {}
-
-            Start-Sleep -Seconds 4
-          }
-
-          if (!$publicReady) {
-            Write-Host "WARNING: Local API works, but public tunnel health check failed."
-            if (Test-Path $tunnelLog) {
-              Get-Content $tunnelLog -Tail 80
-            }
-          }
-          else {
-            Write-Host "PUBLIC API HEALTH CHECK PASSED."
-          }
-
-          while (
-            (Get-Process -Id $editor.Id -ErrorAction SilentlyContinue) -and
-            (Get-Process -Id $tunnel.Id -ErrorAction SilentlyContinue)
-          ) {
-            Start-Sleep -Seconds 30
-
-            Write-Host (
-              "Unreal={0} | Tunnel={1}" -f
-              [bool](Get-Process -Id $editor.Id -ErrorAction SilentlyContinue),
-              [bool](Get-Process -Id $tunnel.Id -ErrorAction SilentlyContinue)
             )
           }
 
-          if (Test-Path $log) {
-            Get-Content $log -Tail 120
+          $data |
+            ConvertTo-Json -Depth 10 |
+            Set-Content $uproject -Encoding utf8
+
+      - name: Create Unreal Python Bridge
+        shell: pwsh
+        run: |
+          $path = "$env:UE_ROOT\UEControl\Content\Python\init_unreal.py"
+
+          @'
+          import json
+          import time
+          import urllib.request
+          import unreal
+
+          API = "http://127.0.0.1:8765"
+          TOKEN = __import__("os").environ.get("COMMAND_TOKEN", "")
+          LAST_POLL = 0
+          BUSY = False
+
+          def api_request(path, payload=None):
+              headers = {"Authorization": "Bearer " + TOKEN}
+              data = None
+
+              if payload is not None:
+                  data = json.dumps(payload).encode("utf-8")
+                  headers["Content-Type"] = "application/json"
+
+              req = urllib.request.Request(
+                  API + path,
+                  data=data,
+                  headers=headers,
+                  method="POST" if data is not None else "GET"
+              )
+
+              with urllib.request.urlopen(req, timeout=15) as response:
+                  return json.loads(response.read().decode("utf-8"))
+
+          def execute_job(job):
+              job_id = job["id"]
+              code = job["code"]
+              namespace = {"unreal": unreal, "RESULT": None}
+
+              try:
+                  exec(compile(code, "<remote-command>", "exec"),
+                       namespace, namespace)
+
+                  result = {
+                      "ok": True,
+                      "output": str(namespace.get("RESULT", "Command completed"))
+                  }
+
+              except Exception as exc:
+                  result = {
+                      "ok": False,
+                      "error": str(exc)
+                  }
+                  unreal.log_error("Remote command error: " + str(exc))
+
+              try:
+                  api_request("/internal/result", {
+                      "id": job_id,
+                      "result": result
+                  })
+              except Exception as exc:
+                  unreal.log_error("Could not return result: " + str(exc))
+
+          def editor_tick(delta_seconds):
+              global LAST_POLL, BUSY
+
+              if BUSY or not TOKEN:
+                  return
+
+              now = time.time()
+
+              if now - LAST_POLL < 0.5:
+                  return
+
+              LAST_POLL = now
+
+              try:
+                  response = api_request("/internal/next")
+                  job = response.get("job")
+
+                  if job:
+                      BUSY = True
+                      try:
+                          execute_job(job)
+                      finally:
+                          BUSY = False
+
+              except Exception:
+                  # API may still be starting.
+                  pass
+
+          unreal.log("Remote Unreal Python bridge loaded.")
+          unreal.register_slate_post_tick_callback(editor_tick)
+          '@ | Set-Content $path -Encoding utf8
+
+      - name: Create API Server
+        shell: pwsh
+        run: |
+          $path = "$env:UE_ROOT\api_server.py"
+
+          @'
+          import os
+          import io
+          import json
+          import uuid
+          import time
+          import queue
+          import threading
+          from pathlib import Path
+          from functools import wraps
+
+          from flask import Flask, request, jsonify, send_file
+          from google.oauth2 import service_account
+          from googleapiclient.discovery import build
+          from googleapiclient.http import MediaFileUpload, MediaIoBaseDownload
+
+          ROOT = Path(r"D:\UE58")
+          PROJECTS = ROOT / "Projects"
+          UPLOADS = ROOT / "Uploads"
+          SCREENSHOTS = ROOT / "Screenshots"
+          LOGS = ROOT / "Logs"
+
+          for folder in (PROJECTS, UPLOADS, SCREENSHOTS, LOGS):
+              folder.mkdir(parents=True, exist_ok=True)
+
+          TOKEN = os.environ["COMMAND_TOKEN"]
+          DRIVE_JSON = os.environ["GG_UE_TOKEN"]
+
+          app = Flask(__name__)
+          app.config["MAX_CONTENT_LENGTH"] = 20 * 1024 * 1024 * 1024
+
+          jobs = {}
+          job_queue = queue.Queue()
+          lock = threading.Lock()
+
+          def auth(fn):
+              @wraps(fn)
+              def wrapper(*args, **kwargs):
+                  if request.headers.get("Authorization") != "Bearer " + TOKEN:
+                      return jsonify({"ok": False, "error": "Unauthorized"}), 401
+                  return fn(*args, **kwargs)
+              return wrapper
+
+          def drive():
+              info = json.loads(DRIVE_JSON)
+              credentials = service_account.Credentials.from_service_account_info(
+                  info,
+                  scopes=["https://www.googleapis.com/auth/drive"]
+              )
+              return build(
+                  "drive", "v3",
+                  credentials=credentials,
+                  cache_discovery=False
+              )
+
+          def submit_command(code, timeout=240):
+              job_id = str(uuid.uuid4())
+
+              with lock:
+                  jobs[job_id] = {"done": False}
+
+              job_queue.put({"id": job_id, "code": code})
+              deadline = time.time() + timeout
+
+              while time.time() < deadline:
+                  with lock:
+                      job = jobs.get(job_id)
+                      if job and job.get("done"):
+                          return job["result"]
+                  time.sleep(0.25)
+
+              return {"ok": False, "error": "Command timed out"}
+
+          @app.get("/health")
+          @auth
+          def health():
+              return jsonify({
+                  "ok": True,
+                  "service": "Unreal Remote API",
+                  "time": time.time()
+              })
+
+          @app.post("/command")
+          @auth
+          def command():
+              body = request.get_json(silent=True) or {}
+              code = body.get("code")
+
+              if not isinstance(code, str) or not code.strip():
+                  return jsonify({"ok": False, "error": "Provide code"}), 400
+
+              timeout = min(max(int(body.get("timeout", 240)), 1), 240)
+              return jsonify(submit_command(code, timeout))
+
+          @app.get("/internal/next")
+          def internal_next():
+              if request.headers.get("Authorization") != "Bearer " + TOKEN:
+                  return jsonify({"error": "Unauthorized"}), 401
+
+              try:
+                  return jsonify({"job": job_queue.get_nowait()})
+              except queue.Empty:
+                  return jsonify({"job": None})
+
+          @app.post("/internal/result")
+          def internal_result():
+              if request.headers.get("Authorization") != "Bearer " + TOKEN:
+                  return jsonify({"error": "Unauthorized"}), 401
+
+              body = request.get_json(silent=True) or {}
+              job_id = body.get("id")
+
+              with lock:
+                  if job_id in jobs:
+                      jobs[job_id] = {
+                          "done": True,
+                          "result": body.get("result", {})
+                      }
+
+              return jsonify({"ok": True})
+
+          @app.get("/projects")
+          @auth
+          def projects():
+              found = []
+
+              for project in ROOT.rglob("*.uproject"):
+                  found.append({
+                      "name": project.stem,
+                      "project_file": str(project),
+                      "directory": str(project.parent)
+                  })
+
+              return jsonify({"ok": True, "projects": found})
+
+          @app.post("/files/upload")
+          @auth
+          def upload_file():
+              file = request.files.get("file")
+
+              if file is None:
+                  return jsonify({"ok": False, "error": "Missing file"}), 400
+
+              filename = Path(file.filename or "upload.bin").name
+              destination = UPLOADS / filename
+              file.save(destination)
+
+              return jsonify({
+                  "ok": True,
+                  "filename": filename,
+                  "path": str(destination),
+                  "size": destination.stat().st_size
+              })
+
+          @app.get("/files/download")
+          @auth
+          def download_file():
+              path = Path(request.args.get("path", ""))
+
+              if not path.is_absolute() or not path.is_file():
+                  return jsonify({"ok": False, "error": "File not found"}), 404
+
+              return send_file(path, as_attachment=True)
+
+          @app.post("/drive/list")
+          @auth
+          def drive_list():
+              body = request.get_json(silent=True) or {}
+              folder_id = body.get("folder_id", "root")
+
+              result = drive().files().list(
+                  q="'" + folder_id.replace("'", "\\'") + "' in parents and trashed = false",
+                  pageSize=min(max(int(body.get("page_size", 100)), 1), 1000),
+                  fields="files(id,name,mimeType,size,webViewLink,modifiedTime)"
+              ).execute()
+
+              return jsonify({"ok": True, "files": result.get("files", [])})
+
+          @app.post("/drive/download")
+          @auth
+          def drive_download():
+              body = request.get_json(silent=True) or {}
+              file_id = body.get("file_id")
+              destination = body.get("destination")
+
+              if not file_id or not destination:
+                  return jsonify({
+                      "ok": False,
+                      "error": "Provide file_id and destination"
+                  }), 400
+
+              path = Path(destination)
+
+              if not path.is_absolute():
+                  return jsonify({"ok": False, "error": "Absolute path required"}), 400
+
+              path.parent.mkdir(parents=True, exist_ok=True)
+              service = drive()
+
+              metadata = service.files().get(
+                  fileId=file_id,
+                  fields="id,name,mimeType"
+              ).execute()
+
+              media = service.files().get_media(fileId=file_id)
+
+              with open(path, "wb") as stream:
+                  downloader = MediaIoBaseDownload(stream, media)
+                  done = False
+
+                  while not done:
+                      _, done = downloader.next_chunk()
+
+              return jsonify({
+                  "ok": True,
+                  "file_id": file_id,
+                  "name": metadata.get("name"),
+                  "path": str(path),
+                  "size": path.stat().st_size
+              })
+
+          @app.post("/drive/upload")
+          @auth
+          def drive_upload():
+              body = request.get_json(silent=True) or {}
+              source = Path(body.get("source", ""))
+
+              if not source.is_absolute() or not source.is_file():
+                  return jsonify({"ok": False, "error": "Source file not found"}), 404
+
+              metadata = {
+                  "name": Path(body.get("filename") or source.name).name
+              }
+
+              folder_id = body.get("drive_folder_id")
+              if folder_id:
+                  metadata["parents"] = [folder_id]
+
+              media = MediaFileUpload(
+                  str(source),
+                  resumable=True,
+                  chunksize=8 * 1024 * 1024
+              )
+
+              result = drive().files().create(
+                  body=metadata,
+                  media_body=media,
+                  fields="id,name,mimeType,webViewLink,size"
+              ).execute()
+
+              return jsonify({"ok": True, "file": result})
+
+          @app.post("/unreal/screenshot")
+          @auth
+          def unreal_screenshot():
+              code = (
+                  "import unreal\n"
+                  "unreal.SystemLibrary.execute_console_command("
+                  "None, 'HighResShot 1920x1080')\n"
+                  "RESULT = 'Screenshot command sent. Check the project Saved/Screenshots folder.'"
+              )
+
+              result = submit_command(code, 90)
+              return jsonify({
+                  "ok": result.get("ok", False),
+                  "result": result,
+                  "note": "The screenshot is written by Unreal to its screenshot output directory."
+              })
+
+          @app.get("/logs")
+          @auth
+          def logs():
+              files = list(LOGS.glob("*.log"))
+
+              if not files:
+                  return jsonify({"ok": True, "logs": []})
+
+              newest = max(files, key=lambda item: item.stat().st_mtime)
+              return send_file(newest, as_attachment=True)
+
+          @app.post("/projects/rename")
+          @auth
+          def rename_project():
+              body = request.get_json(silent=True) or {}
+              project_file = Path(body.get("project_file", ""))
+              new_name = body.get("new_name", "")
+
+              if not project_file.is_absolute() or not project_file.is_file():
+                  return jsonify({"ok": False, "error": "Project file not found"}), 404
+
+              if project_file.suffix.lower() != ".uproject":
+                  return jsonify({"ok": False, "error": "Expected a .uproject file"}), 400
+
+              if not new_name or Path(new_name).name != new_name:
+                  return jsonify({"ok": False, "error": "Invalid new name"}), 400
+
+              target = project_file.with_name(new_name + ".uproject")
+
+              if target.exists():
+                  return jsonify({"ok": False, "error": "Target already exists"}), 409
+
+              project_file.rename(target)
+
+              return jsonify({
+                  "ok": True,
+                  "project_file": str(target),
+                  "note": "Renamed the .uproject file only."
+              })
+
+          if __name__ == "__main__":
+              app.run(host="127.0.0.1", port=8765, threaded=True)
+          '@ | Set-Content $path -Encoding utf8
+
+      - name: Start API, Unreal and Cloudflare Tunnel
+        shell: pwsh
+        env:
+          COMMAND_TOKEN: ${{ secrets.COMMAND_TOKEN }}
+          GG_UE_TOKEN: ${{ secrets.GG_UE_TOKEN }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $root = $env:UE_ROOT
+
+          # Child processes inherit these environment variables.
+          $apiLog = "$root\Logs\api-out.log"
+          $apiError = "$root\Logs\api-error.log"
+
+          $api = Start-Process python `
+            -ArgumentList "`"$root\api_server.py`"" `
+            -PassThru `
+            -RedirectStandardOutput $apiLog `
+            -RedirectStandardError $apiError
+
+          Start-Sleep -Seconds 3
+
+          if ($api.HasExited) {
+            Get-Content $apiError -ErrorAction SilentlyContinue
+            throw "API failed to start."
           }
 
-          throw "Unreal or Cloudflare stopped. The API is offline."
+          $editorLog = "$root\Logs\unreal-editor.log"
+
+          $editor = Start-Process $env:UE_EDITOR `
+            -ArgumentList @(
+              "$root\UEControl\UEControl.uproject",
+              "-abslog=$editorLog",
+              "-EnablePlugins=PythonScriptPlugin,EditorScriptingUtilities",
+              "-AllowSoftwareRendering",
+              "-d3d11"
+            ) `
+            -PassThru
+
+          $cloudflared = "$root\cloudflared.exe"
+
+          Invoke-WebRequest `
+            "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe" `
+            -OutFile $cloudflared
+
+          $tunnelLog = "$root\Logs\cloudflared.log"
+          $tunnelError = "$root\Logs\cloudflared-error.log"
+
+          $tunnel = Start-Process $cloudflared `
+            -ArgumentList @(
+              "tunnel",
+              "--url",
+              "http://127.0.0.1:8765",
+              "--no-autoupdate"
+            ) `
+            -PassThru `
+            -RedirectStandardOutput $tunnelLog `
+            -RedirectStandardError $tunnelError
+
+          $publicUrl = $null
+
+          for ($i = 0; $i -lt 60; $i++) {
+            Start-Sleep -Seconds 2
+
+            if ($tunnel.HasExited) {
+              Get-Content $tunnelError -ErrorAction SilentlyContinue
+              throw "Cloudflare tunnel exited."
+            }
+
+            $text = ""
+
+            if (Test-Path $tunnelLog) {
+              $text += Get-Content $tunnelLog -Raw
+            }
+
+            if (Test-Path $tunnelError) {
+              $text += Get-Content $tunnelError -Raw
+            }
+
+            $match = [regex]::Match(
+              $text,
+              'https://[a-zA-Z0-9-]+\.trycloudflare\.com'
+            )
+
+            if ($match.Success) {
+              $publicUrl = $match.Value
+              break
+            }
+          }
+
+          if ($publicUrl) {
+            Write-Host "PUBLIC_API_URL=$publicUrl"
+            Write-Host "Use this URL from Termux."
+          }
+          else {
+            Write-Host "Tunnel URL not found yet. Check cloudflared logs."
+          }
+
+          while ($true) {
+            if ($api.HasExited) {
+              throw "API server stopped."
+            }
+
+            if ($editor.HasExited) {
+              throw "Unreal Editor stopped."
+            }
+
+            if ($tunnel.HasExited) {
+              throw "Cloudflare tunnel stopped."
+            }
+
+            Start-Sleep -Seconds 30
+          }
