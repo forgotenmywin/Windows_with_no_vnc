@@ -285,8 +285,10 @@ jobs:
                   info, scopes=["https://www.googleapis.com/auth/drive"])
               return build("drive", "v3", credentials=creds, cache_discovery=False)
 
+          # Public health check: used to verify the Cloudflare tunnel in a browser.
+          # All other REST API routes still require COMMAND_TOKEN; the MCP endpoint is
+          # intentionally unauthenticated for the temporary ChatGPT test.
           @app.get("/health")
-          @public_auth
           def health():
               return jsonify(ok=True, service="Unreal Remote API", bridge_connected=bridge_connected(),
                              engine_bridge_last_seen=(last_bridge_seen or None), time=time.time())
@@ -779,7 +781,7 @@ jobs:
           if __name__ == "__main__":
               if not COMMAND_TOKEN or not BRIDGE_TOKEN:
                   raise RuntimeError("COMMAND_TOKEN and BRIDGE_TOKEN must be set")
-              log("Starting Unreal Remote API + MCP at 127.0.0.1:8765; MCP endpoint=/mcp (temporary unauthenticated test mode)")
+              log("Starting Unreal Remote API + MCP at 127.0.0.1:8765; MCP endpoint=/mcp/ (temporary unauthenticated test mode)")
               uvicorn.run(combined_app, host="127.0.0.1", port=8765, log_level="info")
           '@
           Set-Content -LiteralPath "$root\api_server.py" -Value $api -Encoding utf8
@@ -868,9 +870,9 @@ jobs:
           if ($bridgeReady) { Write-Host 'BRIDGE_READY=true' } else { Write-Warning 'BRIDGE_READY=false; /command will report unreal_bridge_not_connected until Unreal loads init_unreal.py.' }
 
           Write-Host 'REST endpoints: /health /command /projects /projects/rename /files/upload /files/download /drive/list /drive/download /drive/upload /unreal/screenshot /logs'
-          Write-Host "MCP_ENDPOINT=$publicUrl/mcp"
+          Write-Host "MCP_ENDPOINT=$publicUrl/mcp/"
           Write-Host 'MCP tools: unreal_execute_python, unreal_get_engine_version, unreal_list_projects, unreal_rename_project, unreal_list_files, unreal_read_text_file, unreal_write_text_file, google_drive_list_files, google_drive_download_file, google_drive_upload_file, unreal_take_screenshot'
-          Write-Host 'TEST MODE: MCP endpoint has NO authentication. Anyone with the URL may execute Unreal tools.'
+          Write-Host 'TEST MODE: MCP endpoint /mcp/ has NO authentication. Anyone with the URL may execute Unreal tools. REST routes other than /health remain protected.'
           while ($true) {
             Start-Sleep -Seconds 60
             if ($apiProc.HasExited) { throw 'API server stopped; inspect D:\UE58\Logs\api-stderr.log.' }
