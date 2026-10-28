@@ -752,33 +752,16 @@ jobs:
               return mcp_json({"ok": False, "error": "screenshot_file_not_created",
                                 "detail": "Unreal did not create the PNG; check viewport/rendering and Editor logs."})
 
-          # MCP SDK v2 uses Streamable HTTP. The public host is a temporary Cloudflare
-          # Quick Tunnel, so host-header validation is delegated to that proxy; every
-          # MCP request is still required to provide the bearer token.
+          # MCP SDK v2 uses Streamable HTTP. For this temporary test workflow,
+          # /mcp is intentionally unauthenticated so ChatGPT can use its
+          # "No authentication" setting. Keep this run temporary: tools can execute
+          # Python inside Unreal and read/write files in the UE workspace.
+          # Other REST endpoints and the internal Unreal bridge remain authenticated.
           mcp_http_app = mcp_server.streamable_http_app(
               streamable_http_path="/",
               transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False),
           )
-
-          class MCPBearerAuth:
-              def __init__(self, downstream):
-                  self.downstream = downstream
-              async def __call__(self, scope, receive, send):
-                  if scope.get("type") == "http":
-                      headers = {key.decode("latin1").lower(): value.decode("latin1")
-                                 for key, value in scope.get("headers", [])}
-                      supplied = headers.get("authorization", "")
-                      expected = "Bearer " + COMMAND_TOKEN
-                      if not COMMAND_TOKEN or not secrets.compare_digest(supplied, expected):
-                          body = json.dumps({"error": "unauthorized"}).encode("utf-8")
-                          await send({"type": "http.response.start", "status": 401,
-                                      "headers": [(b"content-type", b"application/json"),
-                                                  (b"content-length", str(len(body)).encode("ascii"))]})
-                          await send({"type": "http.response.body", "body": body})
-                          return
-                  await self.downstream(scope, receive, send)
-
-          secured_mcp_app = MCPBearerAuth(mcp_http_app)
+          mcp_public_app = mcp_http_app
 
           @asynccontextmanager
           async def combined_lifespan(asgi_app):
@@ -787,7 +770,7 @@ jobs:
 
           combined_app = Starlette(
               routes=[
-                  Mount("/mcp", app=secured_mcp_app),
+                  Mount("/mcp", app=mcp_public_app),
                   Mount("/", app=WSGIMiddleware(app)),
               ],
               lifespan=combined_lifespan,
@@ -796,7 +779,7 @@ jobs:
           if __name__ == "__main__":
               if not COMMAND_TOKEN or not BRIDGE_TOKEN:
                   raise RuntimeError("COMMAND_TOKEN and BRIDGE_TOKEN must be set")
-              log("Starting Unreal Remote API + MCP at 127.0.0.1:8765; MCP endpoint=/mcp")
+              log("Starting Unreal Remote API + MCP at 127.0.0.1:8765; MCP endpoint=/mcp (temporary unauthenticated test mode)")
               uvicorn.run(combined_app, host="127.0.0.1", port=8765, log_level="info")
           '@
           Set-Content -LiteralPath "$root\api_server.py" -Value $api -Encoding utf8
@@ -887,7 +870,7 @@ jobs:
           Write-Host 'REST endpoints: /health /command /projects /projects/rename /files/upload /files/download /drive/list /drive/download /drive/upload /unreal/screenshot /logs'
           Write-Host "MCP_ENDPOINT=$publicUrl/mcp"
           Write-Host 'MCP tools: unreal_execute_python, unreal_get_engine_version, unreal_list_projects, unreal_rename_project, unreal_list_files, unreal_read_text_file, unreal_write_text_file, google_drive_list_files, google_drive_download_file, google_drive_upload_file, unreal_take_screenshot'
-          Write-Host 'Keep this workflow running. Copy PUBLIC_API_URL and use the current COMMAND_TOKEN secret from Termux.'
+          Write-Host 'TEST MODE: MCP endpoint has NO authentication. Anyone with the URL may execute Unreal tools.'
           while ($true) {
             Start-Sleep -Seconds 60
             if ($apiProc.HasExited) { throw 'API server stopped; inspect D:\UE58\Logs\api-stderr.log.' }
