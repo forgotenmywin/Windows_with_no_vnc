@@ -920,13 +920,25 @@ jobs:
           Write-Host "MCP_ENDPOINT=$publicUrl/mcp/"
           Write-Host 'MCP tools: unreal_execute_python, unreal_get_engine_version, unreal_list_projects, unreal_rename_project, unreal_list_files, unreal_read_text_file, unreal_write_text_file, google_drive_list_files, google_drive_download_file, google_drive_upload_file, unreal_take_screenshot'
           Write-Host 'TEST MODE: MCP endpoint /mcp/ has NO authentication. Anyone with the URL may execute Unreal tools. REST routes other than /health remain protected.'
+          # Check services every minute, but print a heartbeat only every 30 minutes.
+          $lastHeartbeat = Get-Date
+          $lastHealth = $null
           while ($true) {
             Start-Sleep -Seconds 60
             if ($apiProc.HasExited) { throw 'API server stopped; inspect D:\UE58\Logs\api-stderr.log.' }
             if ($cfProc.HasExited) { throw 'Cloudflare tunnel stopped; inspect D:\UE58\Logs\cloudflared-stderr.log.' }
             if ($ueProc.HasExited) { throw "Unreal Editor stopped with exit code $($ueProc.ExitCode); inspect D:\UE58\Logs\unreal-stdout.log and D:\UE58\UEControl\Saved\Logs." }
             try {
-              $health = Invoke-RestMethod -Uri 'http://127.0.0.1:8765/health' -Headers $headers -TimeoutSec 4
-              Write-Host ("Heartbeat {0}: API_OK={1} BRIDGE_CONNECTED={2}" -f (Get-Date), $health.ok, $health.bridge_connected)
-            } catch { Write-Warning 'Health check failed.' }
+              $lastHealth = Invoke-RestMethod -Uri 'http://127.0.0.1:8765/health' -Headers $headers -TimeoutSec 4
+            } catch {
+              $lastHealth = $null
+            }
+            if (((Get-Date) - $lastHeartbeat).TotalMinutes -ge 30) {
+              if ($null -ne $lastHealth) {
+                Write-Host ("Heartbeat {0}: API_OK={1} BRIDGE_CONNECTED={2}" -f (Get-Date), $lastHealth.ok, $lastHealth.bridge_connected)
+              } else {
+                Write-Warning ("Heartbeat {0}: health check failed; API process is still running." -f (Get-Date))
+              }
+              $lastHeartbeat = Get-Date
+            }
           }
