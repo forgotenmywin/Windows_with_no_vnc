@@ -275,7 +275,7 @@ jobs:
               return time.time() - last_bridge_seen < 12
 
           def google_drive():
-              """Create Drive API client from OAuth authorized-user JSON or service-account JSON."""
+              """Create a Drive API client with retrying OAuth refresh and API transport."""
               raw = os.environ.get("GG_UE_TOKEN", "")
               if not raw:
                   raise RuntimeError("GG_UE_TOKEN is missing from GitHub Actions Secrets")
@@ -283,32 +283,68 @@ jobs:
               info = json.loads(raw)
               scopes = ["https://www.googleapis.com/auth/drive"]
 
+              # OAuth token refresh sometimes fails on transient TLS/connection resets.
+              # Use an HTTPS session that retries POST (OAuth refresh), connection errors,
+              # rate limits and transient Google 5xx responses with exponential backoff.
+              import requests
+              import httplib2
+              from requests.adapters import HTTPAdapter
+              from urllib3.util.retry import Retry
+              from google.auth.transport.requests import Request
+              from google_auth_httplib2 import AuthorizedHttp
               from googleapiclient.discovery import build
 
+              retry_policy = Retry(
+                  total=8,
+                  connect=8,
+                  read=8,
+                  status=8,
+                  backoff_factor=1.5,
+                  status_forcelist=(429, 500, 502, 503, 504),
+                  allowed_methods=frozenset(["GET", "POST"]),
+                  respect_retry_after_header=True,
+                  raise_on_status=False,
+              )
+              retry_session = requests.Session()
+              retry_session.mount("https://", HTTPAdapter(max_retries=retry_policy))
+              retry_session.mount("http://", HTTPAdapter(max_retries=retry_policy))
+              auth_request = Request(session=retry_session)
+
               if "client_email" in info and "private_key" in info:
-                  # Service-account credentials.
                   from google.oauth2 import service_account
-                  creds = service_account.Credentials.from_service_account_info(
-                      info, scopes=scopes
-                  )
+                  creds = service_account.Credentials.from_service_account_info(info, scopes=scopes)
               elif info.get("refresh_token") and info.get("client_id") and info.get("client_secret"):
-                  # OAuth authorized-user credentials (the contents of authorized_user.json).
                   from google.oauth2.credentials import Credentials
-                  from google.auth.transport.requests import Request
                   creds = Credentials.from_authorized_user_info(info, scopes=scopes)
-                  if creds.expired and creds.refresh_token:
-                      creds.refresh(Request())
                   if not creds.valid:
-                      raise RuntimeError(
-                          "GG_UE_TOKEN is OAuth user credentials but is not valid. Recreate authorized_user.json "
-                          "and update the GG_UE_TOKEN Actions secret."
-                      )
+                      if not creds.refresh_token:
+                          raise RuntimeError(
+                              "OAuth credentials have no refresh_token. Replace GG_UE_TOKEN with the full "
+                              "authorized_user.json created after completing OAuth login."
+                          )
+                      # Retry transient network failures. Do not print token data to logs.
+                      last_error = None
+                      for attempt in range(1, 4):
+                          try:
+                              creds.refresh(auth_request)
+                              last_error = None
+                              break
+                          except Exception as exc:
+                              last_error = exc
+                              log("Google OAuth refresh attempt %s/3 failed: %s" % (attempt, type(exc).__name__))
+                              if attempt < 3:
+                                  time.sleep(attempt * 3)
+                      if last_error is not None:
+                          raise RuntimeError(
+                              "Google OAuth token refresh failed after retries. Check outbound HTTPS access "
+                              "to oauth2.googleapis.com and confirm GG_UE_TOKEN is the authorized_user.json, "
+                              "not the OAuth client configuration JSON. Root error type: %s" % type(last_error).__name__
+                          ) from last_error
               elif "installed" in info or "web" in info:
                   raise RuntimeError(
-                      "GG_UE_TOKEN contains only OAuth client configuration (installed/web). "
-                      "It is not an authorized-user token. Set GG_UE_TOKEN to the FULL JSON contents "
-                      "of authorized_user.json created after completing OAuth login; it must include "
-                      "refresh_token, token_uri, client_id, and client_secret."
+                      "GG_UE_TOKEN contains only OAuth client configuration (installed/web), not a user token. "
+                      "Set it to the full authorized_user.json with refresh_token, token_uri, client_id, "
+                      "and client_secret."
                   )
               else:
                   raise RuntimeError(
@@ -316,7 +352,13 @@ jobs:
                       "or a service-account key JSON."
                   )
 
-              return build("drive", "v3", credentials=creds, cache_discovery=False)
+              # Supply the same retry-capable auth request for any later automatic token refreshes.
+              authorized_http = AuthorizedHttp(
+                  creds,
+                  http=httplib2.Http(timeout=120),
+                  auth_request=auth_request,
+              )
+              return build("drive", "v3", http=authorized_http, cache_discovery=False)
 
           def upload_drive_file(source_path, metadata):
               """Perform a chunked, resumable upload suitable for large files."""
@@ -478,7 +520,7 @@ jobs:
                       query += " and '" + folder_id.replace("'", "") + "' in parents"
                   result = google_drive().files().list(
                       q=query, pageSize=page_size, orderBy="name",
-                      fields="files(id,name,mimeType,size,modifiedTime,webViewLink,parents)").execute()
+                      fields="files(id,name,mimeType,size,modifiedTime,webViewLink,parents)").execute(num_retries=5)
                   files = result.get("files", [])
                   return jsonify(ok=True, count=len(files), files=files)
               except Exception as exc:
@@ -734,7 +776,7 @@ jobs:
                       query += " and '" + folder_id.replace("'", "") + "' in parents"
                   result = google_drive().files().list(
                       q=query, pageSize=page_size, orderBy="name",
-                      fields="files(id,name,mimeType,size,modifiedTime,webViewLink,parents)").execute()
+                      fields="files(id,name,mimeType,size,modifiedTime,webViewLink,parents)").execute(num_retries=5)
                   files = result.get("files", [])
                   return mcp_json({"ok": True, "count": len(files), "files": files})
               except Exception as exc:
@@ -848,7 +890,7 @@ jobs:
           if ([string]::IsNullOrWhiteSpace($env:GG_UE_TOKEN)) { Write-Warning 'GG_UE_TOKEN is empty; Google Drive upload/download will fail until OAuth authorized_user.json is stored in this Actions secret.' }
           $env:BRIDGE_TOKEN = [guid]::NewGuid().ToString('N') + [guid]::NewGuid().ToString('N')
           $python = (Get-Command python).Source
-          & $python -m pip install --disable-pip-version-check --upgrade Flask google-api-python-client google-auth "mcp>=2,<3" uvicorn
+          & $python -m pip install --disable-pip-version-check --upgrade Flask google-api-python-client google-auth google-auth-httplib2 requests urllib3 "mcp>=2,<3" uvicorn
           if ($LASTEXITCODE -ne 0) { throw 'Python package installation failed.' }
 
           $apiOut = "$root\Logs\api-stdout.log"
