@@ -1033,8 +1033,8 @@ jobs:
                               "headers": [(b"content-type", b"application/json"), (b"content-length", str(len(err)).encode())]})
                   await send({"type": "http.response.body", "body": err})
 
-          # Single MCP endpoint: route /mcp directly to Unreal's native AllToolsets MCP.
-          # REST fallback endpoints remain available separately under the same host.
+          # One public MCP endpoint only: /mcp/ proxies Unreal's native AllToolsets server.
+          # REST fallback endpoints remain available under the same tunnel host.
           combined_app = Starlette(routes=[
               Mount("/mcp", app=native_mcp_proxy),
               Mount("/", app=WSGIMiddleware(app))
@@ -1143,9 +1143,10 @@ jobs:
 
           Write-Host 'REST endpoints: GET /health, POST /command, GET /projects, POST /projects/rename, POST /files/upload, GET /files/download, GET /files/read, PUT /files/write, POST /drive/list, POST /drive/download, POST /drive/upload, POST /github/release/upload, POST /unreal/screenshot, GET /logs'
           Write-Host "MCP_ENDPOINT=$publicUrl/mcp/"
+          Write-Host 'Single MCP endpoint only: /mcp/ -> native Unreal AllToolsets. No second MCP URL.' 
           Write-Host 'Binary transfer: files are saved under D:\UE58\Uploads; use unreal_upload_binary_file for small files or begin/chunk/finish tools for larger files. Chunk size: 16 KiB; max file size: 2 GiB.'
-          Write-Host 'MCP tools: unreal_upload_binary_file, unreal_begin_binary_upload, unreal_upload_binary_chunk, unreal_finish_binary_upload, unreal_abort_binary_upload, unreal_execute_python, unreal_wait_python_job, unreal_get_engine_version, unreal_list_projects, unreal_rename_project, unreal_list_files, unreal_read_text_file, unreal_write_text_file, google_drive_list_files, google_drive_download_file, google_drive_upload_file, github_release_upload_file, unreal_take_screenshot'
-          Write-Host 'Single MCP endpoint: /mcp/ (native Unreal AllToolsets). No Authorization header is required for the MCP endpoint or REST fallback endpoints.'
+          Write-Host 'MCP tool list at /mcp/ is provided by Unreal native AllToolsets; REST fallback endpoints remain available on the same host.'
+          Write-Host 'No Authorization header is required for /mcp/ or the REST fallback endpoints.'
           Write-Warning 'TEST MODE: endpoints are unauthenticated. Anyone who obtains the public Quick Tunnel URL may be able to issue Unreal commands or access exposed files/logs. Stop the workflow when finished.'
 
           $lastHeartbeat = Get-Date
