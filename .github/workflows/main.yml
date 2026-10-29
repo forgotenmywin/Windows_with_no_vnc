@@ -206,7 +206,7 @@ jobs:
           Set-Content -LiteralPath "$pythonDir\init_unreal.py" -Value $bridge -Encoding utf8
 
           $api = @'
-          import contextlib, json, os, queue, re, shutil, tempfile, threading, time, uuid
+          import base64, binascii, contextlib, hashlib, json, os, queue, re, shutil, tempfile, threading, time, uuid
           from pathlib import Path
           from functools import wraps
           from flask import Flask, jsonify, request, send_file
@@ -220,6 +220,13 @@ jobs:
           BRIDGE_TOKEN = os.environ.get("BRIDGE_TOKEN", "")
           jobs, waiting, lock = queue.Queue(), {}, threading.Lock()
           last_bridge_seen = 0.0
+          UPLOAD_ROOT = (ROOT / "Uploads").resolve()
+          UPLOAD_ROOT.mkdir(parents=True, exist_ok=True)
+          UPLOAD_CHUNK_BYTES = 16 * 1024
+          UPLOAD_SINGLE_FILE_LIMIT = 8 * 1024 * 1024
+          UPLOAD_MAX_FILE_SIZE = 2 * 1024 * 1024 * 1024
+          UPLOAD_SESSIONS = {}
+          UPLOAD_LOCK = threading.Lock()
 
           def log(message):
               line = time.strftime("%Y-%m-%d %H:%M:%S ") + str(message)
@@ -755,6 +762,195 @@ jobs:
                   return mcp_json({"ok": True, "old_path": str(source), "project_file": str(target)})
               except Exception as exc: return mcp_json({"ok": False, "error": str(exc)})
 
+          def upload_target(filename: str, destination_folder: str = ""):
+              """Resolve a filename under D:\\UE58\\Uploads only."""
+              filename = str(filename or "").strip()
+              if (not filename or filename in (".", "..")
+                  or Path(filename).name != filename
+                  or any(ch in filename for ch in ("/", "\\", "\r", "\n", "\x00"))):
+                  raise ValueError("filename must be a simple filename without path components")
+              folder_value = str(destination_folder or "").replace("\\", "/").strip(" /")
+              folder_parts = [] if not folder_value else folder_value.split("/")
+              if any(part in ("", ".", "..") or ":" in part for part in folder_parts):
+                  raise ValueError("destination_folder must be a relative folder under Uploads")
+              folder = UPLOAD_ROOT.joinpath(*folder_parts).resolve()
+              if folder != UPLOAD_ROOT and UPLOAD_ROOT not in folder.parents:
+                  raise ValueError("destination must remain inside D:\\UE58\\Uploads")
+              folder.mkdir(parents=True, exist_ok=True)
+              target = (folder / filename).resolve()
+              if target.parent != folder:
+                  raise ValueError("destination must remain inside its selected Uploads folder")
+              return target
+
+          def store_uploaded_bytes(target: Path, data: bytes, overwrite: bool = False):
+              if not data:
+                  raise ValueError("file content is empty")
+              if target.exists() and not overwrite:
+                  raise FileExistsError("target already exists; set overwrite=true to replace it")
+              temp = target.with_name(target.name + ".uploading-" + uuid.uuid4().hex)
+              try:
+                  with temp.open("wb") as handle:
+                      handle.write(data)
+                  if target.exists() and not overwrite:
+                      raise FileExistsError("target already exists; set overwrite=true to replace it")
+                  os.replace(temp, target)
+              finally:
+                  temp.unlink(missing_ok=True)
+              return {"ok": True, "path": str(target), "size": target.stat().st_size,
+                      "sha256": hashlib.sha256(data).hexdigest()}
+
+          @mcp_server.tool()
+          def unreal_upload_binary_file(filename: str, content_base64: str,
+                                        destination_folder: str = "", overwrite: bool = False) -> str:
+              """Upload a binary attachment (for example .blend, .fbx, .zip, .png) from the MCP client into D:\\UE58\\Uploads. Pass the file bytes as Base64. Supports up to 8 MiB per call for MCP clients that can pass large arguments. For chat-attached files, prefer the chunked upload tools to keep each request small."""
+              try:
+                  encoded = str(content_base64 or "")
+                  if len(encoded) > ((UPLOAD_SINGLE_FILE_LIMIT + 2) // 3) * 4 + 16:
+                      return mcp_json({"ok": False, "error": "Base64 content exceeds the 8 MiB direct-upload limit; use the chunked upload tools."})
+                  try:
+                      data = base64.b64decode(encoded, validate=True)
+                  except (binascii.Error, ValueError) as exc:
+                      return mcp_json({"ok": False, "error": "content_base64 is not valid Base64", "detail": str(exc)})
+                  if len(data) > UPLOAD_SINGLE_FILE_LIMIT:
+                      return mcp_json({"ok": False, "error": "Direct upload limit is 8 MiB; use the chunked upload tools."})
+                  target = upload_target(filename, destination_folder)
+                  return mcp_json(store_uploaded_bytes(target, data, bool(overwrite)))
+              except FileExistsError as exc:
+                  return mcp_json({"ok": False, "error": str(exc)})
+              except Exception as exc:
+                  return mcp_json({"ok": False, "error": str(exc)})
+
+          @mcp_server.tool()
+          def unreal_begin_binary_upload(filename: str, total_size: int,
+                                         destination_folder: str = "", overwrite: bool = False) -> str:
+              """Start a chunked binary upload to D:\\UE58\\Uploads for files over 8 MiB. Then call unreal_upload_binary_chunk for each Base64 chunk and unreal_finish_binary_upload when all chunks are sent. Chunk size is 16 KiB to keep individual MCP tool arguments manageable. Maximum file size is 2 GiB."""
+              try:
+                  total_size = int(total_size)
+                  if total_size < 1 or total_size > UPLOAD_MAX_FILE_SIZE:
+                      return mcp_json({"ok": False, "error": "total_size must be between 1 byte and 2 GiB"})
+                  target = upload_target(filename, destination_folder)
+                  if target.exists() and not overwrite:
+                      return mcp_json({"ok": False, "error": "target already exists; set overwrite=true to replace it", "path": str(target)})
+                  upload_id = uuid.uuid4().hex
+                  chunk_count = (total_size + UPLOAD_CHUNK_BYTES - 1) // UPLOAD_CHUNK_BYTES
+                  staging = UPLOAD_ROOT / ".incoming" / upload_id
+                  staging.mkdir(parents=True, exist_ok=False)
+                  with UPLOAD_LOCK:
+                      UPLOAD_SESSIONS[upload_id] = {
+                          "target": str(target), "total_size": total_size,
+                          "chunk_count": chunk_count, "staging": str(staging),
+                          "received": set(), "overwrite": bool(overwrite),
+                          "created": time.time()
+                      }
+                  return mcp_json({"ok": True, "upload_id": upload_id,
+                                   "filename": target.name, "destination": str(target),
+                                   "total_size": total_size, "chunk_size": UPLOAD_CHUNK_BYTES,
+                                   "chunks_total": chunk_count,
+                                   "next_step": "Send every chunk in index order starting at 0, then call unreal_finish_binary_upload."})
+              except Exception as exc:
+                  return mcp_json({"ok": False, "error": str(exc)})
+
+          @mcp_server.tool()
+          def unreal_upload_binary_chunk(upload_id: str, chunk_index: int, chunk_base64: str) -> str:
+              """Send one Base64-encoded 16 KiB (maximum) chunk for an upload started with unreal_begin_binary_upload. Indexes start at zero."""
+              try:
+                  upload_id = str(upload_id or "")
+                  with UPLOAD_LOCK:
+                      session = UPLOAD_SESSIONS.get(upload_id)
+                  if session is None:
+                      return mcp_json({"ok": False, "error": "upload session not found or expired"})
+                  chunk_index = int(chunk_index)
+                  if chunk_index < 0 or chunk_index >= session["chunk_count"]:
+                      return mcp_json({"ok": False, "error": "chunk_index is outside the expected range"})
+                  encoded = str(chunk_base64 or "")
+                  if len(encoded) > ((UPLOAD_CHUNK_BYTES + 2) // 3) * 4 + 16:
+                      return mcp_json({"ok": False, "error": "encoded chunk exceeds the 16 KiB decoded limit"})
+                  try:
+                      data = base64.b64decode(encoded, validate=True)
+                  except (binascii.Error, ValueError) as exc:
+                      return mcp_json({"ok": False, "error": "chunk_base64 is not valid Base64", "detail": str(exc)})
+                  expected = min(UPLOAD_CHUNK_BYTES, session["total_size"] - chunk_index * UPLOAD_CHUNK_BYTES)
+                  if len(data) != expected:
+                      return mcp_json({"ok": False, "error": "incorrect chunk length", "expected_bytes": expected, "received_bytes": len(data)})
+                  staging = Path(session["staging"])
+                  part = staging / ("chunk_%08d.bin" % chunk_index)
+                  temp = part.with_suffix(".tmp")
+                  with temp.open("wb") as handle:
+                      handle.write(data)
+                  os.replace(temp, part)
+                  with UPLOAD_LOCK:
+                      current = UPLOAD_SESSIONS.get(upload_id)
+                      if current is None:
+                          part.unlink(missing_ok=True)
+                          return mcp_json({"ok": False, "error": "upload session was cancelled"})
+                      current["received"].add(chunk_index)
+                      received = len(current["received"])
+                      total = current["chunk_count"]
+                  return mcp_json({"ok": True, "upload_id": upload_id,
+                                   "chunk_index": chunk_index, "chunk_bytes": len(data),
+                                   "chunks_received": received, "chunks_total": total,
+                                   "complete": received == total})
+              except Exception as exc:
+                  return mcp_json({"ok": False, "error": str(exc)})
+
+          @mcp_server.tool()
+          def unreal_finish_binary_upload(upload_id: str) -> str:
+              """Finalize a chunked binary upload, verify byte size, calculate SHA-256 and atomically save it under D:\\UE58\\Uploads."""
+              staging = None
+              assembled = None
+              try:
+                  upload_id = str(upload_id or "")
+                  with UPLOAD_LOCK:
+                      session = UPLOAD_SESSIONS.get(upload_id)
+                  if session is None:
+                      return mcp_json({"ok": False, "error": "upload session not found or expired"})
+                  missing = sorted(set(range(session["chunk_count"])) - session["received"])
+                  if missing:
+                      return mcp_json({"ok": False, "error": "upload has missing chunks", "missing_chunk_indexes": missing[:100], "missing_count": len(missing)})
+                  target = Path(session["target"])
+                  target.parent.mkdir(parents=True, exist_ok=True)
+                  if target.exists() and not session["overwrite"]:
+                      return mcp_json({"ok": False, "error": "target already exists; upload was not finalized", "path": str(target)})
+                  staging = Path(session["staging"])
+                  assembled = target.with_name(target.name + ".assembling-" + upload_id)
+                  digest = hashlib.sha256()
+                  written = 0
+                  with assembled.open("wb") as output:
+                      for index in range(session["chunk_count"]):
+                          chunk_path = staging / ("chunk_%08d.bin" % index)
+                          with chunk_path.open("rb") as chunk:
+                              while True:
+                                  block = chunk.read(1024 * 1024)
+                                  if not block:
+                                      break
+                                  output.write(block)
+                                  digest.update(block)
+                                  written += len(block)
+                  if written != session["total_size"]:
+                      raise ValueError("assembled file size does not match total_size")
+                  os.replace(assembled, target)
+                  assembled = None
+                  with UPLOAD_LOCK:
+                      UPLOAD_SESSIONS.pop(upload_id, None)
+                  shutil.rmtree(staging, ignore_errors=True)
+                  return mcp_json({"ok": True, "path": str(target), "size": written,
+                                   "sha256": digest.hexdigest(), "upload_id": upload_id})
+              except Exception as exc:
+                  return mcp_json({"ok": False, "error": str(exc)})
+              finally:
+                  if assembled is not None:
+                      assembled.unlink(missing_ok=True)
+
+          @mcp_server.tool()
+          def unreal_abort_binary_upload(upload_id: str) -> str:
+              """Cancel an unfinished binary upload and remove its temporary chunks."""
+              with UPLOAD_LOCK:
+                  session = UPLOAD_SESSIONS.pop(str(upload_id or ""), None)
+              if session is None:
+                  return mcp_json({"ok": False, "error": "upload session not found"})
+              shutil.rmtree(session["staging"], ignore_errors=True)
+              return mcp_json({"ok": True, "aborted": True, "upload_id": upload_id})
+
           mcp_app = mcp_server.streamable_http_app(
               streamable_http_path="/",
               transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False),
@@ -871,7 +1067,8 @@ jobs:
 
           Write-Host 'REST endpoints: GET /health, POST /command, GET /projects, POST /projects/rename, POST /files/upload, GET /files/download, GET /files/read, PUT /files/write, POST /drive/list, POST /drive/download, POST /drive/upload, POST /github/release/upload, POST /unreal/screenshot, GET /logs'
           Write-Host "MCP_ENDPOINT=$publicUrl/mcp/"
-          Write-Host 'MCP tools: unreal_execute_python, unreal_get_engine_version, unreal_list_projects, unreal_rename_project, unreal_list_files, unreal_read_text_file, unreal_write_text_file, google_drive_list_files, google_drive_download_file, google_drive_upload_file, github_release_upload_file, unreal_take_screenshot'
+          Write-Host 'Binary transfer: files are saved under D:\UE58\Uploads; use unreal_upload_binary_file for small files or begin/chunk/finish tools for larger files. Chunk size: 16 KiB; max file size: 2 GiB.'
+          Write-Host 'MCP tools: unreal_upload_binary_file, unreal_begin_binary_upload, unreal_upload_binary_chunk, unreal_finish_binary_upload, unreal_abort_binary_upload, unreal_execute_python, unreal_get_engine_version, unreal_list_projects, unreal_rename_project, unreal_list_files, unreal_read_text_file, unreal_write_text_file, google_drive_list_files, google_drive_download_file, google_drive_upload_file, github_release_upload_file, unreal_take_screenshot'
           Write-Warning 'This is an unauthenticated temporary public endpoint. Anyone with its URL may control Unreal and access workspace files. Do not share it; stop the workflow when testing is finished.'
 
           $lastHeartbeat = Get-Date
