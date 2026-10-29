@@ -275,15 +275,68 @@ jobs:
               return time.time() - last_bridge_seen < 12
 
           def google_drive():
+              """Create Drive API client from OAuth authorized-user JSON or service-account JSON."""
               raw = os.environ.get("GG_UE_TOKEN", "")
               if not raw:
-                  raise RuntimeError("GG_UE_TOKEN is missing from Actions Secrets")
-              from google.oauth2 import service_account
-              from googleapiclient.discovery import build
+                  raise RuntimeError("GG_UE_TOKEN is missing from GitHub Actions Secrets")
+
               info = json.loads(raw)
-              creds = service_account.Credentials.from_service_account_info(
-                  info, scopes=["https://www.googleapis.com/auth/drive"])
+              scopes = ["https://www.googleapis.com/auth/drive"]
+
+              from googleapiclient.discovery import build
+
+              if "client_email" in info and "private_key" in info:
+                  # Service-account credentials.
+                  from google.oauth2 import service_account
+                  creds = service_account.Credentials.from_service_account_info(
+                      info, scopes=scopes
+                  )
+              elif info.get("refresh_token") and info.get("client_id") and info.get("client_secret"):
+                  # OAuth authorized-user credentials (the contents of authorized_user.json).
+                  from google.oauth2.credentials import Credentials
+                  from google.auth.transport.requests import Request
+                  creds = Credentials.from_authorized_user_info(info, scopes=scopes)
+                  if creds.expired and creds.refresh_token:
+                      creds.refresh(Request())
+                  if not creds.valid:
+                      raise RuntimeError(
+                          "GG_UE_TOKEN is OAuth user credentials but is not valid. Recreate authorized_user.json "
+                          "and update the GG_UE_TOKEN Actions secret."
+                      )
+              elif "installed" in info or "web" in info:
+                  raise RuntimeError(
+                      "GG_UE_TOKEN contains only OAuth client configuration (installed/web). "
+                      "It is not an authorized-user token. Set GG_UE_TOKEN to the FULL JSON contents "
+                      "of authorized_user.json created after completing OAuth login; it must include "
+                      "refresh_token, token_uri, client_id, and client_secret."
+                  )
+              else:
+                  raise RuntimeError(
+                      "GG_UE_TOKEN JSON format is not recognized. Use authorized_user.json from OAuth login "
+                      "or a service-account key JSON."
+                  )
+
               return build("drive", "v3", credentials=creds, cache_discovery=False)
+
+          def upload_drive_file(source_path, metadata):
+              """Perform a chunked, resumable upload suitable for large files."""
+              from googleapiclient.http import MediaFileUpload
+              media = MediaFileUpload(
+                  str(source_path),
+                  resumable=True,
+                  chunksize=8 * 1024 * 1024
+              )
+              request_upload = google_drive().files().create(
+                  body=metadata,
+                  media_body=media,
+                  fields="id,name,mimeType,size,webViewLink"
+              )
+              response = None
+              while response is None:
+                  status, response = request_upload.next_chunk()
+                  if status:
+                      log("Google Drive upload progress: " + str(int(status.progress() * 100)) + "%")
+              return response
 
           # Public health check: used to verify the Cloudflare tunnel in a browser.
           # All other REST API routes still require COMMAND_TOKEN; the MCP endpoint is
@@ -462,14 +515,11 @@ jobs:
                   source = safe_path(body.get("source", ""))
                   if not source.is_file():
                       return jsonify(ok=False, error="source file not found", source=str(source)), 404
-                  from googleapiclient.http import MediaFileUpload
                   folder_id = str(body.get("drive_folder_id", "root"))
                   metadata = {"name": str(body.get("filename") or source.name)}
                   if folder_id and folder_id != "root":
                       metadata["parents"] = [folder_id]
-                  upload = MediaFileUpload(str(source), resumable=True, chunksize=8 * 1024 * 1024)
-                  result = google_drive().files().create(body=metadata, media_body=upload,
-                      fields="id,name,mimeType,size,webViewLink").execute()
+                  result = upload_drive_file(source, metadata)
                   return jsonify(ok=True, file=result)
               except Exception as exc:
                   log("Drive upload error: " + repr(exc))
@@ -717,14 +767,11 @@ jobs:
                   source_path = safe_path(source)
                   if not source_path.is_file():
                       return mcp_json({"ok": False, "error": "source file not found", "source": str(source_path)})
-                  from googleapiclient.http import MediaFileUpload
                   metadata = {"name": str(filename or source_path.name)}
                   folder_id = str(drive_folder_id or "root")
                   if folder_id != "root":
                       metadata["parents"] = [folder_id]
-                  media = MediaFileUpload(str(source_path), resumable=True, chunksize=8 * 1024 * 1024)
-                  result = google_drive().files().create(body=metadata, media_body=media,
-                      fields="id,name,mimeType,size,webViewLink").execute()
+                  result = upload_drive_file(source_path, metadata)
                   return mcp_json({"ok": True, "file": result})
               except Exception as exc:
                   log("MCP Drive upload error: " + repr(exc))
@@ -798,7 +845,7 @@ jobs:
           $env:UE_ROOT = $root
           if ([string]::IsNullOrWhiteSpace($env:COMMAND_TOKEN) -or $env:COMMAND_TOKEN.Length -lt 32) { throw 'Set a new COMMAND_TOKEN repository secret of at least 32 characters.' }
           $commandToken = $env:COMMAND_TOKEN
-          if ([string]::IsNullOrWhiteSpace($env:GG_UE_TOKEN)) { Write-Warning 'GG_UE_TOKEN is empty; Google Drive routes will not work until the service-account JSON is configured.' }
+          if ([string]::IsNullOrWhiteSpace($env:GG_UE_TOKEN)) { Write-Warning 'GG_UE_TOKEN is empty; Google Drive upload/download will fail until OAuth authorized_user.json is stored in this Actions secret.' }
           $env:BRIDGE_TOKEN = [guid]::NewGuid().ToString('N') + [guid]::NewGuid().ToString('N')
           $python = (Get-Command python).Source
           & $python -m pip install --disable-pip-version-check --upgrade Flask google-api-python-client google-auth "mcp>=2,<3" uvicorn
