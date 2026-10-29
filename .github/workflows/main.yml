@@ -275,38 +275,51 @@ jobs:
               return time.time() - last_bridge_seen < 12
 
           def google_drive():
-              """Create a Drive API client with retrying OAuth refresh and API transport."""
+              """Build Drive client with bounded OAuth/network timeouts and retries."""
               raw = os.environ.get("GG_UE_TOKEN", "")
               if not raw:
                   raise RuntimeError("GG_UE_TOKEN is missing from GitHub Actions Secrets")
 
-              info = json.loads(raw)
-              scopes = ["https://www.googleapis.com/auth/drive"]
+              try:
+                  info = json.loads(raw)
+              except json.JSONDecodeError as exc:
+                  raise RuntimeError("GG_UE_TOKEN is not valid JSON; use the complete authorized_user.json") from exc
 
-              # OAuth token refresh sometimes fails on transient TLS/connection resets.
-              # Use an HTTPS session that retries POST (OAuth refresh), connection errors,
-              # rate limits and transient Google 5xx responses with exponential backoff.
+              scopes = ["https://www.googleapis.com/auth/drive"]
               import requests
+              import httplib2
               from requests.adapters import HTTPAdapter
               from urllib3.util.retry import Retry
               from google.auth.transport.requests import Request
+              from google_auth_httplib2 import AuthorizedHttp
               from googleapiclient.discovery import build
 
+              # Keep each OAuth HTTPS attempt short. A long retry chain previously
+              # blocked MCP calls while oauth2.googleapis.com ended the TLS connection.
               retry_policy = Retry(
-                  total=8,
-                  connect=8,
-                  read=8,
-                  status=8,
-                  backoff_factor=1.5,
+                  total=1,
+                  connect=1,
+                  read=0,
+                  status=1,
+                  backoff_factor=0.25,
                   status_forcelist=(429, 500, 502, 503, 504),
                   allowed_methods=frozenset(["GET", "POST"]),
-                  respect_retry_after_header=True,
+                  respect_retry_after_header=False,
                   raise_on_status=False,
               )
               retry_session = requests.Session()
               retry_session.mount("https://", HTTPAdapter(max_retries=retry_policy))
-              retry_session.mount("http://", HTTPAdapter(max_retries=retry_policy))
-              auth_request = Request(session=retry_session)
+
+              class BoundedOAuthRequest(Request):
+                  """Google-auth Request adapter capped at 10 seconds per network try."""
+                  def __call__(self, url, method="GET", body=None, headers=None, timeout=10, **kwargs):
+                      bounded_timeout = 10 if timeout is None else min(float(timeout), 10.0)
+                      return super().__call__(
+                          url, method=method, body=body, headers=headers,
+                          timeout=bounded_timeout, **kwargs
+                      )
+
+              auth_request = BoundedOAuthRequest(session=retry_session)
 
               if "client_email" in info and "private_key" in info:
                   from google.oauth2 import service_account
@@ -314,35 +327,10 @@ jobs:
               elif info.get("refresh_token") and info.get("client_id") and info.get("client_secret"):
                   from google.oauth2.credentials import Credentials
                   creds = Credentials.from_authorized_user_info(info, scopes=scopes)
-                  if not creds.valid:
-                      if not creds.refresh_token:
-                          raise RuntimeError(
-                              "OAuth credentials have no refresh_token. Replace GG_UE_TOKEN with the full "
-                              "authorized_user.json created after completing OAuth login."
-                          )
-                      # Retry transient network failures. Do not print token data to logs.
-                      last_error = None
-                      for attempt in range(1, 4):
-                          try:
-                              creds.refresh(auth_request)
-                              last_error = None
-                              break
-                          except Exception as exc:
-                              last_error = exc
-                              log("Google OAuth refresh attempt %s/3 failed: %s" % (attempt, type(exc).__name__))
-                              if attempt < 3:
-                                  time.sleep(attempt * 3)
-                      if last_error is not None:
-                          raise RuntimeError(
-                              "Google OAuth token refresh failed after retries. Check outbound HTTPS access "
-                              "to oauth2.googleapis.com and confirm GG_UE_TOKEN is the authorized_user.json, "
-                              "not the OAuth client configuration JSON. Root error type: %s" % type(last_error).__name__
-                          ) from last_error
               elif "installed" in info or "web" in info:
                   raise RuntimeError(
                       "GG_UE_TOKEN contains only OAuth client configuration (installed/web), not a user token. "
-                      "Set it to the full authorized_user.json with refresh_token, token_uri, client_id, "
-                      "and client_secret."
+                      "Set it to the full authorized_user.json created after completing OAuth login."
                   )
               else:
                   raise RuntimeError(
@@ -350,12 +338,37 @@ jobs:
                       "or a service-account key JSON."
                   )
 
-              # Build with credentials directly. google_auth_httplib2.AuthorizedHttp
-              # does not accept an `auth_request` constructor argument; passing it caused
-              # the upload to fail before any request reached Google Drive.
-              # The explicit refresh above uses the retry-capable Requests transport.
-              # googleapiclient then creates its supported AuthorizedHttp transport.
-              return build("drive", "v3", credentials=creds, cache_discovery=False)
+              # Pre-refresh once with a bounded request so the first MCP operation
+              # fails fast and reports a useful error instead of waiting for minutes.
+              if not creds.valid:
+                  if hasattr(creds, "refresh_token") and not creds.refresh_token:
+                      raise RuntimeError(
+                          "OAuth credentials have no refresh_token. Replace GG_UE_TOKEN with the full "
+                          "authorized_user.json created after completing OAuth login."
+                      )
+                  last_error = None
+                  for attempt in range(1, 3):
+                      try:
+                          creds.refresh(auth_request)
+                          last_error = None
+                          break
+                      except Exception as exc:
+                          last_error = exc
+                          log("Google OAuth refresh attempt %s/2 failed: %s" % (attempt, type(exc).__name__))
+                          if attempt < 2:
+                              time.sleep(0.5)
+                  if last_error is not None:
+                      raise RuntimeError(
+                          "Google OAuth refresh failed after two bounded attempts. The logs show a TLS/HTTPS "
+                          "connection closure at the Google token endpoint (/token). Check runner outbound HTTPS, "
+                          "proxy/SSL inspection, and the system clock. Token values were not logged. Root type: %s"
+                          % type(last_error).__name__
+                      ) from last_error
+
+              # AuthorizedHttp accepts credentials and an httplib2 transport. It does
+              # NOT accept the requests auth_request kwarg; passing it caused the prior TypeError.
+              authorized_http = AuthorizedHttp(creds, http=httplib2.Http(timeout=20))
+              return build("drive", "v3", http=authorized_http, cache_discovery=False)
 
           def upload_drive_file(source_path, metadata):
               """Perform a chunked, resumable upload suitable for large files."""
@@ -372,7 +385,7 @@ jobs:
               )
               response = None
               while response is None:
-                  status, response = request_upload.next_chunk()
+                  status, response = request_upload.next_chunk(num_retries=2)
                   if status:
                       log("Google Drive upload progress: " + str(int(status.progress() * 100)) + "%")
               return response
@@ -517,7 +530,7 @@ jobs:
                       query += " and '" + folder_id.replace("'", "") + "' in parents"
                   result = google_drive().files().list(
                       q=query, pageSize=page_size, orderBy="name",
-                      fields="files(id,name,mimeType,size,modifiedTime,webViewLink,parents)").execute(num_retries=5)
+                      fields="files(id,name,mimeType,size,modifiedTime,webViewLink,parents)").execute(num_retries=2)
                   files = result.get("files", [])
                   return jsonify(ok=True, count=len(files), files=files)
               except Exception as exc:
@@ -540,7 +553,7 @@ jobs:
                       downloader = MediaIoBaseDownload(handle, media, chunksize=8 * 1024 * 1024)
                       done = False
                       while not done:
-                          _, done = downloader.next_chunk()
+                          _, done = downloader.next_chunk(num_retries=2)
                   return jsonify(ok=True, file_id=file_id, destination=str(destination), size=destination.stat().st_size)
               except Exception as exc:
                   log("Drive download error: " + repr(exc))
@@ -773,7 +786,7 @@ jobs:
                       query += " and '" + folder_id.replace("'", "") + "' in parents"
                   result = google_drive().files().list(
                       q=query, pageSize=page_size, orderBy="name",
-                      fields="files(id,name,mimeType,size,modifiedTime,webViewLink,parents)").execute(num_retries=5)
+                      fields="files(id,name,mimeType,size,modifiedTime,webViewLink,parents)").execute(num_retries=2)
                   files = result.get("files", [])
                   return mcp_json({"ok": True, "count": len(files), "files": files})
               except Exception as exc:
@@ -792,7 +805,7 @@ jobs:
                       downloader = MediaIoBaseDownload(handle, media, chunksize=8 * 1024 * 1024)
                       done = False
                       while not done:
-                          _, done = downloader.next_chunk()
+                          _, done = downloader.next_chunk(num_retries=2)
                   return mcp_json({"ok": True, "file_id": file_id, "destination": str(destination_path),
                                     "size": destination_path.stat().st_size})
               except Exception as exc:
@@ -887,7 +900,7 @@ jobs:
           if ([string]::IsNullOrWhiteSpace($env:GG_UE_TOKEN)) { Write-Warning 'GG_UE_TOKEN is empty; Google Drive upload/download will fail until OAuth authorized_user.json is stored in this Actions secret.' }
           $env:BRIDGE_TOKEN = [guid]::NewGuid().ToString('N') + [guid]::NewGuid().ToString('N')
           $python = (Get-Command python).Source
-          & $python -m pip install --disable-pip-version-check --upgrade Flask google-api-python-client google-auth google-auth-httplib2 requests urllib3 "mcp>=2,<3" uvicorn
+          & $python -m pip install --disable-pip-version-check --upgrade Flask google-api-python-client google-auth google-auth-httplib2 httplib2 requests urllib3 "mcp>=2,<3" uvicorn
           if ($LASTEXITCODE -ne 0) { throw 'Python package installation failed.' }
 
           $apiOut = "$root\Logs\api-stdout.log"
