@@ -106,7 +106,9 @@ jobs:
             "Description": "Unreal Editor controlled through a remote API bridge",
             "Plugins": [
               { "Name": "PythonScriptPlugin", "Enabled": true },
-              { "Name": "EditorScriptingUtilities", "Enabled": true }
+              { "Name": "EditorScriptingUtilities", "Enabled": true },
+              { "Name": "ModelContextProtocol", "Enabled": true },
+              { "Name": "AllToolsets", "Enabled": true }
             ]
           }
           '@
@@ -218,6 +220,7 @@ jobs:
           LOG_DIR.mkdir(parents=True, exist_ok=True)
           LOG_FILE = LOG_DIR / "api.log"
           BRIDGE_TOKEN = os.environ.get("BRIDGE_TOKEN", "")
+          PUBLIC_API_TOKEN = os.environ.get("UE_REMOTE_API_TOKEN", "")
           jobs, waiting, lock = queue.Queue(), {}, threading.Lock()
           last_bridge_seen = 0.0
           UPLOAD_ROOT = (ROOT / "Uploads").resolve()
@@ -238,9 +241,11 @@ jobs:
               print(line, flush=True)
 
           def public_auth(fn):
-              # Deliberately unauthenticated for temporary plugin testing only.
               @wraps(fn)
               def wrapper(*args, **kwargs):
+                  supplied = request.headers.get("Authorization", "")
+                  if not PUBLIC_API_TOKEN or supplied != "Bearer " + PUBLIC_API_TOKEN:
+                      return jsonify(ok=False, error="unauthorized; send Authorization: Bearer <UE_REMOTE_API_TOKEN>"), 401
                   return fn(*args, **kwargs)
               return wrapper
 
@@ -279,19 +284,20 @@ jobs:
                   timeout = 60
               job_id, event = uuid.uuid4().hex, threading.Event()
               with lock:
-                  waiting[job_id] = {"event": event, "result": None}
+                  waiting[job_id] = {"event": event, "result": None, "created": time.time()}
               jobs.put({"id": job_id, "code": code})
               if not event.wait(timeout):
-                  with lock:
-                      waiting.pop(job_id, None)
-                  return {"ok": False, "error": "unreal_command_timeout", "job_id": job_id}, 504
+                  # Keep the job registered. A caller can poll it without losing late results.
+                  return {"ok": True, "status": "pending", "job_id": job_id,
+                          "message": "Still running; call unreal_wait_python_job with this job_id."}, 202
               with lock:
                   row = waiting.pop(job_id, None)
               result = row["result"] if row else None
               if not result:
                   return {"ok": False, "error": "missing_result", "job_id": job_id}, 500
-              return {"ok": not bool(result.get("error")), "output": result.get("output", ""),
-                      "error": result.get("error", ""), "job_id": job_id}, 200
+              return {"ok": not bool(result.get("error")), "status": "completed",
+                      "output": result.get("output", ""), "error": result.get("error", ""),
+                      "job_id": job_id}, 200
 
           def google_drive():
               raw = os.environ.get("GG_UE_TOKEN", "")
@@ -618,6 +624,7 @@ jobs:
           from starlette.applications import Starlette
           from starlette.middleware.wsgi import WSGIMiddleware
           from starlette.routing import Mount
+          import httpx
           from mcp.server.mcpserver import MCPServer
           from mcp.server.transport_security import TransportSecuritySettings
           import uvicorn
@@ -631,15 +638,37 @@ jobs:
               return json.dumps(value, ensure_ascii=False, default=str)
 
           @mcp_server.tool()
-          def unreal_execute_python(code: str, timeout_seconds: int = 60) -> str:
-              """Execute Python inside the running Unreal Editor; this can change the scene/project."""
+          def unreal_execute_python(code: str, timeout_seconds: int = 10) -> str:
+              """Run Python in the Unreal Editor. Returns a job_id if execution takes longer than timeout_seconds; poll with unreal_wait_python_job. This can change the scene/project."""
+              # Short first wait avoids MCP client/proxy request timeouts. Long jobs remain pollable.
+              timeout_seconds = max(1, min(15, int(timeout_seconds)))
               result, status = queue_unreal(code, timeout_seconds)
               return mcp_json(result if status == 200 else {**result, "http_status": status})
 
           @mcp_server.tool()
+          def unreal_wait_python_job(job_id: str, wait_seconds: int = 10) -> str:
+              """Wait briefly for a previously submitted Unreal Python job. Call repeatedly with the returned job_id while status is pending."""
+              job_id = str(job_id or "").strip()
+              wait_seconds = max(1, min(15, int(wait_seconds)))
+              with lock:
+                  row = waiting.get(job_id)
+              if row is None:
+                  return mcp_json({"ok": False, "error": "job_not_found_or_expired", "job_id": job_id})
+              if not row["event"].wait(wait_seconds):
+                  return mcp_json({"ok": True, "status": "pending", "job_id": job_id})
+              with lock:
+                  row = waiting.pop(job_id, None)
+              result = row.get("result") if row else None
+              if not result:
+                  return mcp_json({"ok": False, "error": "missing_result", "job_id": job_id})
+              return mcp_json({"ok": not bool(result.get("error")), "status": "completed",
+                               "job_id": job_id, "output": result.get("output", ""),
+                               "error": result.get("error", "")})
+
+          @mcp_server.tool()
           def unreal_get_engine_version() -> str:
-              """Return engine version reported by the active Unreal Editor."""
-              result, status = queue_unreal("import unreal\nunreal.SystemLibrary.get_engine_version()", 30)
+              """Get engine version; returns quickly or a pollable job_id if the editor has not responded yet."""
+              result, status = queue_unreal("import unreal\nunreal.SystemLibrary.get_engine_version()", 8)
               return mcp_json(result if status == 200 else {**result, "http_status": status})
 
           @mcp_server.tool()
@@ -951,22 +980,85 @@ jobs:
               shutil.rmtree(session["staging"], ignore_errors=True)
               return mcp_json({"ok": True, "aborted": True, "upload_id": upload_id})
 
-          mcp_app = mcp_server.streamable_http_app(
+          _mcp_app = mcp_server.streamable_http_app(
               streamable_http_path="/",
               transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False),
               host="0.0.0.0"
           )
+
+          async def mcp_app(scope, receive, send):
+              if scope.get("type") == "http":
+                  headers = {k.decode("latin1").lower(): v.decode("latin1") for k, v in scope.get("headers", [])}
+                  if not PUBLIC_API_TOKEN or headers.get("authorization", "") != "Bearer " + PUBLIC_API_TOKEN:
+                      body = b'{"ok":false,"error":"unauthorized"}'
+                      await send({"type": "http.response.start", "status": 401,
+                                  "headers": [(b"content-type", b"application/json"), (b"content-length", str(len(body)).encode())]})
+                      await send({"type": "http.response.body", "body": body})
+                      return
+              await _mcp_app(scope, receive, send)
 
           @asynccontextmanager
           async def lifespan(asgi_app):
               async with mcp_server.session_manager.run():
                   yield
 
-          combined_app = Starlette(routes=[Mount("/mcp", app=mcp_app), Mount("/", app=WSGIMiddleware(app))], lifespan=lifespan)
+          async def native_mcp_proxy(scope, receive, send):
+              # Authenticated, streaming reverse proxy to Epic's in-editor MCP server.
+              if scope.get("type") != "http":
+                  return
+              headers_in = {k.decode("latin1").lower(): v.decode("latin1") for k, v in scope.get("headers", [])}
+              if not PUBLIC_API_TOKEN or headers_in.get("authorization", "") != "Bearer " + PUBLIC_API_TOKEN:
+                  body = b'{"ok":false,"error":"unauthorized"}'
+                  await send({"type": "http.response.start", "status": 401,
+                              "headers": [(b"content-type", b"application/json"), (b"content-length", str(len(body)).encode())]})
+                  await send({"type": "http.response.body", "body": body})
+                  return
+              body = bytearray()
+              more = True
+              while more:
+                  message = await receive()
+                  if message["type"] == "http.disconnect":
+                      return
+                  body.extend(message.get("body", b""))
+                  more = message.get("more_body", False)
+              raw_path = scope.get("path", "/") or "/"
+              target_path = "/mcp" + ("" if raw_path == "/" else raw_path)
+              query = scope.get("query_string", b"")
+              target = "http://127.0.0.1:8000" + target_path + ("?" + query.decode("latin1") if query else "")
+              forwarded = {}
+              hop_by_hop = {"connection", "keep-alive", "proxy-authenticate", "proxy-authorization", "te", "trailers", "transfer-encoding", "upgrade", "host", "origin", "authorization"}
+              for key, value in scope.get("headers", []):
+                  name = key.decode("latin1").lower()
+                  if name not in hop_by_hop:
+                      forwarded[name] = value.decode("latin1")
+              forwarded["host"] = "127.0.0.1:8000"
+              forwarded["origin"] = "http://127.0.0.1:8000"
+              try:
+                  async with httpx.AsyncClient(timeout=None) as client:
+                      async with client.stream(scope.get("method", "POST"), target, headers=forwarded, content=bytes(body)) as response:
+                          out_headers = [(k.lower(), v) for k, v in response.headers.raw
+                                         if k.decode("latin1").lower() not in hop_by_hop]
+                          await send({"type": "http.response.start", "status": response.status_code, "headers": out_headers})
+                          async for chunk in response.aiter_raw():
+                              await send({"type": "http.response.body", "body": chunk, "more_body": True})
+                          await send({"type": "http.response.body", "body": b"", "more_body": False})
+              except Exception as exc:
+                  log("Native MCP proxy error: " + repr(exc))
+                  err = b'{"ok":false,"error":"native_mcp_proxy_failed"}'
+                  await send({"type": "http.response.start", "status": 502,
+                              "headers": [(b"content-type", b"application/json"), (b"content-length", str(len(err)).encode())]})
+                  await send({"type": "http.response.body", "body": err})
+
+          combined_app = Starlette(routes=[
+              Mount("/mcp", app=mcp_app),
+              Mount("/native-mcp", app=native_mcp_proxy),
+              Mount("/", app=WSGIMiddleware(app))
+          ], lifespan=lifespan)
 
           if __name__ == "__main__":
               if not BRIDGE_TOKEN: raise RuntimeError("BRIDGE_TOKEN must be set")
-              log("Starting REST API on 127.0.0.1:8765; MCP endpoint=/mcp/")
+              if not PUBLIC_API_TOKEN: raise RuntimeError("UE_REMOTE_API_TOKEN GitHub Actions secret must be set")
+              log("Starting authenticated REST API on 127.0.0.1:8765; MCP endpoint=/mcp/")
               uvicorn.run(combined_app, host="127.0.0.1", port=8765, log_level="info")
           '@
           Set-Content -LiteralPath "$root\api_server.py" -Value $api -Encoding utf8
@@ -976,6 +1068,7 @@ jobs:
         shell: pwsh
         env:
           GG_UE_TOKEN: ${{ secrets.GG_UE_TOKEN }}
+          UE_REMOTE_API_TOKEN: ${{ secrets.UE_REMOTE_API_TOKEN }}
           GITHUB_TOKEN: ${{ github.token }}
           GITHUB_REPOSITORY: ${{ github.repository }}
         run: |
@@ -989,7 +1082,7 @@ jobs:
           # The bridge token is only for local API <-> Unreal communication.
           $env:BRIDGE_TOKEN = [guid]::NewGuid().ToString('N') + [guid]::NewGuid().ToString('N')
           $python = (Get-Command python).Source
-          & $python -m pip install --disable-pip-version-check --upgrade Flask google-api-python-client google-auth google-auth-httplib2 requests urllib3 "mcp>=2,<3" uvicorn starlette
+          & $python -m pip install --disable-pip-version-check --upgrade Flask google-api-python-client google-auth google-auth-httplib2 requests urllib3 httpx "mcp>=2,<3" uvicorn starlette
           if ($LASTEXITCODE -ne 0) { throw 'Python package installation failed.' }
 
           $apiOut = "$root\Logs\api-stdout.log"
@@ -1018,6 +1111,7 @@ jobs:
           $env:GG_UE_TOKEN = $null
           $env:GITHUB_TOKEN = $null
           $env:GITHUB_REPOSITORY = $null
+          $env:UE_REMOTE_API_TOKEN = $null
 
           $editor = $env:UE_EDITOR_EXE
           if ([string]::IsNullOrWhiteSpace($editor) -or -not (Test-Path -LiteralPath $editor)) {
@@ -1026,7 +1120,7 @@ jobs:
           Write-Host "Unreal Editor found: $editor"
           $ueOut = "$root\Logs\unreal-stdout.log"
           $ueErr = "$root\Logs\unreal-stderr.log"
-          $ueArgs = @("$root\UEControl\UEControl.uproject", '-log', '-stdout', '-FullStdOutLogOutput', '-AllowSoftwareRendering', '-d3d11')
+          $ueArgs = @("$root\UEControl\UEControl.uproject", '-log', '-stdout', '-FullStdOutLogOutput', '-AllowSoftwareRendering', '-d3d11', '-ModelContextProtocolStartServer', '-ModelContextProtocolPort=8000', "-ExecutePythonScript=$root\UEControl\Content\Python\init_unreal.py")
           $ueProc = Start-Process -FilePath $editor -ArgumentList $ueArgs -WorkingDirectory "$root\UEControl" -PassThru -RedirectStandardOutput $ueOut -RedirectStandardError $ueErr
           Write-Host "UNREAL_PID=$($ueProc.Id)"
 
@@ -1067,9 +1161,11 @@ jobs:
 
           Write-Host 'REST endpoints: GET /health, POST /command, GET /projects, POST /projects/rename, POST /files/upload, GET /files/download, GET /files/read, PUT /files/write, POST /drive/list, POST /drive/download, POST /drive/upload, POST /github/release/upload, POST /unreal/screenshot, GET /logs'
           Write-Host "MCP_ENDPOINT=$publicUrl/mcp/"
+          Write-Host "NATIVE_ALL_TOOLSETS_MCP_ENDPOINT=$publicUrl/native-mcp"
           Write-Host 'Binary transfer: files are saved under D:\UE58\Uploads; use unreal_upload_binary_file for small files or begin/chunk/finish tools for larger files. Chunk size: 16 KiB; max file size: 2 GiB.'
-          Write-Host 'MCP tools: unreal_upload_binary_file, unreal_begin_binary_upload, unreal_upload_binary_chunk, unreal_finish_binary_upload, unreal_abort_binary_upload, unreal_execute_python, unreal_get_engine_version, unreal_list_projects, unreal_rename_project, unreal_list_files, unreal_read_text_file, unreal_write_text_file, google_drive_list_files, google_drive_download_file, google_drive_upload_file, github_release_upload_file, unreal_take_screenshot'
-          Write-Warning 'This is an unauthenticated temporary public endpoint. Anyone with its URL may control Unreal and access workspace files. Do not share it; stop the workflow when testing is finished.'
+          Write-Host 'MCP tools: unreal_upload_binary_file, unreal_begin_binary_upload, unreal_upload_binary_chunk, unreal_finish_binary_upload, unreal_abort_binary_upload, unreal_execute_python, unreal_wait_python_job, unreal_get_engine_version, unreal_list_projects, unreal_rename_project, unreal_list_files, unreal_read_text_file, unreal_write_text_file, google_drive_list_files, google_drive_download_file, google_drive_upload_file, github_release_upload_file, unreal_take_screenshot'
+          Write-Host 'MCP authentication: Authorization: Bearer <UE_REMOTE_API_TOKEN>'
+          Write-Host 'Native Unreal MCP (All Toolsets) is proxied through the authenticated /native-mcp endpoint; custom API tools remain at /mcp/.'
 
           $lastHeartbeat = Get-Date
           while ($true) {
