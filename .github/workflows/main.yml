@@ -287,11 +287,9 @@ jobs:
               # Use an HTTPS session that retries POST (OAuth refresh), connection errors,
               # rate limits and transient Google 5xx responses with exponential backoff.
               import requests
-              import httplib2
               from requests.adapters import HTTPAdapter
               from urllib3.util.retry import Retry
               from google.auth.transport.requests import Request
-              from google_auth_httplib2 import AuthorizedHttp
               from googleapiclient.discovery import build
 
               retry_policy = Retry(
@@ -352,13 +350,12 @@ jobs:
                       "or a service-account key JSON."
                   )
 
-              # Supply the same retry-capable auth request for any later automatic token refreshes.
-              authorized_http = AuthorizedHttp(
-                  creds,
-                  http=httplib2.Http(timeout=120),
-                  auth_request=auth_request,
-              )
-              return build("drive", "v3", http=authorized_http, cache_discovery=False)
+              # Build with credentials directly. google_auth_httplib2.AuthorizedHttp
+              # does not accept an `auth_request` constructor argument; passing it caused
+              # the upload to fail before any request reached Google Drive.
+              # The explicit refresh above uses the retry-capable Requests transport.
+              # googleapiclient then creates its supported AuthorizedHttp transport.
+              return build("drive", "v3", credentials=creds, cache_discovery=False)
 
           def upload_drive_file(source_path, metadata):
               """Perform a chunked, resumable upload suitable for large files."""
