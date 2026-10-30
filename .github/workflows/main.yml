@@ -1708,9 +1708,9 @@ jobs:
           ## Unreal Live Monitor
           - [Open read-only monitor]($monitorUrl)
           - MCP endpoint: $publicUrl/mcp
-          - Username: `viewer`
-          - Password: repository secret `MONITOR_PASSWORD`
-          - GitHub Release upload: available inside the authenticated monitor; default tag `ue5.8`.
+          - Username: viewer
+          - Password: repository secret MONITOR_PASSWORD
+          - GitHub Release upload: available inside the authenticated monitor; default tag: ue5.8.
           "@
           $summaryText | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
 
