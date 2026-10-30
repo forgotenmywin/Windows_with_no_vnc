@@ -456,34 +456,41 @@ jobs:
         \ solid #3b4654;border-radius:7px;padding:8px;max-width:100%}\n.log-controls{display:flex;gap:9px;align-items:center;flex-wrap:wrap;margin:10px\
         \ 0}.diag{display:flex;gap:8px;flex-wrap:wrap;margin:10px 0}\n.diag .pill{background:#101720}.log-output{white-space:pre-wrap;overflow:auto;overflow-wrap:anywhere;max-height:65vh;min-height:300px;padding:12px;background:#090d12;border:1px\
         \ solid #303946;border-radius:8px;color:#cbd5e1;font:12px/1.55 Consolas,monospace}\n.log-error{color:#ff9292}.log-warn{color:#f5c66b}.log-debug{color:#9ca8b8}.log-info{color:#bcd0e8}\n\
-        #scene3d{height:560px;min-height:360px;background:#080d14;border:1px solid #303946;border-radius:10px;position:relative;overflow:hidden}#scene3d\
-        \ canvas{display:block;width:100%;height:100%}#sceneFallback{position:absolute;inset:0;display:grid;place-items:center;color:#9ca8b8}.scene-layout{display:grid;grid-template-columns:minmax(0,1.7fr)\
-        \ minmax(260px,1fr);gap:12px;margin-top:12px}.scene-side{min-width:0}.actor-list{max-height:470px;overflow:auto;margin-top:9px;display:flex;flex-direction:column;gap:6px}.actor-row{border:1px\
+        #scene3d{height:620px;min-height:480px;background:#080d14;border:1px solid #303946;border-radius:10px;position:relative;overflow:hidden;touch-action:none}#scene3d\
+        \ canvas{display:block;width:100%;height:100%;touch-action:none;cursor:grab}#scene3d canvas:active{cursor:grabbing}#sceneFallback{position:absolute;inset:0;display:grid;place-items:center;color:#9ca8b8}.scene-toolbar{display:flex;gap:7px;align-items:center;flex-wrap:wrap;margin:12px\
+        \ 0}.scene-toolbar button{white-space:nowrap}.scene-toolbar .primary{background:#254b70;border-color:#5d91c2}.scene-layout{display:grid;grid-template-columns:minmax(0,2fr)\
+        \ minmax(260px,1fr);gap:12px;margin-top:12px}.scene-side{min-width:0}.actor-list{max-height:570px;overflow:auto;margin-top:9px;display:flex;flex-direction:column;gap:6px}.actor-row{border:1px\
         \ solid #303946;background:#111720;padding:8px 10px;border-radius:7px;font-size:12px;overflow-wrap:anywhere}.actor-row\
         \ b{color:#dbeafe}.actor-meta{color:#9ca8b8;font-size:11px}.plugin-box{border-top:1px solid #303946;margin-top:14px;padding-top:12px}details{margin-top:10px}summary{cursor:pointer;color:#bcd0e8;font-size:12px}.ops-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:14px}.ops-grid>div{background:#111720;border:1px\
         \ solid #303946;padding:12px;border-radius:9px;min-width:0}.mcp-form{margin-top:10px}.mcp-form input{min-width:160px}.scene-legend{font-size:11px;color:#9ca8b8;margin-top:8px}\n\
-        @media(max-width:850px){main{grid-template-columns:1fr;padding:10px}#logsPanel{grid-column:1!important}}\n</style></head><body>\n\
-        <header><div><h1>Unreal Engine Live Monitor</h1><div class=\"muted small\">Read-only view · no desktop streaming ·\
-        \ low-frequency polling</div></div>\n<div class=\"row\"><span class=\"pill\" id=\"bridge\">Checking bridge…</span><span\
-        \ class=\"pill\" id=\"clock\">—</span></div></header>\n<main><div><section><div class=\"row\" style=\"justify-content:space-between;margin-bottom:10px\"\
-        ><h2>Latest Viewport Snapshot</h2><div class=\"row\"><span class=\"muted small\" id=\"shotInfo\">Waiting for first\
-        \ capture</span><button id=\"captureNow\">Capture now</button></div></div>\n<img id=\"shot\" alt=\"Latest Unreal viewport\
-        \ screenshot\" hidden><div id=\"empty\">The first low-resolution snapshot will appear after the bridge is ready.</div>\n\
-        <div class=\"muted small\" style=\"margin-top:9px\">640 × 360 maximum · JPEG quality 48 · captured only after tool\
-        \ activity, with a 30-second throttle.</div>\n<div class=\"small red\" id=\"captureError\"></div></section>\n<section\
-        \ style=\"margin-top:14px\"><h2>GitHub Release Upload</h2><div class=\"muted small\">Upload the latest monitor screenshot\
-        \ to the current repository's Release using GitHub REST API.</div>\n<div class=\"upload row\"><label>Release tag <input\
-        \ id=\"tag\" value=\"ue5.8\" maxlength=\"100\"></label><label>Asset name <input id=\"assetName\" value=\"\" placeholder=\"\
-        auto timestamp\" maxlength=\"120\"></label>\n<button id=\"uploadBtn\">Save latest screenshot to Release</button></div><div\
-        \ id=\"uploadStatus\" class=\"small muted\" style=\"margin-top:8px\"></div></section></div>\n<section><div class=\"\
-        row\" style=\"justify-content:space-between\"><h2>Tool Activity</h2><span class=\"muted small\">refresh every 5 sec</span></div><div\
-        \ id=\"events\"><div class=\"muted\">Waiting for MCP tool calls…</div></div></section>\n<section id=\"scenePanel\"\
-        \ style=\"grid-column:1/-1\"><div class=\"row\" style=\"justify-content:space-between\"><h2>Read-only 3D Scene Explorer</h2><span\
-        \ class=\"pill\" id=\"sceneStatus\">Waiting for scene data</span></div>\n<div class=\"small muted\">Approximate spatial\
-        \ view built from Actor transforms and bounding boxes. Drag to orbit, scroll to zoom, right-drag to pan. This does\
-        \ not move the Unreal Editor camera or edit the level.</div>\n<div class=\"scene-layout\"><div id=\"scene3d\"><div\
-        \ id=\"sceneFallback\">Loading 3D scene viewer…</div></div><div class=\"scene-side\"><div class=\"row\"><button id=\"\
-        sceneRefresh\">Refresh scene</button><select id=\"sceneFilter\"><option value=\"all\">All objects</option><option>Characters</option><option>Lights</option><option>Cameras</option><option>Meshes</option><option>Volumes</option><option>Actors</option></select></div><div\
+        @media(max-width:950px){main{grid-template-columns:1fr;padding:10px}#logsPanel{grid-column:1!important}.scene-layout{grid-template-columns:1fr}#scene3d{height:65vh;min-height:420px}.actor-list{max-height:360px}}\n\
+        </style></head><body>\n<header><div><h1>Unreal Engine Live Monitor</h1><div class=\"muted small\">Read-only view ·\
+        \ no desktop streaming · low-frequency polling</div></div>\n<div class=\"row\"><span class=\"pill\" id=\"bridge\"\
+        >Checking bridge…</span><span class=\"pill\" id=\"clock\">—</span></div></header>\n<main><div><section><div class=\"\
+        row\" style=\"justify-content:space-between;margin-bottom:10px\"><h2>Latest Viewport Snapshot</h2><div class=\"row\"\
+        ><span class=\"muted small\" id=\"shotInfo\">Waiting for first capture</span><button id=\"captureNow\">Capture now</button></div></div>\n\
+        <img id=\"shot\" alt=\"Latest Unreal viewport screenshot\" hidden><div id=\"empty\">The first low-resolution snapshot\
+        \ will appear after the bridge is ready.</div>\n<div class=\"muted small\" style=\"margin-top:9px\">640 × 360 maximum\
+        \ · JPEG quality 48 · captured only after tool activity, with a 30-second throttle.</div>\n<div class=\"small red\"\
+        \ id=\"captureError\"></div></section>\n<section style=\"margin-top:14px\"><h2>GitHub Release Upload</h2><div class=\"\
+        muted small\">Upload the latest monitor screenshot to the current repository's Release using GitHub REST API.</div>\n\
+        <div class=\"upload row\"><label>Release tag <input id=\"tag\" value=\"ue5.8\" maxlength=\"100\"></label><label>Asset\
+        \ name <input id=\"assetName\" value=\"\" placeholder=\"auto timestamp\" maxlength=\"120\"></label>\n<button id=\"\
+        uploadBtn\">Save latest screenshot to Release</button></div><div id=\"uploadStatus\" class=\"small muted\" style=\"\
+        margin-top:8px\"></div></section></div>\n<section><div class=\"row\" style=\"justify-content:space-between\"><h2>Tool\
+        \ Activity</h2><span class=\"muted small\">refresh every 5 sec</span></div><div id=\"events\"><div class=\"muted\"\
+        >Waiting for MCP tool calls…</div></div></section>\n<section id=\"scenePanel\" style=\"grid-column:1/-1\"><div class=\"\
+        row\" style=\"justify-content:space-between\"><h2>Read-only 3D Scene Explorer</h2><span class=\"pill\" id=\"sceneStatus\"\
+        >Waiting for scene data</span></div>\n<div class=\"small muted\">Interactive 3D overview of the level's Actor bounds.\
+        \ Left-drag: rotate · right-drag: pan · mouse wheel: zoom. This viewer is separate from the Unreal Editor camera and\
+        \ does not edit the level.</div>\n<div class=\"scene-toolbar\" aria-label=\"3D camera controls\"><button id=\"sceneFitAll\"\
+        \ class=\"primary\" type=\"button\">Show all objects / Frame All</button><button id=\"sceneZoomIn\" type=\"button\"\
+        >Zoom +</button><button id=\"sceneZoomOut\" type=\"button\">Zoom −</button><button id=\"sceneViewIso\" type=\"button\"\
+        >Isometric</button><button id=\"sceneViewTop\" type=\"button\">Top</button><button id=\"sceneViewFront\" type=\"button\"\
+        >Front</button><button id=\"sceneViewSide\" type=\"button\">Side</button><button id=\"sceneViewBack\" type=\"button\"\
+        >Back</button><button id=\"sceneRefresh\" type=\"button\">Refresh scene</button></div>\n<div class=\"scene-layout\"\
+        ><div id=\"scene3d\"><div id=\"sceneFallback\">Loading 3D scene viewer…</div></div><div class=\"scene-side\"><div\
+        \ class=\"row\"><select id=\"sceneFilter\"><option value=\"all\">All objects</option><option>Characters</option><option>Lights</option><option>Cameras</option><option>Meshes</option><option>Volumes</option><option>Actors</option></select></div><div\
         \ id=\"sceneCounts\" class=\"diag\"></div><div id=\"actorList\" class=\"actor-list\">No actor data yet.</div></div></div></section>\n\
         <section id=\"projectPanel\" style=\"grid-column:1/-1\"><h2>Projects & Plugins</h2><div class=\"row\"><label>Project\
         \ <select id=\"projectSelect\" style=\"min-width:280px\"></select></label><button id=\"openProjectBtn\">Open project\
@@ -639,52 +646,133 @@ jobs:
         \ p=j.job||{};$('packageStatus').textContent='Build '+p.status+': '+(p.last_line||p.error||'');if(p.status==='completed'){completedPackageZip=p.zip;$('publishPackageBtn').disabled=false;$('packageStatus').innerHTML='Completed.\
         \ <a href=\"/api/package/download?path='+encodeURIComponent(p.zip)+'\">Download packaged ZIP</a>';packageJob=null;}if(p.status==='failed')packageJob=null;}).catch(e=>$('packageStatus').textContent=e.message);}},5000);\n\
         \nupdate();updateLogs();setInterval(update,5000);setInterval(()=>{if($('autoLogs').checked)updateLogs();},8000);\n\
-        </script>\n<script type=\"module\">\nlet THREE,OrbitControls;const root=document.getElementById('scene3d');let scene,camera,renderer,controls,group,actors=[];\n\
-        function init(){scene=new THREE.Scene();scene.background=new THREE.Color(0x080d14);camera=new THREE.PerspectiveCamera(55,1,0.1,1000000);camera.position.set(900,-1100,850);renderer=new\
-        \ THREE.WebGLRenderer({antialias:true});renderer.setPixelRatio(Math.min(window.devicePixelRatio||1,1.5));root.innerHTML='';root.appendChild(renderer.domElement);controls=new\
-        \ OrbitControls(camera,renderer.domElement);controls.enableDamping=true;controls.target.set(0,0,0);scene.add(new THREE.HemisphereLight(0xffffff,0x334455,2));const\
-        \ grid=new THREE.GridHelper(5000,50,0x496078,0x26394c);scene.add(grid);group=new THREE.Group();scene.add(group);const\
-        \ axes=new THREE.AxesHelper(250);scene.add(axes);resize();new ResizeObserver(resize).observe(root);function animate(){requestAnimationFrame(animate);controls.update();renderer.render(scene,camera);}animate();}\n\
-        function resize(){if(!renderer||!root.clientWidth)return;const w=root.clientWidth,h=root.clientHeight;renderer.setSize(w,h,false);camera.aspect=w/h;camera.updateProjectionMatrix();}\n\
-        function colorFor(c){return ({Characters:0xffc857,Lights:0xffe08a,Cameras:0x70b7ff,Meshes:0x8ea6bd,Volumes:0xc28bff,Actors:0x55d6be,Errors:0xff7777})[c]||0xaeb7c4;}\n\
-        function renderActors(rows){actors=rows||[];while(group.children.length){const o=group.children[0];group.remove(o);o.geometry?.dispose();o.material?.dispose();}const\
-        \ bounds=new THREE.Box3();for(const a of actors){if(!a.location||a.hidden)continue;const e=a.bounds_extent||{x:25,y:25,z:25};const\
-        \ sx=Math.max(8,Math.abs(e.x*2)),sy=Math.max(8,Math.abs(e.y*2)),sz=Math.max(8,Math.abs(e.z*2));const geo=new THREE.BoxGeometry(sx,sz,sy);const\
-        \ mat=new THREE.MeshStandardMaterial({color:colorFor(a.category),transparent:true,opacity:0.68,roughness:0.8,metalness:0.05});const\
-        \ mesh=new THREE.Mesh(geo,mat);mesh.position.set(a.location.x,a.location.z,a.location.y);mesh.rotation.set(THREE.MathUtils.degToRad(a.rotation?.pitch||0),THREE.MathUtils.degToRad(a.rotation?.yaw||0),THREE.MathUtils.degToRad(a.rotation?.roll||0));mesh.userData.actor=a;group.add(mesh);const\
-        \ p=new THREE.Vector3(a.location.x,a.location.z,a.location.y);bounds.expandByPoint(p);}if(actors.length&&bounds.isEmpty()===false){const\
-        \ center=bounds.getCenter(new THREE.Vector3());controls.target.copy(center);const size=bounds.getSize(new THREE.Vector3()).length();camera.position.copy(center).add(new\
-        \ THREE.Vector3(size*0.8,-size*1.1,size*0.8));controls.update();}renderList();}\nfunction renderList(){const f=document.getElementById('sceneFilter').value;const\
-        \ rows=actors.filter(a=>f==='all'||a.category===f);document.getElementById('actorList').innerHTML=rows.slice(0,500).map(a=>'<div\
-        \ class=\"actor-row\"><b>'+safe(a.name)+'</b> <span class=\"actor-meta\">'+safe(a.category)+' · '+safe(a.class)+'</span><div\
-        \ class=\"actor-meta\">Location: '+(a.location?`${a.location.x.toFixed(1)}, ${a.location.y.toFixed(1)}, ${a.location.z.toFixed(1)}`:'—')+'\
-        \ cm · Extent: '+(a.bounds_extent?`${a.bounds_extent.x.toFixed(1)}, ${a.bounds_extent.y.toFixed(1)}, ${a.bounds_extent.z.toFixed(1)}`:'—')+'</div></div>').join('')||'No\
-        \ actors in this category.';const cats={};for(const a of actors)cats[a.category]=(cats[a.category]||0)+1;document.getElementById('sceneCounts').innerHTML=Object.entries(cats).map(([k,v])=>'<span\
-        \ class=\"pill\">'+safe(k)+': '+v+'</span>').join('');}\nfunction safe(s){return String(s??'').replace(/[&<>\"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','\"\
-        ':'&quot;',\"'\":'&#39;'}[c]));}\nlet activeSceneJob='',scenePollBusy=false;\nfunction applyScenePayload(sceneData){if(!sceneData||!Array.isArray(sceneData.actors))return\
-        \ false;renderActors(sceneData.actors);document.getElementById('sceneStatus').textContent=(sceneData.level||'Level')+'\
-        \ · '+(sceneData.count??sceneData.actors.length)+' actors · updated '+new Date((sceneData.updated_at||Date.now()/1000)*1000).toLocaleTimeString();return\
-        \ true;}\nasync function pollSceneJob(){if(scenePollBusy||!activeSceneJob)return;scenePollBusy=true;try{const r=await\
-        \ fetch('/api/scene/status?job_id='+encodeURIComponent(activeSceneJob),{cache:'no-store'});const j=await r.json();if(!r.ok)throw\
-        \ new Error(j.error||'Scene job status unavailable');const job=j.job||{};if(job.status==='completed'){applyScenePayload(j.scene||job.scene);document.getElementById('sceneStatus').textContent='Scene\
-        \ scan complete · '+(job.count??(j.scene?.count||0))+' actors';activeSceneJob='';}else if(job.status==='failed'){document.getElementById('sceneStatus').textContent='Scene\
-        \ scan failed: '+(job.error||'unknown error');activeSceneJob='';}else{document.getElementById('sceneStatus').textContent='Scanning\
-        \ scene… '+job.status;}}catch(e){document.getElementById('sceneStatus').textContent='Scene status error: '+e.message;}finally{scenePollBusy=false;}}\n\
-        async function refreshSceneSnapshot(force=false){const status=document.getElementById('sceneStatus');status.textContent='Requesting\
-        \ Unreal scene snapshot…';try{const r=await fetch('/api/scene/snapshot?refresh=1'+(force?'&force=1':''),{cache:'no-store'});const\
-        \ j=await r.json();if(!r.ok||!j.ok)throw new Error(j.error||'Scene snapshot not ready');if(j.scene)applyScenePayload(j.scene);const\
-        \ req=j.request||{},job=j.job||{};activeSceneJob=req.job_id||job.job_id||'';if(activeSceneJob){status.textContent='Scene\
-        \ scan '+(req.status||job.status||'queued')+'…';pollSceneJob();}else if(j.scene){status.textContent=(j.scene.level||'Level')+'\
-        \ · '+(j.scene.count??j.scene.actors?.length??0)+' actors · cached';}else{status.textContent='Waiting for scene scan…';}}catch(e){status.textContent='Scene\
-        \ query failed: '+e.message;}}\ntry{THREE=await import('https://cdn.jsdelivr.net/npm/three@0.160.1/build/three.module.js');({OrbitControls}=await\
-        \ import('https://cdn.jsdelivr.net/npm/three@0.160.1/examples/jsm/controls/OrbitControls.js'));init();window.refreshSceneSnapshot=()=>refreshSceneSnapshot(true);document.getElementById('sceneFilter').addEventListener('change',renderList);refreshSceneSnapshot();setInterval(()=>{if(activeSceneJob)pollSceneJob();else\
-        \ refreshSceneSnapshot(false);},3000);}catch(e){document.getElementById('sceneFallback').textContent='3D viewer failed\
-        \ to load: '+e.message+' (check access to jsdelivr.net)';}\n</script></body></html>'''\n    response = app.response_class(page,\
-        \ mimetype=\"text/html\")\n    response.headers[\"Cache-Control\"] = \"no-store\"\n    return response\n\n@app.get(\"\
-        /api/monitor/state\")\n@monitor_auth\ndef monitor_state():\n    with MONITOR_LOCK:\n        needs_first_image = (not\
-        \ MONITOR_STATE.get(\"image_path\")\n                             and not MONITOR_STATE.get(\"capture_running\")\n\
-        \                             and not MONITOR_STATE.get(\"capture_error\"))\n    if needs_first_image and bridge_connected():\n\
-        \        request_monitor_capture()\n        _start_monitor_capture(force=False)\n    response = jsonify(monitor_state_payload())\n\
+        </script>\n<script type=\"module\">\nlet THREE;\nconst root = document.getElementById('scene3d');\nlet scene, camera,\
+        \ renderer, group, grid, axes;\nlet actors = [], worldBounds = null, cameraHasBeenFramed = false;\nlet lastSceneTimestamp\
+        \ = null;\nlet dragMode = null, lastPointer = {x:0,y:0};\n\nconst numberOr = (value, fallback=0) => Number.isFinite(Number(value))\
+        \ ? Number(value) : fallback;\nconst clamp = (value, low, high) => Math.max(low, Math.min(high, value));\n\nfunction\
+        \ init(){\n  target = new THREE.Vector3(0,0,0);\n  scene = new THREE.Scene();\n  scene.background = new THREE.Color(0x080d14);\n\
+        \  camera = new THREE.PerspectiveCamera(50, 1, 0.1, 100000000);\n  camera.position.set(1200, 950, 1200);\n  renderer\
+        \ = new THREE.WebGLRenderer({antialias:true, alpha:false});\n  renderer.setPixelRatio(Math.min(window.devicePixelRatio\
+        \ || 1, 1.5));\n  root.innerHTML = '';\n  root.appendChild(renderer.domElement);\n  renderer.domElement.setAttribute('aria-label','Interactive\
+        \ Unreal scene overview');\n  renderer.domElement.addEventListener('contextmenu', event => event.preventDefault());\n\
+        \  installCameraControls(renderer.domElement);\n  scene.add(new THREE.HemisphereLight(0xffffff, 0x334455, 2.2));\n\
+        \  const keyLight = new THREE.DirectionalLight(0xffffff, 1.0);\n  keyLight.position.set(1, 2, 1);\n  scene.add(keyLight);\n\
+        \  grid = new THREE.GridHelper(5000, 50, 0x496078, 0x26394c);\n  scene.add(grid);\n  group = new THREE.Group();\n\
+        \  scene.add(group);\n  axes = new THREE.AxesHelper(250);\n  scene.add(axes);\n  resize();\n  new ResizeObserver(resize).observe(root);\n\
+        \  window.addEventListener('resize', resize);\n  function animate(){ requestAnimationFrame(animate); renderer.render(scene,\
+        \ camera); }\n  animate();\n}\n\nfunction resize(){\n  if(!renderer || !root.clientWidth || !root.clientHeight) return;\n\
+        \  const w = root.clientWidth, h = root.clientHeight;\n  renderer.setSize(w, h, false);\n  camera.aspect = w / h;\n\
+        \  camera.updateProjectionMatrix();\n}\n\nfunction installCameraControls(canvas){\n  canvas.addEventListener('pointerdown',\
+        \ event => {\n    if(event.button === 0) dragMode = 'rotate';\n    else if(event.button === 1 || event.button ===\
+        \ 2) dragMode = 'pan';\n    else return;\n    lastPointer = {x:event.clientX, y:event.clientY};\n    canvas.setPointerCapture?.(event.pointerId);\n\
+        \    event.preventDefault();\n  });\n  canvas.addEventListener('pointermove', event => {\n    if(!dragMode) return;\n\
+        \    const dx = event.clientX - lastPointer.x;\n    const dy = event.clientY - lastPointer.y;\n    lastPointer = {x:event.clientX,\
+        \ y:event.clientY};\n    if(dragMode === 'rotate') rotateCamera(dx, dy);\n    else panCamera(dx, dy);\n    event.preventDefault();\n\
+        \  });\n  const stop = () => { dragMode = null; };\n  canvas.addEventListener('pointerup', stop);\n  canvas.addEventListener('pointercancel',\
+        \ stop);\n  canvas.addEventListener('lostpointercapture', stop);\n  canvas.addEventListener('wheel', event => {\n\
+        \    event.preventDefault();\n    zoomCamera(Math.exp(event.deltaY * 0.001));\n  }, {passive:false});\n}\n\nfunction\
+        \ rotateCamera(dx, dy){\n  const offset = camera.position.clone().sub(controlsTarget());\n  const spherical = new\
+        \ THREE.Spherical().setFromVector3(offset);\n  const height = Math.max(1, root.clientHeight);\n  spherical.theta -=\
+        \ (dx / height) * Math.PI * 2;\n  spherical.phi -= (dy / height) * Math.PI * 2;\n  spherical.makeSafe();\n  camera.position.copy(controlsTarget()).add(new\
+        \ THREE.Vector3().setFromSpherical(spherical));\n  camera.up.set(0,1,0);\n  camera.lookAt(controlsTarget());\n}\n\n\
+        let target;\n\nfunction controlsTarget(){ return target; }\n\nfunction panCamera(dx, dy){\n  camera.updateMatrixWorld();\n\
+        \  const distance = camera.position.distanceTo(target);\n  const worldPerPixel = 2 * distance * Math.tan(THREE.MathUtils.degToRad(camera.fov\
+        \ * 0.5)) / Math.max(1, root.clientHeight);\n  const right = new THREE.Vector3().setFromMatrixColumn(camera.matrix,\
+        \ 0);\n  const up = new THREE.Vector3().setFromMatrixColumn(camera.matrix, 1);\n  const shift = right.multiplyScalar(-dx\
+        \ * worldPerPixel).add(up.multiplyScalar(dy * worldPerPixel));\n  camera.position.add(shift);\n  target.add(shift);\n\
+        \  camera.lookAt(target);\n}\n\nfunction zoomCamera(factor){\n  const offset = camera.position.clone().sub(target);\n\
+        \  const distance = offset.length();\n  const minDistance = camera.userData.minDistance || 5;\n  const maxDistance\
+        \ = camera.userData.maxDistance || 100000000;\n  const nextDistance = clamp(distance * factor, minDistance, maxDistance);\n\
+        \  if(distance > 0){\n    offset.setLength(nextDistance);\n    camera.position.copy(target).add(offset);\n    camera.lookAt(target);\n\
+        \  }\n}\n\nfunction colorFor(category){\n  return ({Characters:0xffc857,Lights:0xffe08a,Cameras:0x70b7ff,Meshes:0x8ea6bd,Volumes:0xc28bff,Actors:0x55d6be,Errors:0xff7777})[category]\
+        \ || 0xaeb7c4;\n}\n\nfunction clearGroup(){\n  if(!group) return;\n  while(group.children.length){\n    const object\
+        \ = group.children[0];\n    group.remove(object);\n    object.traverse(child => {\n      child.geometry?.dispose?.();\n\
+        \      if(Array.isArray(child.material)) child.material.forEach(m=>m.dispose?.());\n      else child.material?.dispose?.();\n\
+        \    });\n  }\n}\n\nfunction renderActors(rows){\n  actors = Array.isArray(rows) ? rows : [];\n  clearGroup();\n \
+        \ const bounds = new THREE.Box3();\n  for(const actor of actors){\n    if(!actor || actor.hidden || !actor.location)\
+        \ continue;\n    // Unreal's get_actor_bounds returns a world-space bounds center separately\n    // from the Actor\
+        \ pivot. Use that center so offset pivots do not misframe trees/meshes.\n    const origin = actor.bounds_origin ||\
+        \ actor.location;\n    const px = numberOr(origin.x), py = numberOr(origin.y), pz = numberOr(origin.z);\n    const\
+        \ extent = actor.bounds_extent || {x:25,y:25,z:25};\n    const ex = Math.max(4, Math.abs(numberOr(extent.x,25)));\n\
+        \    const ey = Math.max(4, Math.abs(numberOr(extent.y,25)));\n    const ez = Math.max(4, Math.abs(numberOr(extent.z,25)));\n\
+        \    const center = new THREE.Vector3(px, pz, py); // Unreal Z-up -> Three.js Y-up.\n    const half = new THREE.Vector3(ex,\
+        \ ez, ey);\n    const geometry = new THREE.BoxGeometry(Math.max(8,2*ex), Math.max(8,2*ez), Math.max(8,2*ey));\n  \
+        \  const material = new THREE.MeshStandardMaterial({\n      color:colorFor(actor.category), transparent:true, opacity:0.48,\n\
+        \      roughness:0.84, metalness:0.02, depthWrite:false\n    });\n    const mesh = new THREE.Mesh(geometry, material);\n\
+        \    mesh.position.copy(center);\n    mesh.userData.actor = actor;\n    group.add(mesh);\n    const edge = new THREE.LineSegments(\n\
+        \      new THREE.EdgesGeometry(geometry),\n      new THREE.LineBasicMaterial({color:colorFor(actor.category), transparent:true,\
+        \ opacity:0.95})\n    );\n    mesh.add(edge);\n    bounds.expandByPoint(center.clone().sub(half));\n    bounds.expandByPoint(center.clone().add(half));\n\
+        \  }\n  worldBounds = bounds.isEmpty() ? null : bounds;\n  if(worldBounds && !cameraHasBeenFramed) fitAll();\n  renderList();\n\
+        }\n\nfunction fitAll(){\n  if(!worldBounds || worldBounds.isEmpty()){\n    document.getElementById('sceneStatus').textContent\
+        \ = 'No visible Actor bounds are available yet.';\n    return;\n  }\n  const center = worldBounds.getCenter(new THREE.Vector3());\n\
+        \  const size = worldBounds.getSize(new THREE.Vector3());\n  const radius = Math.max(50, size.length() * 0.5);\n \
+        \ const halfVertical = THREE.MathUtils.degToRad(camera.fov * 0.5);\n  const halfHorizontal = Math.atan(Math.tan(halfVertical)\
+        \ * Math.max(0.2, camera.aspect));\n  const limitingHalfFov = Math.max(0.05, Math.min(halfVertical, halfHorizontal));\n\
+        \  const distance = Math.max(150, radius / Math.sin(limitingHalfFov) * 1.28);\n  const direction = new THREE.Vector3(1,\
+        \ 0.82, 1).normalize();\n  target.copy(center);\n  camera.up.set(0,1,0);\n  camera.position.copy(center).add(direction.multiplyScalar(distance));\n\
+        \  camera.near = Math.max(0.1, distance / 10000);\n  camera.far = Math.max(100000, distance * 100);\n  camera.userData.minDistance\
+        \ = Math.max(2, radius * 0.012);\n  camera.userData.maxDistance = Math.max(5000, radius * 100);\n  camera.updateProjectionMatrix();\n\
+        \  camera.lookAt(target);\n  const gridScale = clamp(Math.max(size.x,size.z,5000) / 5000, 1, 10000);\n  grid.scale.setScalar(gridScale);\n\
+        \  grid.position.set(center.x, worldBounds.min.y, center.z);\n  axes.position.copy(center);\n  axes.scale.setScalar(clamp(radius\
+        \ / 250, 1, 10000));\n  cameraHasBeenFramed = true;\n  document.getElementById('sceneStatus').textContent = 'Framed\
+        \ all visible objects · ' + actors.filter(a=>a && !a.hidden && a.location).length + ' objects';\n}\n\nfunction setView(view){\n\
+        \  if(!worldBounds || worldBounds.isEmpty()){ fitAll(); return; }\n  const center = worldBounds.getCenter(new THREE.Vector3());\n\
+        \  const currentDistance = Math.max(150, camera.position.distanceTo(target));\n  let direction, up = new THREE.Vector3(0,1,0);\n\
+        \  if(view === 'top'){ direction = new THREE.Vector3(0,1,0); up.set(0,0,-1); }\n  else if(view === 'front') direction\
+        \ = new THREE.Vector3(0,0,1);\n  else if(view === 'side') direction = new THREE.Vector3(1,0,0);\n  else if(view ===\
+        \ 'back') direction = new THREE.Vector3(0,0,-1);\n  else direction = new THREE.Vector3(1,0.82,1).normalize();\n  target.copy(center);\n\
+        \  camera.up.copy(up);\n  camera.position.copy(center).add(direction.normalize().multiplyScalar(currentDistance));\n\
+        \  camera.lookAt(target);\n}\n\nfunction renderList(){\n  const filter = document.getElementById('sceneFilter').value;\n\
+        \  const rows = actors.filter(actor => filter === 'all' || actor.category === filter);\n  document.getElementById('actorList').innerHTML\
+        \ = rows.slice(0,500).map(actor => {\n    const p = actor.location;\n    const e = actor.bounds_extent;\n    const\
+        \ location = p ? `${numberOr(p.x).toFixed(1)}, ${numberOr(p.y).toFixed(1)}, ${numberOr(p.z).toFixed(1)}` : '—';\n\
+        \    const extent = e ? `${numberOr(e.x).toFixed(1)}, ${numberOr(e.y).toFixed(1)}, ${numberOr(e.z).toFixed(1)}` :\
+        \ '—';\n    return '<div class=\"actor-row\"><b>'+safe(actor.name)+'</b> <span class=\"actor-meta\">'+safe(actor.category)+'\
+        \ · '+safe(actor.class)+'</span><div class=\"actor-meta\">Location: '+location+' cm · Extent: '+extent+'</div></div>';\n\
+        \  }).join('') || 'No actors in this category.';\n  const categories = {};\n  for(const actor of actors) categories[actor.category]\
+        \ = (categories[actor.category] || 0) + 1;\n  document.getElementById('sceneCounts').innerHTML = Object.entries(categories).map(([name,count])=>'<span\
+        \ class=\"pill\">'+safe(name)+': '+count+'</span>').join('');\n}\n\nfunction safe(value){\n  return String(value ??\
+        \ '').replace(/[&<>\"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;',\"'\":'&#39;'}[c]));\n}\n\nlet activeSceneJob\
+        \ = '', scenePollBusy = false;\nfunction applyScenePayload(sceneData){\n  if(!sceneData || !Array.isArray(sceneData.actors))\
+        \ return false;\n  const stamp = Number(sceneData.updated_at || sceneData.updated || 0);\n  // Cached snapshots arrive\
+        \ every few seconds; do not rebuild the model or reset the camera\n  // when the underlying scene has not changed.\n\
+        \  if(!stamp || stamp !== lastSceneTimestamp){\n    renderActors(sceneData.actors);\n    if(stamp) lastSceneTimestamp\
+        \ = stamp;\n  }\n  document.getElementById('sceneStatus').textContent = (sceneData.level || 'Level') + ' · ' + (sceneData.count\
+        \ ?? sceneData.actors.length) + ' actors · updated ' + new Date((stamp || Date.now()/1000)*1000).toLocaleTimeString();\n\
+        \  return true;\n}\n\nasync function pollSceneJob(){\n  if(scenePollBusy || !activeSceneJob) return;\n  scenePollBusy\
+        \ = true;\n  try{\n    const response = await fetch('/api/scene/status?job_id='+encodeURIComponent(activeSceneJob),\
+        \ {cache:'no-store'});\n    const payload = await response.json();\n    if(!response.ok) throw new Error(payload.error\
+        \ || 'Scene job status unavailable');\n    const job = payload.job || {};\n    if(job.status === 'completed'){\n \
+        \     applyScenePayload(payload.scene || job.scene);\n      document.getElementById('sceneStatus').textContent = 'Scene\
+        \ scan complete · ' + (job.count ?? (payload.scene?.count || 0)) + ' actors';\n      activeSceneJob = '';\n    }else\
+        \ if(job.status === 'failed'){\n      document.getElementById('sceneStatus').textContent = 'Scene scan failed: ' +\
+        \ (job.error || 'unknown error');\n      activeSceneJob = '';\n    }else{\n      document.getElementById('sceneStatus').textContent\
+        \ = 'Scanning scene… ' + job.status;\n    }\n  }catch(error){\n    document.getElementById('sceneStatus').textContent\
+        \ = 'Scene status error: ' + error.message;\n  }finally{ scenePollBusy = false; }\n}\n\nasync function refreshSceneSnapshot(force=false){\n\
+        \  const status = document.getElementById('sceneStatus');\n  status.textContent = 'Requesting Unreal scene snapshot…';\n\
+        \  try{\n    const response = await fetch('/api/scene/snapshot?refresh=1'+(force?'&force=1':''), {cache:'no-store'});\n\
+        \    const payload = await response.json();\n    if(!response.ok || !payload.ok) throw new Error(payload.error ||\
+        \ 'Scene snapshot not ready');\n    if(payload.scene) applyScenePayload(payload.scene);\n    const request = payload.request\
+        \ || {}, job = payload.job || {};\n    activeSceneJob = request.job_id || job.job_id || '';\n    if(activeSceneJob){\
+        \ status.textContent = 'Scene scan ' + (request.status || job.status || 'queued') + '…'; pollSceneJob(); }\n    else\
+        \ if(payload.scene){ status.textContent = (payload.scene.level || 'Level') + ' · ' + (payload.scene.count ?? payload.scene.actors?.length\
+        \ ?? 0) + ' actors · cached'; }\n    else status.textContent = 'Waiting for scene scan…';\n  }catch(error){ status.textContent\
+        \ = 'Scene query failed: ' + error.message; }\n}\n\nfunction bindControls(){\n  document.getElementById('sceneFitAll').onclick\
+        \ = fitAll;\n  document.getElementById('sceneZoomIn').onclick = () => zoomCamera(0.78);\n  document.getElementById('sceneZoomOut').onclick\
+        \ = () => zoomCamera(1.28);\n  document.getElementById('sceneViewIso').onclick = () => setView('iso');\n  document.getElementById('sceneViewTop').onclick\
+        \ = () => setView('top');\n  document.getElementById('sceneViewFront').onclick = () => setView('front');\n  document.getElementById('sceneViewSide').onclick\
+        \ = () => setView('side');\n  document.getElementById('sceneViewBack').onclick = () => setView('back');\n  document.getElementById('sceneRefresh').onclick\
+        \ = () => refreshSceneSnapshot(true);\n  document.getElementById('sceneFilter').addEventListener('change', renderList);\n\
+        }\n\ntry{\n  THREE = await import('https://cdn.jsdelivr.net/npm/three@0.160.1/build/three.module.js');\n  init();\n\
+        \  bindControls();\n  window.refreshSceneSnapshot = () => refreshSceneSnapshot(true);\n  refreshSceneSnapshot();\n\
+        \  setInterval(() => { if(activeSceneJob) pollSceneJob(); else refreshSceneSnapshot(false); }, 3000);\n}catch(error){\n\
+        \  document.getElementById('sceneFallback').textContent = '3D viewer failed to load: ' + error.message + ' (check\
+        \ access to jsdelivr.net)';\n}\n</script></body></html>'''\n    response = app.response_class(page, mimetype=\"text/html\"\
+        )\n    response.headers[\"Cache-Control\"] = \"no-store\"\n    return response\n\n@app.get(\"/api/monitor/state\"\
+        )\n@monitor_auth\ndef monitor_state():\n    with MONITOR_LOCK:\n        needs_first_image = (not MONITOR_STATE.get(\"\
+        image_path\")\n                             and not MONITOR_STATE.get(\"capture_running\")\n                     \
+        \        and not MONITOR_STATE.get(\"capture_error\"))\n    if needs_first_image and bridge_connected():\n       \
+        \ request_monitor_capture()\n        _start_monitor_capture(force=False)\n    response = jsonify(monitor_state_payload())\n\
         \    response.headers[\"Cache-Control\"] = \"no-store\"\n    return response\n\n@app.get(\"/api/monitor/latest.jpg\"\
         )\n@monitor_auth\ndef monitor_latest_image():\n    with MONITOR_LOCK:\n        value = MONITOR_STATE.get(\"image_path\"\
         )\n    target = Path(value) if value else None\n    if not target or not target.is_file():\n        return jsonify(ok=False,\
