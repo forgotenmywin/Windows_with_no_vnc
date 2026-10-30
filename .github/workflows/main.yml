@@ -3,9 +3,9 @@ name: UE 5.8 Remote Control API
 on:
   workflow_dispatch:
 
-# Request all GITHUB_TOKEN permission scopes supported by this repository.
-# Repository/org policies still apply; this does not grant access to Actions secrets.
-permissions: write-all
+# Least-privilege permission needed to create releases and upload release assets.
+permissions:
+  contents: write
 
 jobs:
   ue-remote:
@@ -208,7 +208,8 @@ jobs:
           Set-Content -LiteralPath "$pythonDir\init_unreal.py" -Value $bridge -Encoding utf8
 
           $api = @'
-          import base64, binascii, contextlib, hashlib, json, os, queue, re, shutil, tempfile, threading, time, uuid
+          import base64, binascii, contextlib, hashlib, json, os, queue, re, secrets, shutil, tempfile, threading, time, uuid
+          from collections import deque
           from pathlib import Path
           from functools import wraps
           from flask import Flask, jsonify, request, send_file
@@ -220,6 +221,17 @@ jobs:
           LOG_DIR.mkdir(parents=True, exist_ok=True)
           LOG_FILE = LOG_DIR / "api.log"
           BRIDGE_TOKEN = os.environ.get("BRIDGE_TOKEN", "")
+          MONITOR_USERNAME = "viewer"
+          MONITOR_PASSWORD = os.environ.get("MONITOR_PASSWORD", "")
+          MONITOR_LOCK = threading.RLock()
+          MONITOR_EVENTS = deque(maxlen=100)
+          RELEASE_UPLOAD_LOCK = threading.Lock()
+          RELEASE_LAST_UPLOAD_TIME = 0.0
+          MONITOR_STATE = {
+              "public_base_url": "", "capture_requested": True, "capture_running": False,
+              "capture_again": False, "last_capture_request": 0.0, "capture_error": "",
+              "image_path": None, "image_version": 0, "last_tool_call": None
+          }
           jobs, waiting, lock = queue.Queue(), {}, threading.Lock()
           last_bridge_seen = 0.0
           UPLOAD_ROOT = (ROOT / "Uploads").resolve()
@@ -239,13 +251,98 @@ jobs:
                   pass
               print(line, flush=True)
 
-          # Public endpoints intentionally have no auth for this temporary test workflow.
-          # Do not expose the Quick Tunnel URL publicly or reuse it for sensitive data.
+          # Legacy no-op decorator retained for compatibility; exposed REST routes use monitor_auth.
           def public_auth(fn):
+              # Kept as a compatibility decorator for older route definitions.
               @wraps(fn)
               def wrapper(*args, **kwargs):
                   return fn(*args, **kwargs)
               return wrapper
+
+          def monitor_auth(fn):
+              @wraps(fn)
+              def wrapper(*args, **kwargs):
+                  auth = request.authorization
+                  valid = bool(MONITOR_PASSWORD and auth and auth.type == "basic"
+                               and auth.username == MONITOR_USERNAME
+                               and secrets.compare_digest(auth.password or "", MONITOR_PASSWORD))
+                  if not valid:
+                      if not MONITOR_PASSWORD:
+                          return jsonify(ok=False, error="monitor_password_not_configured"), 503
+                      response = app.response_class("Authentication required", status=401)
+                      response.headers["WWW-Authenticate"] = 'Basic realm="Unreal Live Monitor"'
+                      response.headers["Cache-Control"] = "no-store"
+                      return response
+                  return fn(*args, **kwargs)
+              return wrapper
+
+          def safe_monitor_value(value, key="", depth=0):
+              if depth > 5:
+                  return "[nested value omitted]"
+              if any(word in str(key).lower() for word in ("token", "secret", "password", "authorization", "credential", "base64", "private_key", "data")):
+                  return "[redacted]"
+              if isinstance(value, dict):
+                  return {str(k): safe_monitor_value(v, str(k), depth + 1) for k, v in list(value.items())[:25]}
+              if isinstance(value, (list, tuple)):
+                  return [safe_monitor_value(v, key, depth + 1) for v in list(value)[:20]]
+              if isinstance(value, str):
+                  text_value = value
+                  # Avoid exposing accidental credentials embedded in Python snippets or results.
+                  text_value = re.sub(r"(?i)(password|passwd|token|secret|api[_-]?key|authorization)(\s*[:=]\s*)(['\"])[^'\"]*\3", r"\1\2[redacted]", text_value)
+                  text_value = re.sub(r"(?i)(Bearer\s+)[A-Za-z0-9._~+/-]+=*", r"\1[redacted]", text_value)
+                  text_value = re.sub(r"(?i)([?&](?:token|secret|password|api_key)=)[^&\s]+", r"\1[redacted]", text_value)
+                  text_value = re.sub(r"\b(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,})\b", "[redacted]", text_value)
+                  return text_value if len(text_value) <= 2500 else text_value[:2500] + " …[truncated]"
+              if value is None or isinstance(value, (int, float, bool)):
+                  return value
+              return str(value)[:500]
+
+          def monitor_event_start(tool_name, arguments):
+              event = {
+                  "id": uuid.uuid4().hex[:12], "time": time.time(),
+                  "tool": str(tool_name or "unknown"),
+                  "arguments": safe_monitor_value(arguments or {}),
+                  "status": "running", "http_status": None, "duration_ms": None
+              }
+              with MONITOR_LOCK:
+                  MONITOR_EVENTS.appendleft(event)
+                  MONITOR_STATE["last_tool_call"] = event["time"]
+              log("MONITOR tool call started: " + event["tool"])
+              return event["id"]
+
+          def monitor_event_finish(event_id, http_status=None, error="", response_preview=""):
+              now = time.time()
+              with MONITOR_LOCK:
+                  for event in MONITOR_EVENTS:
+                      if event["id"] == event_id:
+                          event["status"] = "error" if error or (http_status and http_status >= 400) else "completed"
+                          event["http_status"] = http_status
+                          event["duration_ms"] = int((now - event["time"]) * 1000)
+                          if error:
+                              event["error"] = str(safe_monitor_value(str(error)))[:1000]
+                          if response_preview:
+                              event["result_preview"] = str(response_preview)[:4000]
+                          break
+              request_monitor_capture()
+
+          def monitor_response_preview(raw_bytes):
+              if not raw_bytes:
+                  return ""
+              raw_text = raw_bytes.decode("utf-8", errors="replace")
+              try:
+                  value = json.loads(raw_text)
+                  return json.dumps(safe_monitor_value(value), ensure_ascii=False, default=str)[:4000]
+              except Exception:
+                  return str(safe_monitor_value(raw_text))[:2000]
+
+          def request_monitor_capture():
+              # Coalesce activity into one pending snapshot. The HTTP route enforces
+              # the 30-second cooldown, so activity during the cooldown is not lost.
+              with MONITOR_LOCK:
+                  if MONITOR_STATE["capture_running"]:
+                      MONITOR_STATE["capture_again"] = True
+                  else:
+                      MONITOR_STATE["capture_requested"] = True
 
           def bridge_auth(fn):
               @wraps(fn)
@@ -352,7 +449,7 @@ jobs:
               base = "https://api.github.com/repos/" + repository
               session = requests.Session()
               session.headers.update({"Authorization": "Bearer " + token,
-                  "Accept": "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28"})
+                  "Accept": "application/vnd.github+json", "X-GitHub-Api-Version": "2026-03-10"})
               resp = session.get(base + "/releases/tags/" + quote(tag, safe=""), timeout=(10, 30))
               if resp.status_code == 404:
                   resp = session.post(base + "/releases", json={"tag_name": tag,
@@ -421,7 +518,7 @@ jobs:
                              engine_bridge_last_seen=(last_bridge_seen or None), time=time.time())
 
           @app.post("/command")
-          @public_auth
+          @monitor_auth
           def command():
               body = request.get_json(silent=True) or {}
               result, status = queue_unreal(body.get("code"), body.get("timeout", 60))
@@ -450,7 +547,7 @@ jobs:
               return jsonify(ok=True)
 
           @app.get("/projects")
-          @public_auth
+          @monitor_auth
           def projects():
               found = []
               for base in (ROOT / "Projects", ROOT / "UEControl"):
@@ -461,7 +558,7 @@ jobs:
               return jsonify(ok=True, count=len(found), projects=found)
 
           @app.post("/projects/rename")
-          @public_auth
+          @monitor_auth
           def rename_project():
               body = request.get_json(silent=True) or {}
               try: source = safe_path(body.get("project_file", ""))
@@ -481,7 +578,7 @@ jobs:
               except OSError as exc: return jsonify(ok=False, error=str(exc)), 500
 
           @app.post("/files/upload")
-          @public_auth
+          @monitor_auth
           def file_upload():
               if "file" not in request.files: return jsonify(ok=False, error="multipart field 'file' is required"), 400
               file = request.files["file"]
@@ -496,7 +593,7 @@ jobs:
               except (ValueError, OSError) as exc: return jsonify(ok=False, error=str(exc)), 400
 
           @app.get("/files/download")
-          @public_auth
+          @monitor_auth
           def file_download():
               try: target = safe_path(request.args.get("path", ""))
               except ValueError as exc: return jsonify(ok=False, error=str(exc)), 400
@@ -504,7 +601,7 @@ jobs:
               return send_file(target, as_attachment=True, download_name=target.name)
 
           @app.get("/files/read")
-          @public_auth
+          @monitor_auth
           def read_text_file():
               try: target = safe_path(request.args.get("path", ""))
               except ValueError as exc: return jsonify(ok=False, error=str(exc)), 400
@@ -514,7 +611,7 @@ jobs:
               except UnicodeDecodeError: return jsonify(ok=False, error="not a UTF-8 text file"), 415
 
           @app.put("/files/write")
-          @public_auth
+          @monitor_auth
           def write_text_file():
               body = request.get_json(silent=True) or {}
               content = body.get("content")
@@ -528,7 +625,7 @@ jobs:
               except (ValueError, OSError) as exc: return jsonify(ok=False, error=str(exc)), 400
 
           @app.post("/drive/list")
-          @public_auth
+          @monitor_auth
           def drive_list():
               body = request.get_json(silent=True) or {}
               folder_id = str(body.get("folder_id", "root"))
@@ -544,7 +641,7 @@ jobs:
                   return jsonify(ok=False, error=str(exc)), 502
 
           @app.post("/drive/download")
-          @public_auth
+          @monitor_auth
           def drive_download():
               body = request.get_json(silent=True) or {}
               file_id = str(body.get("file_id", "")).strip()
@@ -564,7 +661,7 @@ jobs:
                   return jsonify(ok=False, error=str(exc)), 502
 
           @app.post("/drive/upload")
-          @public_auth
+          @monitor_auth
           def drive_upload():
               body = request.get_json(silent=True) or {}
               try:
@@ -579,7 +676,7 @@ jobs:
                   return jsonify(ok=False, error=str(exc)), 502
 
           @app.post("/github/release/upload")
-          @public_auth
+          @monitor_auth
           def release_upload():
               body = request.get_json(silent=True) or {}
               try:
@@ -593,7 +690,7 @@ jobs:
                   return jsonify(ok=False, error=str(exc)), 502
 
           @app.post("/unreal/screenshot")
-          @public_auth
+          @monitor_auth
           def screenshot():
               out = ROOT / "Screenshots" / ("ue_" + time.strftime("%Y%m%d_%H%M%S") + ".png")
               out.parent.mkdir(parents=True, exist_ok=True)
@@ -609,13 +706,205 @@ jobs:
               return jsonify(ok=False, error="screenshot_file_not_created", expected_path=str(out)), 502
 
           @app.get("/logs")
-          @public_auth
+          @monitor_auth
           def logs():
               chunks = []
               for path in (LOG_FILE, LOG_DIR / "unreal_bridge.log", LOG_DIR / "unreal-stdout.log", LOG_DIR / "unreal-stderr.log", LOG_DIR / "cloudflared-stderr.log", ROOT / "UEControl" / "Saved" / "Logs" / "UnrealEditor.log"):
                   if path.is_file():
                       chunks.append("===== " + path.name + " =====\n" + path.read_text(encoding="utf-8", errors="replace")[-50000:])
               return app.response_class("\n\n".join(chunks) or "No logs yet.", mimetype="text/plain")
+
+          def monitor_public_url():
+              with MONITOR_LOCK:
+                  base = MONITOR_STATE.get("public_base_url", "").rstrip("/")
+              return base + "/monitor" if base else ""
+
+          def monitor_state_payload():
+              with MONITOR_LOCK:
+                  events = [dict(item) for item in list(MONITOR_EVENTS)[:20]]
+                  state = {
+                      "ok": True,
+                      "bridge_connected": bridge_connected(),
+                      "monitor_url": monitor_public_url(),
+                      "mcp_url": (MONITOR_STATE.get("public_base_url", "").rstrip("/") + "/mcp") if MONITOR_STATE.get("public_base_url") else "",
+                      "capture_requested": bool(MONITOR_STATE["capture_requested"]),
+                      "capture_running": bool(MONITOR_STATE["capture_running"]),
+                      "capture_error": MONITOR_STATE["capture_error"],
+                      "image_version": int(MONITOR_STATE["image_version"]),
+                      "has_image": bool(MONITOR_STATE["image_path"] and Path(MONITOR_STATE["image_path"]).is_file()),
+                      "events": events,
+                      "time": time.time()
+                  }
+              return state
+
+          def monitor_capture_worker():
+              png_path = ROOT / "Screenshots" / "monitor_capture.png"
+              jpg_path = ROOT / "Screenshots" / "monitor_latest.jpg"
+              try:
+                  png_path.parent.mkdir(parents=True, exist_ok=True)
+                  png_path.unlink(missing_ok=True)
+                  target = str(png_path).replace("\\", "/")
+                  capture_console = "HighResShot 640x360 filename=" + chr(34) + target + chr(34)
+                  code = (
+                      "import unreal\n"
+                      "world = unreal.get_editor_subsystem(unreal.UnrealEditorSubsystem).get_editor_world()\n"
+                      "unreal.SystemLibrary.execute_console_command(world, " + repr(capture_console) + ")\n"
+                      "print('MONITOR_CAPTURE_REQUESTED')"
+                  )
+                  result, status = queue_unreal(code, 35)
+                  if status != 200 or not result.get("ok"):
+                      raise RuntimeError("Unreal capture command failed: " + str(result))
+                  deadline = time.time() + 25
+                  while time.time() < deadline and (not png_path.is_file() or png_path.stat().st_size == 0):
+                      time.sleep(0.5)
+                  if not png_path.is_file() or png_path.stat().st_size == 0:
+                      raise RuntimeError("Unreal did not create the monitor screenshot")
+                  from PIL import Image
+                  with Image.open(png_path) as source:
+                      source.thumbnail((640, 360))
+                      source.convert("RGB").save(jpg_path, format="JPEG", quality=48, optimize=True)
+                  png_path.unlink(missing_ok=True)
+                  with MONITOR_LOCK:
+                      MONITOR_STATE["image_path"] = str(jpg_path)
+                      MONITOR_STATE["image_version"] += 1
+                      MONITOR_STATE["capture_error"] = ""
+                      MONITOR_STATE["capture_running"] = False
+                      MONITOR_STATE["capture_requested"] = bool(MONITOR_STATE["capture_again"])
+                      MONITOR_STATE["capture_again"] = False
+                  log("Monitor screenshot updated: %s bytes" % jpg_path.stat().st_size)
+              except Exception as exc:
+                  log("Monitor screenshot failed: " + repr(exc))
+                  with MONITOR_LOCK:
+                      MONITOR_STATE["capture_error"] = str(exc)[:1000]
+                      MONITOR_STATE["capture_running"] = False
+                      MONITOR_STATE["capture_requested"] = False
+                      MONITOR_STATE["capture_again"] = False
+
+          @app.get("/monitor")
+          @monitor_auth
+          def monitor_page():
+              page = r'''<!doctype html>
+          <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+          <title>Unreal Live Monitor</title><style>
+          :root{color-scheme:dark}*{box-sizing:border-box}body{margin:0;background:#101318;color:#e8edf5;font:14px/1.5 Segoe UI,Arial,sans-serif}
+          header{padding:18px 22px;border-bottom:1px solid #2b313b;display:flex;gap:12px;align-items:center;justify-content:space-between;flex-wrap:wrap}
+          h1{font-size:19px;margin:0}.muted{color:#9ca8b8}.pill{border:1px solid #3b4654;border-radius:99px;padding:4px 10px;font-size:12px}
+          main{max-width:1400px;margin:auto;padding:18px;display:grid;grid-template-columns:minmax(0,1.5fr) minmax(320px,1fr);gap:16px}
+          section{background:#171c24;border:1px solid #2b313b;border-radius:12px;padding:14px;min-width:0}h2{font-size:15px;margin:0 0 12px}
+          #shot{width:100%;min-height:180px;max-height:62vh;object-fit:contain;background:#0b0d11;border-radius:8px;display:block}
+          #empty{padding:65px 8px;text-align:center;color:#9ca8b8;background:#0b0d11;border-radius:8px}
+          #events{display:flex;flex-direction:column;gap:9px;max-height:70vh;overflow:auto}.event{border:1px solid #303946;border-radius:8px;padding:10px;background:#121720}
+          .eventtop{display:flex;justify-content:space-between;gap:8px;flex-wrap:wrap}.tool{font-weight:650;color:#dbeafe}.status{font-size:11px;border-radius:99px;padding:2px 7px;background:#283241}
+          pre{white-space:pre-wrap;overflow-wrap:anywhere;max-height:170px;overflow:auto;color:#b9c6d8;font-size:11px;margin:8px 0 0}
+          .row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}.green{color:#6ee7a0}.red{color:#ff9a9a}.small{font-size:12px}
+          .upload{margin-top:14px;padding-top:12px;border-top:1px solid #303946}.upload input{background:#0e131a;color:#e8edf5;border:1px solid #3b4654;border-radius:7px;padding:8px;max-width:150px}
+          button{background:#26364a;color:#eaf2ff;border:1px solid #52657d;padding:8px 12px;border-radius:7px;cursor:pointer}button:disabled{opacity:.5;cursor:wait}
+          @media(max-width:850px){main{grid-template-columns:1fr;padding:10px}}
+          </style></head><body>
+          <header><div><h1>Unreal Engine Live Monitor</h1><div class="muted small">Read-only view · no desktop streaming · low-frequency polling</div></div>
+          <div class="row"><span class="pill" id="bridge">Checking bridge…</span><span class="pill" id="clock">—</span></div></header>
+          <main><div><section><div class="row" style="justify-content:space-between;margin-bottom:10px"><h2>Latest Viewport Snapshot</h2><span class="muted small" id="shotInfo">Waiting for first capture</span></div>
+          <img id="shot" alt="Latest Unreal viewport screenshot" hidden><div id="empty">The first low-resolution snapshot will appear after the bridge is ready.</div>
+          <div class="muted small" style="margin-top:9px">640 × 360 maximum · JPEG quality 48 · captured only after tool activity, with a 30-second throttle.</div>
+          <div class="small red" id="captureError"></div></section>
+          <section style="margin-top:14px"><h2>GitHub Release Upload</h2><div class="muted small">Upload the latest monitor screenshot to the current repository's Release using GitHub REST API.</div>
+          <div class="upload row"><label>Release tag <input id="tag" value="ue5.8" maxlength="100"></label><label>Asset name <input id="assetName" value="" placeholder="auto timestamp" maxlength="120"></label>
+          <button id="uploadBtn">Save latest screenshot to Release</button></div><div id="uploadStatus" class="small muted" style="margin-top:8px"></div></section></div>
+          <section><div class="row" style="justify-content:space-between"><h2>Tool Activity</h2><span class="muted small">refresh every 5 sec</span></div><div id="events"><div class="muted">Waiting for MCP tool calls…</div></div></section></main>
+          <script>
+          const $=id=>document.getElementById(id);let imageVersion=-1,captureBusy=false;
+          function esc(s){return String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
+          async function update(){try{const r=await fetch('/api/monitor/state',{cache:'no-store'});if(!r.ok)throw new Error('HTTP '+r.status);const s=await r.json();
+          $('bridge').textContent=s.bridge_connected?'Bridge connected':'Bridge offline';$('bridge').className='pill '+(s.bridge_connected?'green':'red');$('clock').textContent=new Date(s.time*1000).toLocaleTimeString();
+          $('captureError').textContent=s.capture_error||'';$('shotInfo').textContent=s.capture_running?'Capturing…':(s.has_image?'Snapshot #'+s.image_version:'No snapshot yet');
+          if(s.has_image&&s.image_version!==imageVersion){$('shot').src='/api/monitor/latest.jpg?v='+s.image_version;$('shot').hidden=false;$('empty').hidden=true;imageVersion=s.image_version;}
+          if(s.capture_requested&&s.bridge_connected&&!captureBusy){captureBusy=true;fetch('/api/monitor/capture',{method:'POST'}).catch(()=>{}).finally(()=>{captureBusy=false;});}
+          const box=$('events');if(!s.events.length){box.innerHTML='<div class="muted">Waiting for MCP tool calls…</div>';}else{box.innerHTML=s.events.map(e=>`<article class="event"><div class="eventtop"><span class="tool">${esc(e.tool)}</span><span class="status">${esc(e.status)}${e.http_status?' · HTTP '+e.http_status:''}</span></div><div class="muted small">${new Date(e.time*1000).toLocaleString()}${e.duration_ms?' · '+e.duration_ms+' ms':''}</div><pre>${esc(JSON.stringify(e.arguments,null,2))}</pre>${e.result_preview?'<pre>Result: '+esc(e.result_preview)+'</pre>':''}${e.error?'<div class="red small">'+esc(e.error)+'</div>':''}</article>`).join('');}
+          }catch(e){$('bridge').textContent='Monitor API unavailable: '+e.message;$('bridge').className='pill red';}}
+          $('uploadBtn').addEventListener('click',async()=>{const b=$('uploadBtn');b.disabled=true;$('uploadStatus').textContent='Uploading via GitHub API…';try{const r=await fetch('/api/monitor/release-upload',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({tag:$('tag').value,filename:$('assetName').value,latest_screenshot:true})});const j=await r.json();if(!r.ok||!j.ok)throw new Error(j.error||'Upload failed');$('uploadStatus').innerHTML='Uploaded: <a target="_blank" rel="noreferrer" href="'+esc(j.assets?.[0]?.url||j.release_url)+'">open GitHub Release</a>'; }catch(e){$('uploadStatus').textContent='Upload failed: '+e.message;}finally{b.disabled=false;}});
+          update();setInterval(update,5000);
+          </script></body></html>'''
+              response = app.response_class(page, mimetype="text/html")
+              response.headers["Cache-Control"] = "no-store"
+              return response
+
+          @app.get("/api/monitor/state")
+          @monitor_auth
+          def monitor_state():
+              response = jsonify(monitor_state_payload())
+              response.headers["Cache-Control"] = "no-store"
+              return response
+
+          @app.get("/api/monitor/latest.jpg")
+          @monitor_auth
+          def monitor_latest_image():
+              with MONITOR_LOCK:
+                  value = MONITOR_STATE.get("image_path")
+              target = Path(value) if value else None
+              if not target or not target.is_file():
+                  return jsonify(ok=False, error="monitor_image_not_ready"), 404
+              response = send_file(target, mimetype="image/jpeg", conditional=False, max_age=0)
+              response.headers["Cache-Control"] = "no-store, max-age=0"
+              return response
+
+          @app.post("/api/monitor/capture")
+          @monitor_auth
+          def monitor_capture_request():
+              with MONITOR_LOCK:
+                  if MONITOR_STATE["capture_running"]:
+                      return jsonify(ok=True, status="already_running"), 202
+                  if not MONITOR_STATE["capture_requested"]:
+                      return jsonify(ok=True, status="not_requested"), 200
+                  now = time.time()
+                  cooldown_left = 30 - (now - MONITOR_STATE["last_capture_request"])
+                  if cooldown_left > 0:
+                      # Keep capture_requested=True; the dashboard retries on its next
+                      # low-frequency poll and captures once the cooldown has elapsed.
+                      return jsonify(ok=True, status="throttled", retry_after_seconds=int(cooldown_left) + 1), 202
+                  MONITOR_STATE["capture_requested"] = False
+                  MONITOR_STATE["capture_running"] = True
+                  MONITOR_STATE["last_capture_request"] = now
+              threading.Thread(target=monitor_capture_worker, name="UE-Monitor-Capture", daemon=True).start()
+              return jsonify(ok=True, status="capture_started"), 202
+
+          @app.post("/api/monitor/release-upload")
+          @monitor_auth
+          def monitor_release_upload():
+              body = request.get_json(silent=True) or {}
+              tag = str(body.get("tag") or "ue5.8").strip()
+              filename = str(body.get("filename") or "").strip()
+              with MONITOR_LOCK:
+                  screenshot = MONITOR_STATE.get("image_path")
+              source_value = screenshot if body.get("latest_screenshot", True) else body.get("source", "")
+              try:
+                  source = safe_path(source_value or "")
+                  allowed_roots = [UPLOAD_ROOT, (ROOT / "Screenshots").resolve()]
+                  if not any(root == source or root in source.parents for root in allowed_roots):
+                      return jsonify(ok=False, error="source_must_be_inside_Uploads_or_Screenshots"), 400
+                  if not source.is_file():
+                      return jsonify(ok=False, error="source_file_not_found", source=str(source)), 404
+                  if source.stat().st_size > 100 * 1024 * 1024:
+                      return jsonify(ok=False, error="Release uploads are limited to 100 MiB per file"), 413
+                  if not filename and source.suffix.lower() in (".jpg", ".jpeg"):
+                      filename = "UnrealViewport_" + time.strftime("%Y%m%d_%H%M%S") + ".jpg"
+                  result = github_release_upload(source, tag, filename)
+                  log("Monitor uploaded file to GitHub Release tag=%s file=%s" % (tag, filename or source.name))
+                  return jsonify(result)
+              except Exception as exc:
+                  log("Monitor GitHub Release upload failed: " + repr(exc))
+                  return jsonify(ok=False, error=str(exc)), 502
+
+          @app.post("/internal/set-public-url")
+          @bridge_auth
+          def internal_set_public_url():
+              body = request.get_json(silent=True) or {}
+              url = str(body.get("public_url") or "").rstrip("/")
+              if not re.fullmatch(r"https://[a-zA-Z0-9-]+\.trycloudflare\.com", url):
+                  return jsonify(ok=False, error="invalid_quick_tunnel_url"), 400
+              with MONITOR_LOCK:
+                  MONITOR_STATE["public_base_url"] = url
+              log("Public Quick Tunnel URL registered for monitor and MCP link tool")
+              return jsonify(ok=True, monitor_url=url + "/monitor", mcp_url=url + "/mcp")
 
           # MCP server (MCP Python SDK v2). Public MCP has no authentication in this test workflow.
           from contextlib import asynccontextmanager
@@ -993,8 +1282,68 @@ jobs:
               async with mcp_server.session_manager.run():
                   yield
 
+          def monitor_mcp_tools():
+              return [
+                  {
+                      "name": "unreal_monitor_get_url",
+                      "description": "Read-only: return the current browser URL for the password-protected Unreal Live Monitor dashboard.",
+                      "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False}
+                  },
+                  {
+                      "name": "unreal_monitor_get_state",
+                      "description": "Read-only: return current bridge status, latest snapshot version, and recent Unreal MCP tool activity.",
+                      "inputSchema": {"type": "object", "properties": {"limit": {"type": "integer", "minimum": 1, "maximum": 20, "default": 20}}, "additionalProperties": False}
+                  },
+                  {
+                      "name": "unreal_upload_binary_file",
+                      "description": "Upload a small file into D:\\UE58\\Uploads. Binary content must be Base64 and is limited to 8 MiB; use the resulting path with github_release_upload_file to publish it.",
+                      "inputSchema": {"type": "object", "properties": {
+                          "filename": {"type": "string", "description": "A simple filename without directory separators."},
+                          "content_base64": {"type": "string", "description": "Base64-encoded file bytes; maximum decoded size 8 MiB."},
+                          "destination_folder": {"type": "string", "default": "", "description": "Optional subfolder under Uploads."},
+                          "overwrite": {"type": "boolean", "default": False}
+                      }, "required": ["filename", "content_base64"], "additionalProperties": False}
+                  },
+                  {
+                      "name": "github_release_upload_file",
+                      "description": "Public side effect: upload one existing file from D:\\UE58\\Uploads or D:\\UE58\\Screenshots to the existing ue5.8 GitHub Release. The asset name is timestamped to avoid replacing existing assets. Requires confirm_public_upload=true because the asset becomes public.",
+                      "inputSchema": {"type": "object", "properties": {
+                          "source": {"type": "string", "description": "Path relative to D:\\UE58, limited to Uploads/ or Screenshots/."},
+                          "tag": {"type": "string", "enum": ["ue5.8"], "default": "ue5.8"},
+                          "confirm_public_upload": {"type": "boolean", "description": "Must be true to publish this file publicly in the GitHub Release."}
+                      }, "required": ["source", "confirm_public_upload"], "additionalProperties": False}
+                  },
+                  {
+                      "name": "unreal_monitor_publish_latest_screenshot",
+                      "description": "Public side effect: upload the most recent 640x360 monitor screenshot to the existing ue5.8 GitHub Release under a unique timestamped asset name. Requires confirm_public_upload=true because the screenshot becomes public.",
+                      "inputSchema": {"type": "object", "properties": {
+                          "tag": {"type": "string", "enum": ["ue5.8"], "default": "ue5.8"},
+                          "confirm_public_upload": {"type": "boolean", "description": "Must be true to publish the screenshot publicly."}
+                      }, "required": ["confirm_public_upload"], "additionalProperties": False}
+                  }
+              ]
+
+          def mcp_text_result(send, request_obj, value, is_error=False):
+              response_obj = {
+                  "jsonrpc": "2.0", "id": request_obj.get("id"),
+                  "result": {"content": [{"type": "text", "text": json.dumps(value, ensure_ascii=False, default=str)}], "isError": bool(is_error)}
+              }
+              return response_obj
+
+          async def send_mcp_json(send, obj, headers=None, status=200):
+              payload = json.dumps(obj, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+              out = [(b"content-type", b"application/json; charset=utf-8"),
+                     (b"content-length", str(len(payload)).encode("ascii")),
+                     (b"cache-control", b"no-store")]
+              for key, value in (headers or []):
+                  if key.lower() not in (b"content-type", b"content-length", b"transfer-encoding", b"connection"):
+                      out.append((key.lower(), value))
+              await send({"type": "http.response.start", "status": status, "headers": out})
+              await send({"type": "http.response.body", "body": payload, "more_body": False})
+
           async def native_mcp_proxy(scope, receive, send):
-              # Unauthenticated streaming reverse proxy to Epic's in-editor MCP server.
+              # One public MCP endpoint. Native Unreal tools are proxied unchanged;
+              # monitor-link/status and confirmed, path-restricted Release tools are added to tools/list.
               if scope.get("type") != "http":
                   return
               body = bytearray()
@@ -1005,17 +1354,9 @@ jobs:
                       return
                   body.extend(message.get("body", b""))
                   more = message.get("more_body", False)
-              # Starlette Mount may strip the mounted prefix from scope["path"].
-              # Always forward to Unreal's configured path exactly once; never
-              # append scope["path"] here (that caused /mcp/mcp/ in older runs).
               raw_path = scope.get("path", "/") or "/"
               query = scope.get("query_string", b"")
               target = "http://127.0.0.1:8000/mcp" + ("?" + query.decode("latin1") if query else "")
-              # Log protocol metadata only (never log request bodies or credentials).
-              log("MCP request: %s %s -> %s; accept=%s; content-type=%s" % (
-                  scope.get("method", "POST"), raw_path, target,
-                  next((v.decode("latin1") for k, v in scope.get("headers", []) if k.lower() == b"accept"), ""),
-                  next((v.decode("latin1") for k, v in scope.get("headers", []) if k.lower() == b"content-type"), "")))
               forwarded = {}
               hop_by_hop = {"connection", "keep-alive", "proxy-authenticate", "proxy-authorization", "te", "trailers", "transfer-encoding", "upgrade", "host", "origin", "authorization"}
               for key, value in scope.get("headers", []):
@@ -1024,8 +1365,155 @@ jobs:
                       forwarded[name] = value.decode("latin1")
               forwarded["host"] = "127.0.0.1:8000"
               forwarded["origin"] = "http://127.0.0.1:8000"
+              request_obj = None
+              try:
+                  if body:
+                      request_obj = json.loads(bytes(body).decode("utf-8"))
+              except Exception:
+                  request_obj = None
+              method = request_obj.get("method", "") if isinstance(request_obj, dict) else ""
+              params = request_obj.get("params", {}) if isinstance(request_obj, dict) else {}
+              local_response_headers = [(key.lower(), value) for key, value in scope.get("headers", [])
+                                        if key.lower() in (b"mcp-session-id", b"mcp-protocol-version")]
+
+              # Handle safe monitor tools locally so ChatGPT can obtain the browser link.
+              if method == "tools/call" and isinstance(params, dict) and params.get("name") in ("unreal_monitor_get_url", "unreal_monitor_get_state"):
+                  tool_name = params.get("name")
+                  args = params.get("arguments") or {}
+                  if tool_name == "unreal_monitor_get_url":
+                      result_value = {"monitor_url": monitor_public_url(), "username": MONITOR_USERNAME,
+                                      "authentication": "HTTP Basic; password is the repository Actions secret MONITOR_PASSWORD",
+                                      "mcp_url": (MONITOR_STATE.get("public_base_url", "").rstrip("/") + "/mcp") if MONITOR_STATE.get("public_base_url") else ""}
+                  else:
+                      result_value = monitor_state_payload()
+                      try:
+                          result_value["events"] = result_value["events"][:max(1, min(20, int(args.get("limit", 20))))]
+                      except Exception:
+                          result_value["events"] = result_value["events"][:20]
+                  response_obj = {"jsonrpc": "2.0", "id": request_obj.get("id"),
+                                  "result": {"content": [{"type": "text", "text": json.dumps(result_value, ensure_ascii=False, default=str)}]}}
+                  await send_mcp_json(send, response_obj, headers=local_response_headers)
+                  return
+
+              if method == "tools/call" and isinstance(params, dict) and params.get("name") == "unreal_upload_binary_file":
+                  args = params.get("arguments") or {}
+                  event_id = monitor_event_start("unreal_upload_binary_file", args)
+                  failed = False
+                  try:
+                      encoded = str(args.get("content_base64") or "")
+                      if len(encoded) > ((UPLOAD_SINGLE_FILE_LIMIT + 2) // 3) * 4 + 16:
+                          raise ValueError("Base64 content exceeds 8 MiB; use a smaller image/file")
+                      try:
+                          data = base64.b64decode(encoded, validate=True)
+                      except (binascii.Error, ValueError) as exc:
+                          raise ValueError("content_base64 is not valid Base64: " + str(exc))
+                      if len(data) > UPLOAD_SINGLE_FILE_LIMIT:
+                          raise ValueError("Direct upload limit is 8 MiB")
+                      target = upload_target(args.get("filename", ""), args.get("destination_folder", ""))
+                      value = store_uploaded_bytes(target, data, bool(args.get("overwrite", False)))
+                      monitor_event_finish(event_id, 200, response_preview=json.dumps(safe_monitor_value(value), ensure_ascii=False))
+                  except Exception as exc:
+                      failed = True
+                      value = {"ok": False, "error": str(exc)}
+                      monitor_event_finish(event_id, 400, str(exc), json.dumps(value, ensure_ascii=False))
+                  response_obj = mcp_text_result(send, request_obj, value, failed)
+                  await send_mcp_json(send, response_obj, headers=local_response_headers)
+                  return
+
+              # Release upload tools are intentionally narrow: current repository, one existing
+              # release tag, files under Uploads/Screenshots, timestamped names, size/rate limited.
+              if method == "tools/call" and isinstance(params, dict) and params.get("name") in ("github_release_upload_file", "unreal_monitor_publish_latest_screenshot"):
+                  global RELEASE_LAST_UPLOAD_TIME
+                  tool_name = params.get("name")
+                  args = params.get("arguments") or {}
+                  event_id = monitor_event_start(tool_name, args)
+                  value, failed = None, False
+                  try:
+                      if args.get("confirm_public_upload") is not True:
+                          raise ValueError("confirm_public_upload must be true; this makes the asset publicly downloadable")
+                      if not RELEASE_UPLOAD_LOCK.acquire(blocking=False):
+                          raise RuntimeError("another GitHub Release upload is already running")
+                      try:
+                          now = time.time()
+                          if now - RELEASE_LAST_UPLOAD_TIME < 60:
+                              raise RuntimeError("Release uploads are rate-limited to one per minute")
+                          RELEASE_LAST_UPLOAD_TIME = now
+                          if str(args.get("tag") or "ue5.8") != "ue5.8":
+                              raise ValueError("MCP uploads are restricted to the existing ue5.8 Release")
+                          if tool_name == "unreal_monitor_publish_latest_screenshot":
+                              with MONITOR_LOCK:
+                                  source_value = MONITOR_STATE.get("image_path")
+                              if not source_value:
+                                  raise FileNotFoundError("no monitor screenshot has been captured yet")
+                              source = safe_path(source_value)
+                              stem, suffix = "UnrealViewport", ".jpg"
+                          else:
+                              source = safe_path(args.get("source", ""))
+                              allowed_roots = [UPLOAD_ROOT, (ROOT / "Screenshots").resolve()]
+                              if not any(root == source or root in source.parents for root in allowed_roots):
+                                  raise ValueError("source must be inside D:\\UE58\\Uploads or D:\\UE58\\Screenshots")
+                              stem, suffix = source.stem, source.suffix
+                          if not source.is_file():
+                              raise FileNotFoundError("source file not found: " + str(source))
+                          if source.stat().st_size > 100 * 1024 * 1024:
+                              raise ValueError("MCP Release uploads are limited to 100 MiB per file")
+                          unique = time.strftime("%Y%m%d_%H%M%S") + "_" + uuid.uuid4().hex[:6]
+                          filename = stem[:80] + "_" + unique + suffix[:12]
+                          value = github_release_upload(source, "ue5.8", filename)
+                      finally:
+                          RELEASE_UPLOAD_LOCK.release()
+                      monitor_event_finish(event_id, 200, response_preview=json.dumps(safe_monitor_value(value), ensure_ascii=False))
+                  except Exception as exc:
+                      failed = True
+                      value = {"ok": False, "error": str(exc)}
+                      monitor_event_finish(event_id, 400, str(exc), json.dumps(value, ensure_ascii=False))
+                  response_obj = mcp_text_result(send, request_obj, value, failed)
+                  await send_mcp_json(send, response_obj, headers=local_response_headers)
+                  return
+
+              event_id = None
+              if method == "tools/call" and isinstance(params, dict):
+                  event_id = monitor_event_start(params.get("name", "unknown"), params.get("arguments", {}))
+
+              log("MCP request: %s %s -> %s; method=%s" % (
+                  scope.get("method", "POST"), raw_path, target, method or "non-JSON-RPC"))
               try:
                   async with httpx.AsyncClient(timeout=None, trust_env=False) as client:
+                      # tools/list is a short JSON-RPC response: merge monitor and guarded upload tools.
+                      if method == "tools/list" and scope.get("method", "POST").upper() == "POST":
+                          response = await client.post(target, headers=forwarded, content=bytes(body))
+                          raw = response.content
+                          parsed = None
+                          try:
+                              parsed = response.json()
+                          except Exception:
+                              # Some Streamable HTTP servers may encode the single JSON-RPC
+                              # message as an SSE data frame. Quick Tunnels do not support SSE
+                              # as a browser transport, but MCP negotiation may still use it.
+                              if "text/event-stream" in response.headers.get("content-type", ""):
+                                  for line in raw.splitlines():
+                                      if line.startswith(b"data:"):
+                                          try:
+                                              parsed = json.loads(line[5:].strip().decode("utf-8"))
+                                              break
+                                          except Exception:
+                                              pass
+                          if isinstance(parsed, dict) and isinstance(parsed.get("result"), dict) and isinstance(parsed["result"].get("tools"), list):
+                              existing = {item.get("name") for item in parsed["result"]["tools"] if isinstance(item, dict)}
+                              for item in monitor_mcp_tools():
+                                  if item["name"] not in existing:
+                                      parsed["result"]["tools"].append(item)
+                              raw = json.dumps(parsed, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+                              headers = [(k.lower(), v) for k, v in response.headers.raw
+                                         if k.decode("latin1").lower() not in hop_by_hop]
+                              await send_mcp_json(send, parsed, headers=headers, status=response.status_code)
+                              return
+                          out_headers = [(k.lower(), v) for k, v in response.headers.raw
+                                         if k.decode("latin1").lower() not in hop_by_hop]
+                          await send({"type": "http.response.start", "status": response.status_code, "headers": out_headers})
+                          await send({"type": "http.response.body", "body": raw, "more_body": False})
+                          return
+
                       async with client.stream(scope.get("method", "POST"), target, headers=forwarded, content=bytes(body)) as response:
                           session_id = response.headers.get("mcp-session-id", "")
                           log("MCP upstream response: status=%s; content-type=%s; protocol-version=%s; session-id-present=%s" % (
@@ -1034,18 +1522,27 @@ jobs:
                           out_headers = [(k.lower(), v) for k, v in response.headers.raw
                                          if k.decode("latin1").lower() not in hop_by_hop]
                           await send({"type": "http.response.start", "status": response.status_code, "headers": out_headers})
+                          response_preview_bytes = bytearray()
                           async for chunk in response.aiter_raw():
+                              if event_id and len(response_preview_bytes) < 12000:
+                                  response_preview_bytes.extend(chunk[:12000 - len(response_preview_bytes)])
                               await send({"type": "http.response.body", "body": chunk, "more_body": True})
                           await send({"type": "http.response.body", "body": b"", "more_body": False})
+                          if event_id:
+                              monitor_event_finish(event_id, response.status_code,
+                                                   response_preview=monitor_response_preview(bytes(response_preview_bytes)))
               except Exception as exc:
+                  if event_id:
+                      monitor_event_finish(event_id, 502, repr(exc))
                   log("Native MCP proxy error: " + repr(exc))
                   err = b'{"ok":false,"error":"native_mcp_proxy_failed"}'
                   await send({"type": "http.response.start", "status": 502,
                               "headers": [(b"content-type", b"application/json"), (b"content-length", str(len(err)).encode())]})
                   await send({"type": "http.response.body", "body": err})
 
-          # One public MCP endpoint only: /mcp/ proxies Unreal's native AllToolsets server.
-          # REST fallback endpoints remain available under the same tunnel host.
+          # One public MCP endpoint only: /mcp/ proxies Unreal's native AllToolsets server
+          # and adds monitor tools plus guarded Release upload tools to tools/list.
+          # REST fallback endpoints remain available under the same tunnel host and use Basic auth.
           combined_app = Starlette(routes=[
               Mount("/mcp", app=native_mcp_proxy),
               Mount("/", app=WSGIMiddleware(app))
@@ -1053,11 +1550,21 @@ jobs:
 
           if __name__ == "__main__":
               if not BRIDGE_TOKEN: raise RuntimeError("BRIDGE_TOKEN must be set")
-              log("Starting unauthenticated REST API on 127.0.0.1:8765; single MCP endpoint=/mcp -> native Unreal AllToolsets")
+              if not MONITOR_PASSWORD: raise RuntimeError("MONITOR_PASSWORD must be configured")
+              log("Starting REST API on 127.0.0.1:8765; monitor uses HTTP Basic; single MCP endpoint=/mcp -> native Unreal AllToolsets + monitor/file/Release tools")
               uvicorn.run(combined_app, host="127.0.0.1", port=8765, log_level="info")
           '@
           Set-Content -LiteralPath "$root\api_server.py" -Value $api -Encoding utf8
           Write-Host 'Created UE project, bridge, and API server.'
+
+      - name: Validate generated Python scripts
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $python = (Get-Command python).Source
+          & $python -m py_compile 'D:\UE58\api_server.py' 'D:\UE58\UEControl\Content\Python\init_unreal.py'
+          if ($LASTEXITCODE -ne 0) { throw 'Generated Python scripts failed syntax validation.' }
+          Write-Host 'PYTHON_SYNTAX_VALIDATION=true'
 
       - name: Launch API, Unreal and Cloudflare tunnel
         shell: pwsh
@@ -1065,10 +1572,14 @@ jobs:
           GG_UE_TOKEN: ${{ secrets.GG_UE_TOKEN }}
           GITHUB_TOKEN: ${{ github.token }}
           GITHUB_REPOSITORY: ${{ github.repository }}
+          MONITOR_PASSWORD: ${{ secrets.MONITOR_PASSWORD }}
         run: |
           $ErrorActionPreference = 'Stop'
           $root = 'D:\UE58'
           $env:UE_ROOT = $root
+          if ([string]::IsNullOrWhiteSpace($env:MONITOR_PASSWORD) -or $env:MONITOR_PASSWORD.Length -lt 16) {
+            throw 'Create repository Actions secret MONITOR_PASSWORD with a strong password of at least 16 characters before running this workflow.'
+          }
           if ([string]::IsNullOrWhiteSpace($env:GG_UE_TOKEN)) {
             Write-Warning 'GG_UE_TOKEN is empty; Google Drive endpoints will fail until authorized_user.json or service-account JSON is saved as this Actions secret.'
           }
@@ -1076,7 +1587,7 @@ jobs:
           # The bridge token is only for local API <-> Unreal communication.
           $env:BRIDGE_TOKEN = [guid]::NewGuid().ToString('N') + [guid]::NewGuid().ToString('N')
           $python = (Get-Command python).Source
-          & $python -m pip install --disable-pip-version-check --upgrade Flask google-api-python-client google-auth google-auth-httplib2 requests urllib3 httpx "mcp>=2,<3" uvicorn starlette
+          & $python -m pip install --disable-pip-version-check --upgrade Flask google-api-python-client google-auth google-auth-httplib2 requests urllib3 httpx Pillow "mcp>=2,<3" uvicorn starlette
           if ($LASTEXITCODE -ne 0) { throw 'Python package installation failed.' }
 
           $apiOut = "$root\Logs\api-stdout.log"
@@ -1105,6 +1616,7 @@ jobs:
           $env:GG_UE_TOKEN = $null
           $env:GITHUB_TOKEN = $null
           $env:GITHUB_REPOSITORY = $null
+          $env:MONITOR_PASSWORD = $null
 
           $editor = $env:UE_EDITOR_EXE
           if ([string]::IsNullOrWhiteSpace($editor) -or -not (Test-Path -LiteralPath $editor)) {
@@ -1144,7 +1656,6 @@ jobs:
             throw 'Cloudflare Quick Tunnel did not provide a public URL.'
           }
           Write-Host "PUBLIC_API_URL=$publicUrl"
-
           Write-Host 'Waiting up to 3 minutes for the Unreal Python bridge...'
           $bridgeReady = $false
           for ($i = 0; $i -lt 90; $i++) {
@@ -1180,19 +1691,38 @@ jobs:
             Start-Sleep -Seconds 2
           }
           if ($nativeMcpReady) {
-            Write-Host 'NATIVE_MCP_LISTENER_READY=true (GET /mcp returned expected HTTP 405).'
+            Write-Host 'NATIVE_MCP_LISTENER_READY=true (GET /mcp returned expected HTTP 405).' 
           } else {
             throw 'NATIVE_MCP_LISTENER_READY=false. Do not add the MCP URL in ChatGPT yet; inspect UEControl\Saved\Logs\UnrealEditor.log and unreal-stdout.log for LogModelContextProtocol errors.'
           }
 
-          Write-Host 'REST endpoints: GET /health, POST /command, GET /projects, POST /projects/rename, POST /files/upload, GET /files/download, GET /files/read, PUT /files/write, POST /drive/list, POST /drive/download, POST /drive/upload, POST /github/release/upload, POST /unreal/screenshot, GET /logs'
+          $internalHeaders = @{ Authorization = "Bearer $env:BRIDGE_TOKEN" }
+          $urlBody = @{ public_url = $publicUrl } | ConvertTo-Json -Compress
+          $urlRegistration = Invoke-RestMethod -Uri 'http://127.0.0.1:8765/internal/set-public-url' -Method Post -Headers $internalHeaders -ContentType 'application/json' -Body $urlBody -TimeoutSec 10
+          if (-not $urlRegistration.ok) { throw 'Could not register the public monitor URL with the API.' }
+          $monitorUrl = "$publicUrl/monitor"
+          Write-Host "MONITOR_URL=$monitorUrl"
+          Write-Host 'MONITOR_USERNAME=viewer'
+          Write-Host 'MONITOR_PASSWORD is stored only in the repository Actions secret MONITOR_PASSWORD.'
+          $summaryText = @"
+          ## Unreal Live Monitor
+          - [Open read-only monitor]($monitorUrl)
+          - MCP endpoint: $publicUrl/mcp
+          - Username: `viewer`
+          - Password: repository secret `MONITOR_PASSWORD`
+          - GitHub Release upload: available inside the authenticated monitor; default tag `ue5.8`.
+          "@
+          $summaryText | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+
+          Write-Host 'REST endpoints: GET /health; authenticated read-only monitor at GET /monitor; authenticated file, Drive, GitHub Release and project endpoints.'
           Write-Host "MCP_ENDPOINT=$publicUrl/mcp"
-          Write-Host 'Single MCP endpoint only: /mcp -> native Unreal AllToolsets. No second MCP URL.'
+          Write-Host 'Single MCP endpoint only: /mcp -> native Unreal AllToolsets plus monitor, binary-upload and guarded GitHub Release tools. No second MCP URL.'
           Write-Host 'Bridge startup: Content/Python/init_unreal.py auto-loads; Unreal is intentionally launched without -ExecutePythonScript so the Editor stays open.'
-          Write-Host 'Binary transfer: files are saved under D:\UE58\Uploads; use unreal_upload_binary_file for small files or begin/chunk/finish tools for larger files. Chunk size: 16 KiB; max file size: 2 GiB.'
-          Write-Host 'MCP tool list at /mcp is provided by Unreal native AllToolsets; REST fallback endpoints remain available on the same host.'
-          Write-Host 'No Authorization header is required for /mcp/ or the REST fallback endpoints.'
-          Write-Warning 'TEST MODE: endpoints are unauthenticated. Anyone who obtains the public Quick Tunnel URL may be able to issue Unreal commands or access exposed files/logs. Stop the workflow when finished.'
+          Write-Host 'Binary transfer: unreal_upload_binary_file accepts files up to 8 MiB per MCP call; place larger files under D:\UE58\Uploads through the authenticated API before publishing them.'
+          Write-Host 'Monitor uses 5-second JSON polling and 640x360 JPEG snapshots after MCP tool calls; no VNC, desktop stream, WebSocket, or SSE.'
+          Write-Host 'MCP tool list at /mcp includes Unreal native AllToolsets, monitor URL/state tools, direct uploads up to 8 MiB, and confirmed GitHub Release upload tools.'
+          Write-Host 'Monitor and REST endpoints require HTTP Basic: username viewer, password from MONITOR_PASSWORD secret. MCP /mcp remains unauthenticated for the ChatGPT MCP client.'
+          Write-Warning 'SECURITY: the monitor and REST endpoints are password-protected, but /mcp is intentionally unauthenticated for ChatGPT. Anyone who obtains the MCP URL may issue Unreal commands. Do not share the MCP URL; stop the workflow when finished.'
 
           $lastHeartbeat = Get-Date
           while ($true) {
