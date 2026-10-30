@@ -1005,10 +1005,12 @@ jobs:
                       return
                   body.extend(message.get("body", b""))
                   more = message.get("more_body", False)
+              # Starlette Mount may strip the mounted prefix from scope["path"].
+              # Always forward to Unreal's configured path exactly once; never
+              # append scope["path"] here (that caused /mcp/mcp/ in older runs).
               raw_path = scope.get("path", "/") or "/"
-              target_path = "/mcp" + ("" if raw_path == "/" else raw_path)
               query = scope.get("query_string", b"")
-              target = "http://127.0.0.1:8000" + target_path + ("?" + query.decode("latin1") if query else "")
+              target = "http://127.0.0.1:8000/mcp" + ("?" + query.decode("latin1") if query else "")
               # Log protocol metadata only (never log request bodies or credentials).
               log("MCP request: %s %s -> %s; accept=%s; content-type=%s" % (
                   scope.get("method", "POST"), raw_path, target,
@@ -1023,7 +1025,7 @@ jobs:
               forwarded["host"] = "127.0.0.1:8000"
               forwarded["origin"] = "http://127.0.0.1:8000"
               try:
-                  async with httpx.AsyncClient(timeout=None) as client:
+                  async with httpx.AsyncClient(timeout=None, trust_env=False) as client:
                       async with client.stream(scope.get("method", "POST"), target, headers=forwarded, content=bytes(body)) as response:
                           session_id = response.headers.get("mcp-session-id", "")
                           log("MCP upstream response: status=%s; content-type=%s; protocol-version=%s; session-id-present=%s" % (
@@ -1111,7 +1113,12 @@ jobs:
           Write-Host "Unreal Editor found: $editor"
           $ueOut = "$root\Logs\unreal-stdout.log"
           $ueErr = "$root\Logs\unreal-stderr.log"
-          $ueArgs = @("$root\UEControl\UEControl.uproject", '-log', '-stdout', '-FullStdOutLogOutput', '-AllowSoftwareRendering', '-d3d11', '-ModelContextProtocolStartServer', '-ModelContextProtocolPort=8000', "-ExecutePythonScript=$root\UEControl\Content\Python\init_unreal.py")
+          $initScript = "$root\UEControl\Content\Python\init_unreal.py"
+          if (-not (Test-Path -LiteralPath $initScript)) { throw "Unreal bridge startup script was not found: $initScript" }
+          # IMPORTANT: do NOT pass -ExecutePythonScript here. Epic documents that
+          # the Editor closes after a command-line ExecutePythonScript finishes.
+          # Content/Python/init_unreal.py is auto-detected and run by the Editor.
+          $ueArgs = @("$root\UEControl\UEControl.uproject", '-log', '-stdout', '-FullStdOutLogOutput', '-AllowSoftwareRendering', '-d3d11', '-ModelContextProtocolStartServer', '-ModelContextProtocolPort=8000')
           $ueProc = Start-Process -FilePath $editor -ArgumentList $ueArgs -WorkingDirectory "$root\UEControl" -PassThru -RedirectStandardOutput $ueOut -RedirectStandardError $ueErr
           Write-Host "UNREAL_PID=$($ueProc.Id)"
 
@@ -1148,7 +1155,12 @@ jobs:
             } catch { }
             if ($ueProc.HasExited) { Write-Warning 'Unreal Editor exited before the Python bridge connected.'; break }
           }
-          if ($bridgeReady) { Write-Host 'BRIDGE_READY=true' } else { Write-Warning 'BRIDGE_READY=false; inspect unreal-stdout.log, unreal-stderr.log and /logs.' }
+          if ($bridgeReady) {
+            Write-Host 'BRIDGE_READY=true'
+          } else {
+            if ($ueProc.HasExited) { throw "Unreal Editor exited before the Python bridge connected (exit code $($ueProc.ExitCode)). Inspect $ueOut and $ueErr." }
+            throw 'BRIDGE_READY=false after 3 minutes. The MCP URL will not be published because Unreal Python bridge is unavailable.'
+          }
 
           # Confirm Epic's native MCP listener is alive before publishing the endpoint.
           # Unreal documents GET /mcp returning HTTP 405 as a valid liveness response.
@@ -1170,12 +1182,13 @@ jobs:
           if ($nativeMcpReady) {
             Write-Host 'NATIVE_MCP_LISTENER_READY=true (GET /mcp returned expected HTTP 405).'
           } else {
-            Write-Warning 'NATIVE_MCP_LISTENER_READY=false; inspect UEControl\Saved\Logs\UnrealEditor.log and unreal-stdout.log for LogModelContextProtocol errors.'
+            throw 'NATIVE_MCP_LISTENER_READY=false. Do not add the MCP URL in ChatGPT yet; inspect UEControl\Saved\Logs\UnrealEditor.log and unreal-stdout.log for LogModelContextProtocol errors.'
           }
 
           Write-Host 'REST endpoints: GET /health, POST /command, GET /projects, POST /projects/rename, POST /files/upload, GET /files/download, GET /files/read, PUT /files/write, POST /drive/list, POST /drive/download, POST /drive/upload, POST /github/release/upload, POST /unreal/screenshot, GET /logs'
           Write-Host "MCP_ENDPOINT=$publicUrl/mcp"
-          Write-Host 'Single MCP endpoint only: /mcp -> native Unreal AllToolsets. No second MCP URL.' 
+          Write-Host 'Single MCP endpoint only: /mcp -> native Unreal AllToolsets. No second MCP URL.'
+          Write-Host 'Bridge startup: Content/Python/init_unreal.py auto-loads; Unreal is intentionally launched without -ExecutePythonScript so the Editor stays open.'
           Write-Host 'Binary transfer: files are saved under D:\UE58\Uploads; use unreal_upload_binary_file for small files or begin/chunk/finish tools for larger files. Chunk size: 16 KiB; max file size: 2 GiB.'
           Write-Host 'MCP tool list at /mcp is provided by Unreal native AllToolsets; REST fallback endpoints remain available on the same host.'
           Write-Host 'No Authorization header is required for /mcp/ or the REST fallback endpoints.'
