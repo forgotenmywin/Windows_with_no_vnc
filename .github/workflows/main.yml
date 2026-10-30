@@ -612,7 +612,7 @@ jobs:
           @public_auth
           def logs():
               chunks = []
-              for path in (LOG_FILE, LOG_DIR / "unreal_bridge.log", ROOT / "UEControl" / "Saved" / "Logs" / "UnrealEditor.log"):
+              for path in (LOG_FILE, LOG_DIR / "unreal_bridge.log", LOG_DIR / "unreal-stdout.log", LOG_DIR / "unreal-stderr.log", LOG_DIR / "cloudflared-stderr.log", ROOT / "UEControl" / "Saved" / "Logs" / "UnrealEditor.log"):
                   if path.is_file():
                       chunks.append("===== " + path.name + " =====\n" + path.read_text(encoding="utf-8", errors="replace")[-50000:])
               return app.response_class("\n\n".join(chunks) or "No logs yet.", mimetype="text/plain")
@@ -1009,6 +1009,11 @@ jobs:
               target_path = "/mcp" + ("" if raw_path == "/" else raw_path)
               query = scope.get("query_string", b"")
               target = "http://127.0.0.1:8000" + target_path + ("?" + query.decode("latin1") if query else "")
+              # Log protocol metadata only (never log request bodies or credentials).
+              log("MCP request: %s %s -> %s; accept=%s; content-type=%s" % (
+                  scope.get("method", "POST"), raw_path, target,
+                  next((v.decode("latin1") for k, v in scope.get("headers", []) if k.lower() == b"accept"), ""),
+                  next((v.decode("latin1") for k, v in scope.get("headers", []) if k.lower() == b"content-type"), "")))
               forwarded = {}
               hop_by_hop = {"connection", "keep-alive", "proxy-authenticate", "proxy-authorization", "te", "trailers", "transfer-encoding", "upgrade", "host", "origin", "authorization"}
               for key, value in scope.get("headers", []):
@@ -1020,6 +1025,10 @@ jobs:
               try:
                   async with httpx.AsyncClient(timeout=None) as client:
                       async with client.stream(scope.get("method", "POST"), target, headers=forwarded, content=bytes(body)) as response:
+                          session_id = response.headers.get("mcp-session-id", "")
+                          log("MCP upstream response: status=%s; content-type=%s; protocol-version=%s; session-id-present=%s" % (
+                              response.status_code, response.headers.get("content-type", ""),
+                              response.headers.get("mcp-protocol-version", ""), bool(session_id)))
                           out_headers = [(k.lower(), v) for k, v in response.headers.raw
                                          if k.decode("latin1").lower() not in hop_by_hop]
                           await send({"type": "http.response.start", "status": response.status_code, "headers": out_headers})
@@ -1042,7 +1051,7 @@ jobs:
 
           if __name__ == "__main__":
               if not BRIDGE_TOKEN: raise RuntimeError("BRIDGE_TOKEN must be set")
-              log("Starting unauthenticated REST API on 127.0.0.1:8765; single MCP endpoint=/mcp/ -> native Unreal AllToolsets")
+              log("Starting unauthenticated REST API on 127.0.0.1:8765; single MCP endpoint=/mcp -> native Unreal AllToolsets")
               uvicorn.run(combined_app, host="127.0.0.1", port=8765, log_level="info")
           '@
           Set-Content -LiteralPath "$root\api_server.py" -Value $api -Encoding utf8
@@ -1141,11 +1150,34 @@ jobs:
           }
           if ($bridgeReady) { Write-Host 'BRIDGE_READY=true' } else { Write-Warning 'BRIDGE_READY=false; inspect unreal-stdout.log, unreal-stderr.log and /logs.' }
 
+          # Confirm Epic's native MCP listener is alive before publishing the endpoint.
+          # Unreal documents GET /mcp returning HTTP 405 as a valid liveness response.
+          $nativeMcpReady = $false
+          for ($i = 0; $i -lt 45; $i++) {
+            try {
+              $probe = Invoke-WebRequest -Uri 'http://127.0.0.1:8000/mcp' -Method Get -TimeoutSec 4 -UseBasicParsing
+              if ([int]$probe.StatusCode -eq 405) { $nativeMcpReady = $true; break }
+              Write-Host ("Native MCP GET probe returned HTTP {0}" -f [int]$probe.StatusCode)
+            } catch {
+              $status = $null
+              try { $status = [int]$_.Exception.Response.StatusCode } catch { }
+              if ($status -eq 405) { $nativeMcpReady = $true; break }
+              if ($status) { Write-Host ("Native MCP GET probe returned HTTP {0}" -f $status) }
+            }
+            if ($ueProc.HasExited) { break }
+            Start-Sleep -Seconds 2
+          }
+          if ($nativeMcpReady) {
+            Write-Host 'NATIVE_MCP_LISTENER_READY=true (GET /mcp returned expected HTTP 405).'
+          } else {
+            Write-Warning 'NATIVE_MCP_LISTENER_READY=false; inspect UEControl\Saved\Logs\UnrealEditor.log and unreal-stdout.log for LogModelContextProtocol errors.'
+          }
+
           Write-Host 'REST endpoints: GET /health, POST /command, GET /projects, POST /projects/rename, POST /files/upload, GET /files/download, GET /files/read, PUT /files/write, POST /drive/list, POST /drive/download, POST /drive/upload, POST /github/release/upload, POST /unreal/screenshot, GET /logs'
-          Write-Host "MCP_ENDPOINT=$publicUrl/mcp/"
-          Write-Host 'Single MCP endpoint only: /mcp/ -> native Unreal AllToolsets. No second MCP URL.' 
+          Write-Host "MCP_ENDPOINT=$publicUrl/mcp"
+          Write-Host 'Single MCP endpoint only: /mcp -> native Unreal AllToolsets. No second MCP URL.' 
           Write-Host 'Binary transfer: files are saved under D:\UE58\Uploads; use unreal_upload_binary_file for small files or begin/chunk/finish tools for larger files. Chunk size: 16 KiB; max file size: 2 GiB.'
-          Write-Host 'MCP tool list at /mcp/ is provided by Unreal native AllToolsets; REST fallback endpoints remain available on the same host.'
+          Write-Host 'MCP tool list at /mcp is provided by Unreal native AllToolsets; REST fallback endpoints remain available on the same host.'
           Write-Host 'No Authorization header is required for /mcp/ or the REST fallback endpoints.'
           Write-Warning 'TEST MODE: endpoints are unauthenticated. Anyone who obtains the public Quick Tunnel URL may be able to issue Unreal commands or access exposed files/logs. Stop the workflow when finished.'
 
