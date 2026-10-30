@@ -19,6 +19,7 @@ jobs:
           $ErrorActionPreference = 'Stop'
           $root = 'D:\UE58'
           New-Item -ItemType Directory -Force -Path $root, "$root\parts", "$root\Logs", "$root\Projects", "$root\Screenshots", "$root\Uploads" | Out-Null
+          try { Start-Transcript -Path "$root\Logs\workflow-prepare-transcript.log" -Append -Force | Out-Null } catch { }
           $drive = Get-PSDrive D -ErrorAction SilentlyContinue
           if (-not $drive) { throw 'Drive D is not available on this runner.' }
           Write-Host ("D: available space: {0:N2} GB" -f ($drive.Free / 1GB))
@@ -31,6 +32,7 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           $root = 'D:\UE58'
+          try { Start-Transcript -Path "$root\Logs\workflow-extract-transcript.log" -Append -Force | Out-Null } catch { }
           $partsDir = "$root\parts"
           $archive = "$root\UE_5.8.zip"
           $extract = "$root\Extracted"
@@ -93,6 +95,7 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           $root = 'D:\UE58'
+          try { Start-Transcript -Path "$root\Logs\workflow-setup-transcript.log" -Append -Force | Out-Null } catch { }
           $project = "$root\UEControl"
           $pythonDir = "$project\Content\Python"
           $config = "$project\Config"
@@ -225,6 +228,10 @@ jobs:
           MONITOR_PASSWORD = os.environ.get("MONITOR_PASSWORD", "")
           MONITOR_LOCK = threading.RLock()
           MONITOR_EVENTS = deque(maxlen=100)
+          MCP_CONNECTION = {
+              "request_count": 0, "last_seen": 0.0, "last_method": "",
+              "last_path": "", "last_status": None, "last_error": ""
+          }
           RELEASE_UPLOAD_LOCK = threading.Lock()
           RELEASE_LAST_UPLOAD_TIME = 0.0
           MONITOR_STATE = {
@@ -250,6 +257,19 @@ jobs:
               except Exception:
                   pass
               print(line, flush=True)
+
+          @app.before_request
+          def _request_log_started():
+              request.environ["ue_remote_request_started"] = time.monotonic()
+
+          @app.after_request
+          def _request_log_finished(response):
+              # Do not fill the logs with the dashboard's 5-second polling traffic.
+              if request.path not in ("/api/monitor/state", "/api/monitor/logs", "/api/monitor/latest.jpg"):
+                  started = request.environ.get("ue_remote_request_started", time.monotonic())
+                  elapsed_ms = (time.monotonic() - started) * 1000.0
+                  log("HTTP %s %s -> %s (%.1f ms)" % (request.method, request.path, response.status_code, elapsed_ms))
+              return response
 
           # Legacy no-op decorator retained for compatibility; exposed REST routes use monitor_auth.
           def public_auth(fn):
@@ -705,14 +725,129 @@ jobs:
                   time.sleep(1)
               return jsonify(ok=False, error="screenshot_file_not_created", expected_path=str(out)), 502
 
+          def _available_log_sources():
+              sources = {
+                  "api": LOG_FILE,
+                  "api-stdout": LOG_DIR / "api-stdout.log",
+                  "api-stderr": LOG_DIR / "api-stderr.log",
+                  "bridge": LOG_DIR / "unreal_bridge.log",
+                  "unreal-stdout": LOG_DIR / "unreal-stdout.log",
+                  "unreal-stderr": LOG_DIR / "unreal-stderr.log",
+                  "cloudflared-stdout": LOG_DIR / "cloudflared-stdout.log",
+                  "cloudflared-stderr": LOG_DIR / "cloudflared-stderr.log",
+                  "workflow-prepare": LOG_DIR / "workflow-prepare-transcript.log",
+                  "workflow-extract": LOG_DIR / "workflow-extract-transcript.log",
+                  "workflow-setup": LOG_DIR / "workflow-setup-transcript.log",
+                  "workflow-validation": LOG_DIR / "workflow-validation-transcript.log",
+                  "workflow-runtime": LOG_DIR / "workflow-runtime-transcript.log",
+              }
+              unreal_log_dir = ROOT / "UEControl" / "Saved" / "Logs"
+              if unreal_log_dir.is_dir():
+                  for path in sorted(unreal_log_dir.glob("*.log")):
+                      sources["unreal-saved:" + path.name] = path
+              return sources
+
+          def _redact_log_line(value):
+              value = str(value)
+              value = re.sub(r"(?i)\b(MONITOR_PASSWORD|GITHUB_TOKEN|GG_UE_TOKEN|BRIDGE_TOKEN|API_TOKEN)\s*[:=]\s*([^\s,;]+)", r"\1=[redacted]", value)
+              value = re.sub(r"(?i)(authorization\s*[:=]\s*['\"]?(?:bearer|basic)\s+)[^'\"\s,;]+", r"\1[redacted]", value)
+              value = re.sub(r"(?i)(Bearer\s+)[A-Za-z0-9._~+/-]+=*", r"\1[redacted]", value)
+              value = re.sub(r"\b(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,})\b", "[redacted GitHub token]", value)
+              return value
+
+          def _read_log_tail(path, max_bytes=180000):
+              try:
+                  with path.open("rb") as handle:
+                      handle.seek(0, os.SEEK_END)
+                      size = handle.tell()
+                      handle.seek(max(0, size - max_bytes), os.SEEK_SET)
+                      data = handle.read()
+                  text_value = data.decode("utf-8", errors="replace")
+                  if size > max_bytes and "\n" in text_value:
+                      text_value = text_value.split("\n", 1)[1]
+                  return text_value.splitlines(), path.stat().st_mtime
+              except (OSError, PermissionError):
+                  return [], 0.0
+
+          def _log_line_epoch(line, fallback):
+              match = re.match(r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})", line)
+              if match:
+                  try:
+                      return time.mktime(time.strptime(match.group(1), "%Y-%m-%d %H:%M:%S"))
+                  except ValueError:
+                      pass
+              match = re.match(r"^(\d{4}\.\d{2}\.\d{2}-\d{2}\.\d{2}\.\d{2})", line)
+              if match:
+                  try:
+                      return time.mktime(time.strptime(match.group(1), "%Y.%m.%d-%H.%M.%S"))
+                  except ValueError:
+                      pass
+              return fallback
+
+          def _collect_logs(source_filter="all", query="", level_filter="all", limit=500):
+              entries = []
+              sources = _available_log_sources()
+              needle = str(query or "").strip().lower()
+              for source_name, path in sources.items():
+                  if source_filter not in ("", "all") and source_name != source_filter:
+                      continue
+                  if not path.is_file():
+                      continue
+                  lines, fallback_time = _read_log_tail(path)
+                  for line_number, raw_line in enumerate(lines):
+                      message = _redact_log_line(raw_line)
+                      lower = message.lower()
+                      if needle and needle not in lower and needle not in source_name.lower():
+                          continue
+                      if any(word in lower for word in ("error", "exception", "traceback", "fatal", "failed", "failure")):
+                          level = "ERROR"
+                      elif "warning" in lower or " warn" in lower:
+                          level = "WARN"
+                      elif "debug" in lower:
+                          level = "DEBUG"
+                      else:
+                          level = "INFO"
+                      if level_filter not in ("", "all") and level.lower() != level_filter.lower():
+                          continue
+                      epoch = _log_line_epoch(message, fallback_time)
+                      entries.append({
+                          "time": epoch,
+                          "timestamp": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(epoch)) if epoch else "time unknown",
+                          "source": source_name,
+                          "level": level,
+                          "message": message[:6000],
+                          "line": line_number + 1
+                      })
+              entries.sort(key=lambda item: item["time"])
+              return entries[-limit:], sorted(sources.keys())
+
+          @app.get("/api/monitor/logs")
+          @monitor_auth
+          def monitor_logs_api():
+              try:
+                  limit = max(50, min(2000, int(request.args.get("limit", 500))))
+              except (TypeError, ValueError):
+                  limit = 500
+              entries, source_names = _collect_logs(
+                  request.args.get("source", "all"),
+                  request.args.get("q", ""),
+                  request.args.get("level", "all"), limit
+              )
+              with MONITOR_LOCK:
+                  connection = dict(MCP_CONNECTION)
+                  connection["bridge_connected"] = bridge_connected()
+                  connection["monitor_url"] = monitor_public_url()
+                  connection["mcp_url"] = (MONITOR_STATE.get("public_base_url", "").rstrip("/") + "/mcp") if MONITOR_STATE.get("public_base_url") else ""
+              response = jsonify(ok=True, count=len(entries), entries=entries, sources=source_names, connection=connection, generated_at=time.time())
+              response.headers["Cache-Control"] = "no-store"
+              return response
+
           @app.get("/logs")
           @monitor_auth
           def logs():
-              chunks = []
-              for path in (LOG_FILE, LOG_DIR / "unreal_bridge.log", LOG_DIR / "unreal-stdout.log", LOG_DIR / "unreal-stderr.log", LOG_DIR / "cloudflared-stderr.log", ROOT / "UEControl" / "Saved" / "Logs" / "UnrealEditor.log"):
-                  if path.is_file():
-                      chunks.append("===== " + path.name + " =====\n" + path.read_text(encoding="utf-8", errors="replace")[-50000:])
-              return app.response_class("\n\n".join(chunks) or "No logs yet.", mimetype="text/plain")
+              entries, _ = _collect_logs(limit=2000)
+              body = "\n".join("[%s] [%s] [%s] %s" % (entry["timestamp"], entry["source"], entry["level"], entry["message"]) for entry in entries)
+              return app.response_class(body or "No logs yet.", mimetype="text/plain")
 
           def monitor_public_url():
               with MONITOR_LOCK:
@@ -727,6 +862,7 @@ jobs:
                       "bridge_connected": bridge_connected(),
                       "monitor_url": monitor_public_url(),
                       "mcp_url": (MONITOR_STATE.get("public_base_url", "").rstrip("/") + "/mcp") if MONITOR_STATE.get("public_base_url") else "",
+                      "mcp_connection": dict(MCP_CONNECTION),
                       "capture_requested": bool(MONITOR_STATE["capture_requested"]),
                       "capture_running": bool(MONITOR_STATE["capture_running"]),
                       "capture_error": MONITOR_STATE["capture_error"],
@@ -799,7 +935,11 @@ jobs:
           .row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}.green{color:#6ee7a0}.red{color:#ff9a9a}.small{font-size:12px}
           .upload{margin-top:14px;padding-top:12px;border-top:1px solid #303946}.upload input{background:#0e131a;color:#e8edf5;border:1px solid #3b4654;border-radius:7px;padding:8px;max-width:150px}
           button{background:#26364a;color:#eaf2ff;border:1px solid #52657d;padding:8px 12px;border-radius:7px;cursor:pointer}button:disabled{opacity:.5;cursor:wait}
-          @media(max-width:850px){main{grid-template-columns:1fr;padding:10px}}
+          input,select{background:#0e131a;color:#e8edf5;border:1px solid #3b4654;border-radius:7px;padding:8px;max-width:100%}
+          .log-controls{display:flex;gap:9px;align-items:center;flex-wrap:wrap;margin:10px 0}.diag{display:flex;gap:8px;flex-wrap:wrap;margin:10px 0}
+          .diag .pill{background:#101720}.log-output{white-space:pre-wrap;overflow:auto;overflow-wrap:anywhere;max-height:65vh;min-height:300px;padding:12px;background:#090d12;border:1px solid #303946;border-radius:8px;color:#cbd5e1;font:12px/1.55 Consolas,monospace}
+          .log-error{color:#ff9292}.log-warn{color:#f5c66b}.log-debug{color:#9ca8b8}.log-info{color:#bcd0e8}
+          @media(max-width:850px){main{grid-template-columns:1fr;padding:10px}#logsPanel{grid-column:1!important}}
           </style></head><body>
           <header><div><h1>Unreal Engine Live Monitor</h1><div class="muted small">Read-only view · no desktop streaming · low-frequency polling</div></div>
           <div class="row"><span class="pill" id="bridge">Checking bridge…</span><span class="pill" id="clock">—</span></div></header>
@@ -810,19 +950,41 @@ jobs:
           <section style="margin-top:14px"><h2>GitHub Release Upload</h2><div class="muted small">Upload the latest monitor screenshot to the current repository's Release using GitHub REST API.</div>
           <div class="upload row"><label>Release tag <input id="tag" value="ue5.8" maxlength="100"></label><label>Asset name <input id="assetName" value="" placeholder="auto timestamp" maxlength="120"></label>
           <button id="uploadBtn">Save latest screenshot to Release</button></div><div id="uploadStatus" class="small muted" style="margin-top:8px"></div></section></div>
-          <section><div class="row" style="justify-content:space-between"><h2>Tool Activity</h2><span class="muted small">refresh every 5 sec</span></div><div id="events"><div class="muted">Waiting for MCP tool calls…</div></div></section></main>
+          <section><div class="row" style="justify-content:space-between"><h2>Tool Activity</h2><span class="muted small">refresh every 5 sec</span></div><div id="events"><div class="muted">Waiting for MCP tool calls…</div></div></section>
+          <section id="logsPanel" style="grid-column:1/-1"><div class="row" style="justify-content:space-between"><h2>Logs & Connection Diagnostics</h2><span class="muted small" id="logSummary">Loading system logs…</span></div>
+          <div class="diag"><span class="pill" id="apiDiag">API: checking</span><span class="pill" id="bridgeDiag">Bridge: checking</span><span class="pill" id="mcpDiag">MCP: waiting for client</span><span class="pill" id="tunnelDiag">Tunnel: URL pending</span></div>
+          <div class="small muted" id="mcpAddress" style="overflow-wrap:anywhere">MCP endpoint: not registered</div>
+          <div class="log-controls"><label>Source <select id="logSource"><option value="all">All components</option></select></label>
+          <label>Level <select id="logLevel"><option value="all">All levels</option><option value="ERROR">Errors</option><option value="WARN">Warnings</option><option value="INFO">Info</option><option value="DEBUG">Debug</option></select></label>
+          <label>Search <input id="logSearch" type="search" placeholder="Search connection, error, tool…" style="min-width:220px"></label>
+          <button id="refreshLogs">Refresh logs</button><label class="small"><input id="autoLogs" type="checkbox" checked> Auto-refresh</label></div>
+          <pre id="logOutput" class="log-output">Waiting for API, Unreal, Bridge, MCP and Cloudflare logs…</pre></section></main>
           <script>
-          const $=id=>document.getElementById(id);let imageVersion=-1,captureBusy=false;
+          const $=id=>document.getElementById(id);let imageVersion=-1,captureBusy=false,logsBusy=false,lastLogText='';
           function esc(s){return String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
           async function update(){try{const r=await fetch('/api/monitor/state',{cache:'no-store'});if(!r.ok)throw new Error('HTTP '+r.status);const s=await r.json();
           $('bridge').textContent=s.bridge_connected?'Bridge connected':'Bridge offline';$('bridge').className='pill '+(s.bridge_connected?'green':'red');$('clock').textContent=new Date(s.time*1000).toLocaleTimeString();
+          $('bridgeDiag').textContent=s.bridge_connected?'Bridge: connected':'Bridge: offline';$('bridgeDiag').className='pill '+(s.bridge_connected?'green':'red');
+          $('apiDiag').textContent='API: responding';$('apiDiag').className='pill green';$('mcpAddress').textContent='MCP endpoint: '+(s.mcp_url||'not registered');
+          const mc=s.mcp_connection||{};$('mcpDiag').textContent=mc.request_count?('MCP: '+mc.request_count+' requests · last '+(mc.last_method||'request')+' · HTTP '+(mc.last_status??'pending')):'MCP: no client request received';$('mcpDiag').className='pill '+(mc.request_count?'green':'muted');
+          $('tunnelDiag').textContent=s.mcp_url?'Tunnel: public URL registered':'Tunnel: URL pending';$('tunnelDiag').className='pill '+(s.mcp_url?'green':'red');
           $('captureError').textContent=s.capture_error||'';$('shotInfo').textContent=s.capture_running?'Capturing…':(s.has_image?'Snapshot #'+s.image_version:'No snapshot yet');
           if(s.has_image&&s.image_version!==imageVersion){$('shot').src='/api/monitor/latest.jpg?v='+s.image_version;$('shot').hidden=false;$('empty').hidden=true;imageVersion=s.image_version;}
           if(s.capture_requested&&s.bridge_connected&&!captureBusy){captureBusy=true;fetch('/api/monitor/capture',{method:'POST'}).catch(()=>{}).finally(()=>{captureBusy=false;});}
           const box=$('events');if(!s.events.length){box.innerHTML='<div class="muted">Waiting for MCP tool calls…</div>';}else{box.innerHTML=s.events.map(e=>`<article class="event"><div class="eventtop"><span class="tool">${esc(e.tool)}</span><span class="status">${esc(e.status)}${e.http_status?' · HTTP '+e.http_status:''}</span></div><div class="muted small">${new Date(e.time*1000).toLocaleString()}${e.duration_ms?' · '+e.duration_ms+' ms':''}</div><pre>${esc(JSON.stringify(e.arguments,null,2))}</pre>${e.result_preview?'<pre>Result: '+esc(e.result_preview)+'</pre>':''}${e.error?'<div class="red small">'+esc(e.error)+'</div>':''}</article>`).join('');}
           }catch(e){$('bridge').textContent='Monitor API unavailable: '+e.message;$('bridge').className='pill red';}}
+          async function updateLogs(){if(logsBusy)return;logsBusy=true;try{const params=new URLSearchParams({source:$('logSource').value,level:$('logLevel').value,q:$('logSearch').value,limit:'700'});const r=await fetch('/api/monitor/logs?'+params.toString(),{cache:'no-store'});if(!r.ok)throw new Error('HTTP '+r.status);const data=await r.json();
+          const select=$('logSource');if(select.options.length===1){for(const source of data.sources){const option=document.createElement('option');option.value=source;option.textContent=source;select.appendChild(option);}}
+          const c=data.connection||{};$('apiDiag').textContent='API: responding';$('apiDiag').className='pill green';$('bridgeDiag').textContent=c.bridge_connected?'Bridge: connected':'Bridge: offline';$('bridgeDiag').className='pill '+(c.bridge_connected?'green':'red');
+          $('mcpDiag').textContent=c.request_count?('MCP: '+c.request_count+' requests · '+(c.last_method||'')+' · HTTP '+(c.last_status??'pending')):'MCP: no request has reached this server';$('mcpDiag').className='pill '+(c.request_count?'green':'muted');
+          $('tunnelDiag').textContent=c.mcp_url?'Tunnel URL registered':'Tunnel URL unavailable';$('tunnelDiag').className='pill '+(c.mcp_url?'green':'red');$('mcpAddress').textContent='MCP endpoint: '+(c.mcp_url||'not registered')+(c.last_seen?' · last request '+new Date(c.last_seen*1000).toLocaleString():'');
+          $('logSummary').textContent=data.count+' log lines · updated '+new Date(data.generated_at*1000).toLocaleTimeString();
+          const output=data.entries.map(e=>{const cls=e.level==='ERROR'?'log-error':e.level==='WARN'?'log-warn':e.level==='DEBUG'?'log-debug':'log-info';return '<span class="'+cls+'">'+esc(e.timestamp)+' ['+esc(e.source)+'] ['+esc(e.level)+'] '+esc(e.message)+'</span>';}).join('\n');
+          if(output!==lastLogText){const box=$('logOutput');const shouldScroll=box.scrollTop+box.clientHeight>=box.scrollHeight-45;box.innerHTML=output||'No matching log entries.';lastLogText=output;if(shouldScroll)box.scrollTop=box.scrollHeight;}
+          }catch(e){$('logSummary').textContent='Could not load logs: '+e.message;$('logOutput').textContent='Log API error: '+e.message+'\nCheck the API process and /api/monitor/logs endpoint.';}finally{logsBusy=false;}}
+          $('refreshLogs').addEventListener('click',updateLogs);$('logSource').addEventListener('change',updateLogs);$('logLevel').addEventListener('change',updateLogs);$('logSearch').addEventListener('keydown',e=>{if(e.key==='Enter')updateLogs();});
           $('uploadBtn').addEventListener('click',async()=>{const b=$('uploadBtn');b.disabled=true;$('uploadStatus').textContent='Uploading via GitHub API…';try{const r=await fetch('/api/monitor/release-upload',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({tag:$('tag').value,filename:$('assetName').value,latest_screenshot:true})});const j=await r.json();if(!r.ok||!j.ok)throw new Error(j.error||'Upload failed');$('uploadStatus').innerHTML='Uploaded: <a target="_blank" rel="noreferrer" href="'+esc(j.assets?.[0]?.url||j.release_url)+'">open GitHub Release</a>'; }catch(e){$('uploadStatus').textContent='Upload failed: '+e.message;}finally{b.disabled=false;}});
-          update();setInterval(update,5000);
+          update();updateLogs();setInterval(update,5000);setInterval(()=>{if($('autoLogs').checked)updateLogs();},8000);
           </script></body></html>'''
               response = app.response_class(page, mimetype="text/html")
               response.headers["Cache-Control"] = "no-store"
@@ -1330,13 +1492,42 @@ jobs:
               }
               return response_obj
 
+          def parse_sse_json_messages(raw_bytes):
+              """Decode JSON-RPC messages carried in an upstream SSE response."""
+              decoded = raw_bytes.decode("utf-8", errors="replace")
+              messages = []
+              for block in re.split(r"\r?\n\r?\n", decoded):
+                  data_lines = []
+                  for line in block.splitlines():
+                      if line.startswith("data:"):
+                          data_lines.append(line[5:].lstrip())
+                  if not data_lines:
+                      continue
+                  payload = "\n".join(data_lines).strip()
+                  if not payload or payload == "[DONE]":
+                      continue
+                  try:
+                      value = json.loads(payload)
+                  except Exception:
+                      continue
+                  if isinstance(value, dict):
+                      messages.append(value)
+                  elif isinstance(value, list):
+                      messages.extend(item for item in value if isinstance(item, dict))
+              return messages
+
           async def send_mcp_json(send, obj, headers=None, status=200):
               payload = json.dumps(obj, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+              with MONITOR_LOCK:
+                  MCP_CONNECTION["last_status"] = int(status)
+                  if status >= 400:
+                      MCP_CONNECTION["last_error"] = str(obj.get("error", obj.get("message", "MCP HTTP %s" % status)))[:500] if isinstance(obj, dict) else "MCP HTTP %s" % status
+              log("MCP OUT status=%s content_type=application/json bytes=%s" % (status, len(payload)))
               out = [(b"content-type", b"application/json; charset=utf-8"),
                      (b"content-length", str(len(payload)).encode("ascii")),
                      (b"cache-control", b"no-store")]
               for key, value in (headers or []):
-                  if key.lower() not in (b"content-type", b"content-length", b"transfer-encoding", b"connection"):
+                  if key.lower() not in (b"content-type", b"content-length", b"content-encoding", b"transfer-encoding", b"connection"):
                       out.append((key.lower(), value))
               await send({"type": "http.response.start", "status": status, "headers": out})
               await send({"type": "http.response.body", "body": payload, "more_body": False})
@@ -1373,6 +1564,15 @@ jobs:
                   request_obj = None
               method = request_obj.get("method", "") if isinstance(request_obj, dict) else ""
               params = request_obj.get("params", {}) if isinstance(request_obj, dict) else {}
+              with MONITOR_LOCK:
+                  MCP_CONNECTION["request_count"] += 1
+                  MCP_CONNECTION["last_seen"] = time.time()
+                  MCP_CONNECTION["last_method"] = str(method or scope.get("method", "HTTP"))
+                  MCP_CONNECTION["last_path"] = raw_path
+                  MCP_CONNECTION["last_error"] = ""
+              log("MCP IN method=%s path=%s jsonrpc_id=%s" % (
+                  method or scope.get("method", "HTTP"), raw_path,
+                  request_obj.get("id", "-") if isinstance(request_obj, dict) else "-"))
               local_response_headers = [(key.lower(), value) for key, value in scope.get("headers", [])
                                         if key.lower() in (b"mcp-session-id", b"mcp-protocol-version")]
 
@@ -1490,14 +1690,12 @@ jobs:
                               # Some Streamable HTTP servers may encode the single JSON-RPC
                               # message as an SSE data frame. Quick Tunnels do not support SSE
                               # as a browser transport, but MCP negotiation may still use it.
-                              if "text/event-stream" in response.headers.get("content-type", ""):
-                                  for line in raw.splitlines():
-                                      if line.startswith(b"data:"):
-                                          try:
-                                              parsed = json.loads(line[5:].strip().decode("utf-8"))
-                                              break
-                                          except Exception:
-                                              pass
+                              if "text/event-stream" in response.headers.get("content-type", "").lower():
+                                  messages = parse_sse_json_messages(raw)
+                                  if isinstance(request_obj, dict) and "id" in request_obj:
+                                      parsed = next((item for item in reversed(messages) if item.get("id") == request_obj.get("id")), None)
+                                  elif messages:
+                                      parsed = messages[-1]
                           if isinstance(parsed, dict) and isinstance(parsed.get("result"), dict) and isinstance(parsed["result"].get("tools"), list):
                               existing = {item.get("name") for item in parsed["result"]["tools"] if isinstance(item, dict)}
                               for item in monitor_mcp_tools():
@@ -1508,6 +1706,12 @@ jobs:
                                          if k.decode("latin1").lower() not in hop_by_hop]
                               await send_mcp_json(send, parsed, headers=headers, status=response.status_code)
                               return
+                          with MONITOR_LOCK:
+                              MCP_CONNECTION["last_status"] = int(response.status_code)
+                              if response.status_code >= 400:
+                                  MCP_CONNECTION["last_error"] = "tools/list upstream HTTP %s" % response.status_code
+                          log("MCP tools/list upstream response: status=%s; content-type=%s; parsed_jsonrpc=%s" % (
+                              response.status_code, response.headers.get("content-type", ""), bool(parsed)))
                           out_headers = [(k.lower(), v) for k, v in response.headers.raw
                                          if k.decode("latin1").lower() not in hop_by_hop]
                           await send({"type": "http.response.start", "status": response.status_code, "headers": out_headers})
@@ -1515,7 +1719,45 @@ jobs:
                           return
 
                       async with client.stream(scope.get("method", "POST"), target, headers=forwarded, content=bytes(body)) as response:
+                          # Cloudflare Quick Tunnels do not carry SSE streams. Unreal may
+                          # answer a Streamable HTTP POST with either JSON or SSE, both of
+                          # which are valid MCP responses. Buffer an SSE response locally,
+                          # extract the matching JSON-RPC reply, and return it as JSON so
+                          # the public tunnel only has to carry ordinary HTTP responses.
+                          upstream_content_type = response.headers.get("content-type", "").lower()
+                          if (scope.get("method", "POST").upper() == "POST"
+                                  and "text/event-stream" in upstream_content_type
+                                  and isinstance(request_obj, dict) and "id" in request_obj):
+                              raw_sse = await response.aread()
+                              messages = parse_sse_json_messages(raw_sse)
+                              rpc_response = next(
+                                  (item for item in reversed(messages) if item.get("id") == request_obj.get("id")),
+                                  None
+                              )
+                              response_headers = [(k.lower(), v) for k, v in response.headers.raw
+                                                  if k.decode("latin1").lower() not in hop_by_hop]
+                              if rpc_response is None:
+                                  log("MCP SSE response had no JSON-RPC message matching request id=%s; parsed_messages=%s" % (
+                                      request_obj.get("id"), len(messages)))
+                                  rpc_response = {
+                                      "jsonrpc": "2.0", "id": request_obj.get("id"),
+                                      "error": {"code": -32603, "message": "Upstream SSE stream contained no matching JSON-RPC response"}
+                                  }
+                                  await send_mcp_json(send, rpc_response, headers=response_headers, status=502)
+                                  if event_id:
+                                      monitor_event_finish(event_id, 502, "upstream SSE had no matching JSON-RPC response")
+                              else:
+                                  await send_mcp_json(send, rpc_response, headers=response_headers, status=response.status_code)
+                                  if event_id:
+                                      monitor_event_finish(event_id, response.status_code,
+                                          response_preview=json.dumps(safe_monitor_value(rpc_response), ensure_ascii=False))
+                              return
+
                           session_id = response.headers.get("mcp-session-id", "")
+                          with MONITOR_LOCK:
+                              MCP_CONNECTION["last_status"] = int(response.status_code)
+                              if response.status_code >= 400:
+                                  MCP_CONNECTION["last_error"] = "Upstream MCP HTTP %s" % response.status_code
                           log("MCP upstream response: status=%s; content-type=%s; protocol-version=%s; session-id-present=%s" % (
                               response.status_code, response.headers.get("content-type", ""),
                               response.headers.get("mcp-protocol-version", ""), bool(session_id)))
@@ -1532,6 +1774,9 @@ jobs:
                               monitor_event_finish(event_id, response.status_code,
                                                    response_preview=monitor_response_preview(bytes(response_preview_bytes)))
               except Exception as exc:
+                  with MONITOR_LOCK:
+                      MCP_CONNECTION["last_status"] = 502
+                      MCP_CONNECTION["last_error"] = str(exc)[:500]
                   if event_id:
                       monitor_event_finish(event_id, 502, repr(exc))
                   log("Native MCP proxy error: " + repr(exc))
@@ -1561,6 +1806,7 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
+          try { Start-Transcript -Path 'D:\UE58\Logs\workflow-validation-transcript.log' -Append -Force | Out-Null } catch { }
           $python = (Get-Command python).Source
           & $python -m py_compile 'D:\UE58\api_server.py' 'D:\UE58\UEControl\Content\Python\init_unreal.py'
           if ($LASTEXITCODE -ne 0) { throw 'Generated Python scripts failed syntax validation.' }
@@ -1576,6 +1822,7 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           $root = 'D:\UE58'
+          try { Start-Transcript -Path "$root\Logs\workflow-runtime-transcript.log" -Append -Force | Out-Null } catch { }
           $env:UE_ROOT = $root
           if ([string]::IsNullOrWhiteSpace($env:MONITOR_PASSWORD) -or $env:MONITOR_PASSWORD.Length -lt 16) {
             throw 'Create repository Actions secret MONITOR_PASSWORD with a strong password of at least 16 characters before running this workflow.'
@@ -1714,14 +1961,15 @@ jobs:
           "@
           $summaryText | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
 
-          Write-Host 'REST endpoints: GET /health; authenticated read-only monitor at GET /monitor; authenticated file, Drive, GitHub Release and project endpoints.'
+          Write-Host 'REST endpoints: GET /health; authenticated read-only monitor at GET /monitor; authenticated file, Drive, GitHub Release, project and unified logs endpoints.'
           Write-Host "MCP_ENDPOINT=$publicUrl/mcp"
           Write-Host 'Single MCP endpoint only: /mcp -> native Unreal AllToolsets plus monitor, binary-upload and guarded GitHub Release tools. No second MCP URL.'
           Write-Host 'Bridge startup: Content/Python/init_unreal.py auto-loads; Unreal is intentionally launched without -ExecutePythonScript so the Editor stays open.'
           Write-Host 'Binary transfer: unreal_upload_binary_file accepts files up to 8 MiB per MCP call; place larger files under D:\UE58\Uploads through the authenticated API before publishing them.'
           Write-Host 'Monitor uses 5-second JSON polling and 640x360 JPEG snapshots after MCP tool calls; no VNC, desktop stream, WebSocket, or SSE.'
           Write-Host 'MCP tool list at /mcp includes Unreal native AllToolsets, monitor URL/state tools, direct uploads up to 8 MiB, and confirmed GitHub Release upload tools.'
-          Write-Host 'Monitor and REST endpoints require HTTP Basic: username viewer, password from MONITOR_PASSWORD secret. MCP /mcp remains unauthenticated for the ChatGPT MCP client.'
+          Write-Host 'MCP transport: upstream SSE replies are converted to JSON-RPC JSON locally because Cloudflare Quick Tunnels do not support SSE.'
+          Write-Host 'Monitor includes a Logs & Connection Diagnostics section: API, MCP ingress/egress, Bridge, Unreal stdout/stderr/Saved Logs, Cloudflare stdout/stderr and GitHub Actions PowerShell transcripts.'
           Write-Warning 'SECURITY: the monitor and REST endpoints are password-protected, but /mcp is intentionally unauthenticated for ChatGPT. Anyone who obtains the MCP URL may issue Unreal commands. Do not share the MCP URL; stop the workflow when finished.'
 
           $lastHeartbeat = Get-Date
