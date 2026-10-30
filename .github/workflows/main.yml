@@ -1,13 +1,31 @@
 name: UE 5.8 Remote Studio - Stable MCP GET+POST Compatibility + Live Monitor
 'on':
+  # Run automatically when this workflow file is pushed to any branch.
+  # Keep workflow_dispatch so it can also be started manually from Actions.
+  push:
+    branches:
+      - '**'
+    paths:
+      - '.github/workflows/**'
   workflow_dispatch:
 permissions:
   contents: write
 jobs:
   ue-remote:
+    # GitHub-hosted Windows runner. This job is queued by push or workflow_dispatch.
     runs-on: windows-latest
     timeout-minutes: 360
     steps:
+    - name: Confirm GitHub Actions runner was allocated
+      shell: pwsh
+      run: |
+        $ErrorActionPreference = 'Stop'
+        Write-Host "RUNNER_ALLOCATED=true"
+        Write-Host "RUNNER_NAME=$env:RUNNER_NAME"
+        Write-Host "RUNNER_OS=$env:RUNNER_OS"
+        Write-Host "GITHUB_REF=$env:GITHUB_REF"
+        Write-Host "GITHUB_WORKFLOW=$env:GITHUB_WORKFLOW"
+        Write-Host "POWERSHELL_VERSION=$($PSVersionTable.PSVersion)"
     - name: Prepare D drive
       shell: pwsh
       run: '$ErrorActionPreference = ''Stop''
