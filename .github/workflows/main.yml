@@ -194,13 +194,23 @@ jobs:
                     actors = unreal.EditorLevelLibrary.get_all_level_actors()
                     mesh_component_count = 0
                     for actor in actors:
+                        # Count BOTH static and skeletal mesh components. Without this,
+                        # an actor such as a dinosaur (SkeletalMeshActor) is misidentified
+                        # as an empty level and preview cubes/spheres are injected over it.
                         try:
                             components = actor.get_components_by_class(unreal.StaticMeshComponent)
                             for component in components:
                                 if component.get_editor_property("static_mesh") is not None:
                                     mesh_component_count += 1
                         except Exception:
-                            continue
+                            pass
+                        try:
+                            skeletal_components = actor.get_components_by_class(unreal.SkeletalMeshComponent)
+                            for component in skeletal_components:
+                                if component.get_editor_property("skeletal_mesh") is not None:
+                                    mesh_component_count += 1
+                        except Exception:
+                            pass
                     if mesh_component_count > 0:
                         PREVIEW_GEOMETRY_READY = True
                         log("Active level already contains %s static mesh component(s); preview geometry was not added" % mesh_component_count)
@@ -1154,7 +1164,17 @@ jobs:
         .diag .pill{background:#101720}.log-output{white-space:pre-wrap;overflow:auto;overflow-wrap:anywhere;max-height:65vh;min-height:300px;padding:12px;background:#090d12;border:1px solid #303946;border-radius:8px;color:#cbd5e1;font:12px/1.55 Consolas,monospace}
         .log-error{color:#ff9292}.log-warn{color:#f5c66b}.log-debug{color:#9ca8b8}.log-info{color:#bcd0e8}
         #scene3d{height:620px;min-height:480px;background:#080d14;border:1px solid #303946;border-radius:10px;position:relative;overflow:hidden;touch-action:none}#scene3d canvas{display:block;width:100%;height:100%;touch-action:none;cursor:grab}#scene3d canvas:active{cursor:grabbing}#sceneFallback{position:absolute;inset:0;display:grid;place-items:center;color:#d7e3f4;text-align:center;padding:20px;background:rgba(8,13,20,.74);pointer-events:none;z-index:2}#sceneFallback[hidden]{display:none}.scene-model-status{margin:8px 0 12px;padding:9px 11px;background:#101720;border:1px solid #303946;border-radius:8px;color:#bcd0e8;font-size:12px;overflow-wrap:anywhere}.scene-toolbar{display:flex;gap:7px;align-items:center;flex-wrap:wrap;margin:12px 0}.scene-toolbar button{white-space:nowrap}.scene-toolbar .primary{background:#254b70;border-color:#5d91c2}.scene-layout{display:grid;grid-template-columns:minmax(0,2fr) minmax(260px,1fr);gap:12px;margin-top:12px}.scene-side{min-width:0}.actor-list{max-height:570px;overflow:auto;margin-top:9px;display:flex;flex-direction:column;gap:6px}.actor-row{border:1px solid #303946;background:#111720;padding:8px 10px;border-radius:7px;font-size:12px;overflow-wrap:anywhere}.actor-row b{color:#dbeafe}.actor-meta{color:#9ca8b8;font-size:11px}.plugin-box{border-top:1px solid #303946;margin-top:14px;padding-top:12px}details{margin-top:10px}summary{cursor:pointer;color:#bcd0e8;font-size:12px}.ops-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:14px}.ops-grid>div{background:#111720;border:1px solid #303946;padding:12px;border-radius:9px;min-width:0}.mcp-form{margin-top:10px}.mcp-form input{min-width:160px}.scene-legend{font-size:11px;color:#9ca8b8;margin-top:8px}
-        @media(max-width:950px){main{grid-template-columns:1fr;padding:10px}#logsPanel{grid-column:1!important}.scene-layout{grid-template-columns:1fr}#scene3d{height:65vh;min-height:420px}.actor-list{max-height:360px}}
+        .scene-side{display:none!important}
+        .scene-explorer{position:absolute;z-index:8;top:10px;right:10px;width:min(310px,48%);max-height:calc(100% - 20px);overflow:hidden;display:flex;flex-direction:column;gap:8px;padding:10px;background:rgba(14,20,29,.94);border:1px solid #50647d;border-radius:11px;box-shadow:0 8px 30px rgba(0,0,0,.42);backdrop-filter:blur(8px);color:#e8edf5;pointer-events:auto}
+        .scene-explorer-head{display:flex;align-items:center;justify-content:space-between;gap:8px;font-size:12px;letter-spacing:.04em}.scene-explorer-head b{color:#eaf2ff}.scene-explorer-head button{padding:5px 8px;font-size:11px}.scene-explorer.collapsed{width:auto;min-width:145px}.scene-explorer.collapsed #sceneExplorerBody{display:none}
+        .scene-search{width:100%;min-width:0!important;background:#0a111a!important;font-size:12px}.scene-explorer-controls{display:flex;gap:6px}.scene-explorer-controls select{width:100%;font-size:12px}
+        .scene-explorer .diag{gap:4px;margin:0}.scene-explorer .diag .pill{font-size:10px;padding:2px 6px}
+        .scene-explorer .actor-list{max-height:190px;min-height:34px;overflow:auto;margin:0;gap:5px;overscroll-behavior:contain}
+        .scene-explorer .actor-row{display:block;width:100%;text-align:left;color:#dce7f5;cursor:pointer;background:#111b28;border:1px solid #35485e;padding:7px 8px;border-radius:7px;font-size:11px;line-height:1.35}
+        .scene-explorer .actor-row:hover,.scene-explorer .actor-row.selected{border-color:#60a5fa;background:#18324b}.scene-explorer .actor-row b{display:inline-block;max-width:100%;overflow-wrap:anywhere;color:#f0f6ff}.scene-explorer .actor-row .actor-meta{display:block;font-size:10px;margin-top:2px}.scene-explorer .actor-kind{float:right;color:#a8c9ed;font-size:9px;border:1px solid #425d79;border-radius:9px;padding:1px 5px;margin-left:5px}
+        .scene-mesh-details{margin:0;border-top:1px solid #354354;padding-top:6px}.scene-mesh-details summary{font-size:11px}.scene-explorer .mesh-node-list{max-height:130px;margin-top:6px}.scene-selection-info{border-top:1px solid #354354;padding-top:7px;font-size:10px;color:#bdcbe0;line-height:1.45;overflow-wrap:anywhere}.scene-selection-info b{color:#f0f6ff;font-size:12px}.scene-selection-actions{display:flex;gap:5px;flex-wrap:wrap;margin-top:6px}.scene-selection-actions button{font-size:10px;padding:4px 7px}
+        @media(max-width:950px){main{grid-template-columns:1fr;padding:10px}#logsPanel{grid-column:1!important}.scene-layout{grid-template-columns:1fr}#scene3d{height:65vh;min-height:420px}.scene-explorer{width:min(270px,47%);max-height:calc(100% - 16px);top:8px;right:8px;padding:8px}.scene-explorer .actor-list{max-height:165px}.scene-explorer .mesh-node-list{max-height:105px}}
+        @media(max-width:480px){.scene-explorer{width:52%;font-size:11px}.scene-explorer .actor-list{max-height:135px}.scene-selection-info{max-height:105px;overflow:auto}}
         </style><script type="importmap">{"imports":{"three":"https://cdn.jsdelivr.net/npm/three@0.160.1/build/three.module.js","three/addons/":"https://cdn.jsdelivr.net/npm/three@0.160.1/examples/jsm/"}}</script></head><body>
         <header><div><h1>Unreal Engine Live Monitor</h1><div class="muted small">Read-only view · no desktop streaming · low-frequency polling</div></div>
         <div class="row"><span class="pill" id="bridge">Checking bridge…</span><span class="pill" id="clock">—</span></div></header>
@@ -1170,7 +1190,17 @@ jobs:
         <div class="small muted">Shows the real meshes exported from the active Unreal level, including supported materials, textures and transforms — not placeholder boxes. One finger / left mouse drag: orbit · two-finger drag: pan · pinch or wheel: zoom. This is a read-only viewer and does not move objects in Unreal.</div>
         <div class="scene-model-status" id="sceneModelStatus">Waiting to export actual scene geometry from Unreal…</div>
         <div class="scene-toolbar" aria-label="3D camera controls"><button id="sceneFitAll" class="primary" type="button">Frame actual model</button><button id="sceneZoomIn" type="button">Zoom +</button><button id="sceneZoomOut" type="button">Zoom −</button><button id="sceneViewIso" type="button">Isometric</button><button id="sceneViewTop" type="button">Top</button><button id="sceneViewFront" type="button">Front</button><button id="sceneViewSide" type="button">Side</button><button id="sceneViewBack" type="button">Back</button><button id="sceneRefresh" type="button">Refresh scene data</button><button id="sceneModelRefresh" class="primary" type="button">Reload real geometry</button></div>
-        <div class="scene-layout"><div id="scene3d"><div id="sceneFallback">Exporting the actual Unreal model. The 3D object will appear here when the GLB export finishes.</div></div><div class="scene-side"><div class="row"><select id="sceneFilter"><option value="all">All objects</option><option>Characters</option><option>Lights</option><option>Cameras</option><option>Meshes</option><option>Volumes</option><option>Actors</option></select></div><div id="sceneCounts" class="diag"></div><div id="actorList" class="actor-list">No actor data yet.</div></div></div></section>
+        <div class="scene-layout"><div id="scene3d"><div id="sceneFallback">Exporting the actual Unreal model. The 3D object will appear here when the GLB export finishes.</div>
+        <aside id="sceneExplorer" class="scene-explorer" aria-label="Unreal object and camera explorer">
+          <div class="scene-explorer-head"><div><b>WORLD OUTLINER</b><div class="actor-meta" id="sceneExplorerCount">Loading actors…</div></div><button id="sceneExplorerToggle" type="button" aria-expanded="true">Hide</button></div>
+          <div id="sceneExplorerBody"><input id="sceneSearch" class="scene-search" type="search" placeholder="Search object, mesh, camera…" autocomplete="off">
+            <div class="scene-explorer-controls"><select id="sceneFilter" aria-label="Filter object type"><option value="all">All objects</option><option>Characters</option><option>Meshes</option><option>Cameras</option><option>Lights</option><option>Volumes</option><option>Actors</option></select></div>
+            <div id="sceneCounts" class="diag"></div>
+            <div id="actorList" class="actor-list">No actor data yet.</div>
+            <details class="scene-mesh-details"><summary id="meshNodeSummary">Exported GLB meshes (0)</summary><div id="meshNodeList" class="actor-list mesh-node-list">Waiting for geometry…</div></details>
+            <div id="sceneSelectionInfo" class="scene-selection-info">Tap an object here or tap a mesh in the 3D view to identify it.</div>
+          </div>
+        </aside></div><div class="scene-side" aria-hidden="true"></div></div></section>
         <section id="projectPanel" style="grid-column:1/-1"><h2>Projects & Plugins</h2><div class="row"><label>Project <select id="projectSelect" style="min-width:280px"></select></label><button id="openProjectBtn">Open project (restart Unreal)</button><button id="refreshProjects">Refresh</button><span class="small muted" id="projectStatus"></span></div>
         <div class="plugin-box"><div class="row"><b>Installed Unreal plugins</b><button id="refreshPlugins">Refresh plugins</button></div><div class="small muted">Toggle installed plugins or install a plugin ZIP into the active project's Plugins folder. The .uproject descriptor is backed up and Unreal restarts to apply changes. Core remote-control plugins cannot be disabled.</div><div class="row"><input id="pluginZip" type="file" accept=".zip"><button id="installPluginBtn">Install plugin ZIP</button><span class="small muted" id="pluginInstallStatus"></span></div>
         <div class="row"><input id="pluginSearch" type="search" placeholder="Search plugin name…"><button id="pluginPrev" disabled>Previous</button><button id="pluginNext" disabled>Next</button><span class="small muted" id="pluginPageInfo">Page 1</span></div><div id="pluginList" class="actor-list">Loading plugins…</div></div></section>
@@ -1255,11 +1285,14 @@ jobs:
         let activeSceneJob = '', scenePollBusy = false, modelExportBusy = false, modelExportPending = false, modelPollTimer = null;
         let loadedModelVersion = -1, forceFrameAfterExport = false;
         let target;
+        let selectableMeshes = [], selectedObject = null, selectedActor = null, selectedBox = null;
+        let sceneRaycaster = null, glbMeshNames = [], sceneExplorerCollapsed = false;
         const numberOr = (value, fallback=0) => Number.isFinite(Number(value)) ? Number(value) : fallback;
         const clamp = (value, low, high) => Math.max(low, Math.min(high, value));
 
         function init(){
           target = new THREE.Vector3(0,0,0);
+          sceneRaycaster = new THREE.Raycaster();
           scene = new THREE.Scene();
           scene.background = new THREE.Color(0x080d14);
           camera = new THREE.PerspectiveCamera(48, 1, 0.1, 100000000);
@@ -1275,12 +1308,17 @@ jobs:
             const fallback=document.getElementById('sceneFallback');
             if(fallback){fallback.hidden=false;fallback.textContent='The browser lost its WebGL graphics context. Reload this page or use a browser with WebGL enabled.';}
           });
+          // Preserve the HTML outliner while rebuilding the WebGL canvas.
+          // Clearing root.innerHTML without saving this node used to erase all
+          // controls that were placed inside the viewport.
+          const explorer = document.getElementById('sceneExplorer');
           root.innerHTML = '';
           root.appendChild(renderer.domElement);
           const fallback = document.createElement('div');
           fallback.id = 'sceneFallback';
           fallback.textContent = 'Waiting for Unreal scene geometry…';
           root.appendChild(fallback);
+          if(explorer) root.appendChild(explorer);
           renderer.domElement.setAttribute('aria-label','Interactive viewer showing actual Unreal Engine mesh geometry');
           renderer.domElement.addEventListener('contextmenu', event => event.preventDefault());
           installCameraControls(renderer.domElement);
@@ -1350,7 +1388,7 @@ jobs:
           const pointers = new Map();
           let lastPoint = null, lastMidpoint = null, lastPinchDistance = 0;
           canvas.addEventListener('pointerdown', event => {
-            pointers.set(event.pointerId, {x:event.clientX, y:event.clientY, button:event.button});
+            pointers.set(event.pointerId, {x:event.clientX, y:event.clientY, startX:event.clientX, startY:event.clientY, moved:false, button:event.button});
             canvas.setPointerCapture?.(event.pointerId);
             if(pointers.size >= 2){
               const pts = [...pointers.values()].slice(0,2);
@@ -1366,7 +1404,9 @@ jobs:
           });
           canvas.addEventListener('pointermove', event => {
             if(!pointers.has(event.pointerId)) return;
-            pointers.set(event.pointerId, {...pointers.get(event.pointerId), x:event.clientX, y:event.clientY});
+            const oldPointer = pointers.get(event.pointerId);
+            pointers.set(event.pointerId, {...oldPointer, x:event.clientX, y:event.clientY,
+              moved:oldPointer.moved || Math.hypot(event.clientX-oldPointer.startX,event.clientY-oldPointer.startY)>7});
             if(pointers.size >= 2){
               const pts = [...pointers.values()].slice(0,2);
               const midpoint = {x:(pts[0].x+pts[1].x)/2, y:(pts[0].y+pts[1].y)/2};
@@ -1385,6 +1425,11 @@ jobs:
             event.preventDefault();
           });
           const stop = event => {
+            const ended = pointers.get(event.pointerId);
+            // A short one-finger / left-click gesture selects the real mesh under it.
+            // Orbiting, right-drag panning and two-finger gestures remain unchanged.
+            if(ended && !ended.moved && ended.button === 0 && pointers.size === 1)
+              pickSceneObject(event.clientX, event.clientY);
             pointers.delete(event.pointerId);
             if(pointers.size === 1){
               const remaining = [...pointers.values()][0];
@@ -1491,17 +1536,172 @@ jobs:
         function safe(value){
           return String(value ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
         }
+        function normalSceneName(value){ return String(value||'').toLowerCase().replace(/[^a-z0-9]/g,''); }
+        function actorNameTokens(actor){
+          const values=[actor?.name,actor?.object_name,actor?.object_path];
+          for(const component of (actor?.components||[])) values.push(component.name,component.asset_name,component.asset_path);
+          return values.map(normalSceneName).filter(Boolean);
+        }
+        function matchActorForMesh(entry){
+          if(!entry) return null;
+          const names=[entry.name,...(entry.path||'').split(' / ')].map(normalSceneName).filter(Boolean);
+          if(!names.length) return null;
+          let best=null,bestScore=0;
+          for(const actor of actors){
+            let score=0;
+            for(const token of actorNameTokens(actor)) for(const name of names){
+              if(token===name) score=Math.max(score,100);
+              else if(token.length>3 && name.length>3 && (token.includes(name)||name.includes(token))) score=Math.max(score,55);
+            }
+            if(score>bestScore){best=actor;bestScore=score;}
+          }
+          return best;
+        }
+        function clearSelectionBox(){ if(selectedBox){scene.remove(selectedBox);selectedBox.geometry?.dispose?.();selectedBox.material?.dispose?.();selectedBox=null;} }
+        function showSelectionInfo(title, lines, actor=null){
+          const info=document.getElementById('sceneSelectionInfo');
+          const safeLines=(lines||[]).filter(Boolean).map(line=>'<div>'+safe(line)+'</div>').join('');
+          const cameraAction=actor && actor.category==='Cameras' ? '<button type="button" id="sceneUseCamera">Use this camera</button>' : '';
+          info.innerHTML='<b>'+safe(title||'Selected object')+'</b>'+safeLines+'<div class="scene-selection-actions"><button type="button" id="sceneFrameSelection">Frame selection</button>'+cameraAction+'</div>';
+          document.getElementById('sceneFrameSelection')?.addEventListener('click',()=>{
+            if(selectedObject) frameObject(selectedObject); else if(selectedActor) frameActor(selectedActor);
+          });
+          document.getElementById('sceneUseCamera')?.addEventListener('click',()=>useUnrealCamera(selectedActor));
+        }
+        function focusBounds(bounds){
+          if(!bounds || bounds.isEmpty()) return false;
+          const center=bounds.getCenter(new THREE.Vector3());
+          const size=bounds.getSize(new THREE.Vector3());
+          const radius=Math.max(0.05,size.length()*0.5);
+          const halfVertical=THREE.MathUtils.degToRad(camera.fov*0.5);
+          const halfHorizontal=Math.atan(Math.tan(halfVertical)*Math.max(0.2,camera.aspect||1));
+          const limiting=Math.max(0.05,Math.min(halfVertical,halfHorizontal));
+          const distance=Math.max(0.5,radius/Math.sin(limiting)*1.45);
+          const direction=new THREE.Vector3(1.25,0.88,1.25).normalize();
+          target.copy(center);camera.up.set(0,1,0);camera.position.copy(center).add(direction.multiplyScalar(distance));
+          camera.near=Math.max(0.001,radius/10000);camera.far=Math.max(1000,radius*100);
+          camera.userData.minDistance=Math.max(0.02,radius*0.003);camera.userData.maxDistance=Math.max(500,radius*120);
+          camera.updateProjectionMatrix();camera.lookAt(target);return true;
+        }
+        function frameObject(object){
+          if(!object)return;
+          object.updateMatrixWorld(true);
+          const bounds=new THREE.Box3().setFromObject(object,true);
+          if(focusBounds(bounds)){document.getElementById('sceneFallback').hidden=true;}
+        }
+        function actorBounds(actor){
+          const p=actor?.bounds_origin||actor?.location,e=actor?.bounds_extent;
+          if(!p||!e)return null;
+          const center=new THREE.Vector3(numberOr(p.x)*0.01,numberOr(p.z)*0.01,numberOr(p.y)*0.01);
+          const half=new THREE.Vector3(Math.max(.01,Math.abs(numberOr(e.x,25))*.01),Math.max(.01,Math.abs(numberOr(e.z,25))*.01),Math.max(.01,Math.abs(numberOr(e.y,25))*.01));
+          return new THREE.Box3(center.clone().sub(half),center.clone().add(half));
+        }
+        function frameActor(actor){const bounds=actorBounds(actor);if(bounds&&focusBounds(bounds)){document.getElementById('sceneFallback').hidden=true;return true;}return false;}
+        function selectMeshEntry(entry, actorOverride=null, shouldFrame=true){
+          if(!entry?.object)return;
+          selectedObject=entry.object;selectedActor=actorOverride||matchActorForMesh(entry);
+          clearSelectionBox();selectedBox=new THREE.BoxHelper(selectedObject,0x38bdf8);selectedBox.renderOrder=999;
+          if(selectedBox.material){selectedBox.material.depthTest=false;selectedBox.material.transparent=true;selectedBox.material.opacity=1;}
+          scene.add(selectedBox);
+          if(shouldFrame)frameObject(selectedObject);
+          if(selectedActor){
+            renderList();
+            const lines=[selectedActor.category+' · '+selectedActor.class,
+              'Actor: '+(selectedActor.object_name||selectedActor.name),
+              'GLB node: '+(entry.path||entry.name),
+              'Location (cm): '+formatVector(selectedActor.location),
+              (selectedActor.components||[]).length+' mesh component(s)'];
+            showSelectionInfo(selectedActor.name,lines,selectedActor);
+          }else{
+            renderList();
+            const pos=selectedObject.getWorldPosition(new THREE.Vector3());
+            const size=new THREE.Box3().setFromObject(selectedObject,true).getSize(new THREE.Vector3());
+            showSelectionInfo(entry.name,['GLB mesh node · '+(entry.path||entry.name),
+              'Viewer position: '+formatVector({x:pos.x,y:pos.y,z:pos.z}),
+              'Bounds: '+formatVector({x:size.x,y:size.y,z:size.z})+' m']);
+          }
+        }
+        function formatVector(p){return p?`${numberOr(p.x).toFixed(2)}, ${numberOr(p.y).toFixed(2)}, ${numberOr(p.z).toFixed(2)}`:'—';}
+        function selectActor(actor){
+          if(!actor)return;
+          selectedActor=actor;
+          const actorTokens=actorNameTokens(actor);
+          let entry=selectableMeshes.find(item=>{
+            const tokens=[item.name,...(item.path||'').split(' / ')].map(normalSceneName);
+            return tokens.some(name=>name&&actorTokens.some(token=>token===name||(token.length>3&&name.length>3&&(token.includes(name)||name.includes(token)))));
+          });
+          if(!entry && actor.location){
+            const actorCenter=actor.bounds_origin||actor.location;
+            let best=null,bestDistance=Infinity;
+            for(const candidate of selectableMeshes){
+              const c=new THREE.Box3().setFromObject(candidate.object,true).getCenter(new THREE.Vector3());
+              const d=c.distanceTo(new THREE.Vector3(numberOr(actorCenter.x)*.01,numberOr(actorCenter.z)*.01,numberOr(actorCenter.y)*.01));
+              if(d<bestDistance){bestDistance=d;best=candidate;}
+            }
+            if(best && bestDistance<Math.max(3,Math.abs(numberOr(actor.bounds_extent?.x,100))*.04)) entry=best;
+          }
+          if(entry) selectMeshEntry(entry,actor,true);
+          else{
+            selectedObject=null;clearSelectionBox();frameActor(actor);renderList();
+            const lines=[actor.category+' · '+actor.class,'Actor: '+(actor.object_path||actor.object_name||actor.name),
+              'Location (cm): '+formatVector(actor.location), 'Rotation: '+formatVector(actor.rotation),
+              (actor.components||[]).map(c=>c.asset_name+' ['+c.class+']').join(' · ')||'No mesh component attached'];
+            showSelectionInfo(actor.name,lines,actor);
+          }
+        }
+        function useUnrealCamera(actor){
+          const cam=actor?.camera;
+          if(!cam?.location)return;
+          const p=cam.location,r=cam.rotation||actor.rotation||{};
+          const pitch=THREE.MathUtils.degToRad(numberOr(r.pitch)),yaw=THREE.MathUtils.degToRad(numberOr(r.yaw));
+          // Convert Unreal centimeters / Z-up coordinates to the GLB viewer's meter / Y-up space.
+          const position=new THREE.Vector3(numberOr(p.x)*.01,numberOr(p.z)*.01,numberOr(p.y)*.01);
+          const forward=new THREE.Vector3(Math.cos(pitch)*Math.cos(yaw),Math.sin(pitch),Math.cos(pitch)*Math.sin(yaw)).normalize();
+          const distance=Math.max(2,Math.abs(numberOr(actor.bounds_extent?.x,100))*.05);
+          camera.position.copy(position);target.copy(position).add(forward.multiplyScalar(distance));
+          camera.up.set(0,1,0);camera.fov=clamp(numberOr(cam.fov,60),20,120);camera.near=.01;camera.far=100000;
+          camera.updateProjectionMatrix();camera.lookAt(target);
+          document.getElementById('sceneStatus').textContent='Camera view · '+actor.name+' · FOV '+camera.fov.toFixed(1)+'°';
+        }
+        function pickSceneObject(clientX,clientY){
+          if(!renderer||!sceneRaycaster||!selectableMeshes.length)return;
+          const rect=renderer.domElement.getBoundingClientRect();
+          const pointer=new THREE.Vector2(((clientX-rect.left)/rect.width)*2-1,-((clientY-rect.top)/rect.height)*2+1);
+          sceneRaycaster.setFromCamera(pointer,camera);
+          const hits=sceneRaycaster.intersectObjects(group.children,true);
+          const hit=hits.find(item=>item.object?.isMesh);
+          if(!hit)return;
+          const entry=selectableMeshes.find(item=>item.object===hit.object);
+          if(entry)selectMeshEntry(entry);
+        }
+        function renderMeshNodes(){
+          const list=document.getElementById('meshNodeList');
+          const summary=document.getElementById('meshNodeSummary');
+          if(!list||!summary)return;
+          summary.textContent='Exported GLB meshes ('+selectableMeshes.length+')';
+          list.innerHTML=selectableMeshes.slice(0,300).map((entry,index)=>
+            '<button type="button" class="actor-row" data-mesh-index="'+index+'"><b>'+safe(entry.name)+'</b><span class="actor-meta">'+safe(entry.path||'GLB mesh node')+'</span></button>'
+          ).join('')||'<div class="actor-meta">No exported mesh nodes.</div>';
+        }
         function renderList(){
-          const filter = document.getElementById('sceneFilter').value;
-          const rows = actors.filter(actor => filter === 'all' || actor.category === filter);
-          document.getElementById('actorList').innerHTML = rows.slice(0,500).map(actor => {
-            const p=actor.location, e=actor.bounds_extent;
-            const location=p ? `${numberOr(p.x).toFixed(1)}, ${numberOr(p.y).toFixed(1)}, ${numberOr(p.z).toFixed(1)}` : '—';
-            const extent=e ? `${numberOr(e.x).toFixed(1)}, ${numberOr(e.y).toFixed(1)}, ${numberOr(e.z).toFixed(1)}` : '—';
-            return '<div class="actor-row"><b>'+safe(actor.name)+'</b> <span class="actor-meta">'+safe(actor.category)+' · '+safe(actor.class)+'</span><div class="actor-meta">Location: '+location+' cm · Bounds extent: '+extent+'</div></div>';
-          }).join('') || 'No actors in this category.';
-          const categories={}; for(const actor of actors) categories[actor.category]=(categories[actor.category]||0)+1;
+          const filter=document.getElementById('sceneFilter').value;
+          const search=(document.getElementById('sceneSearch')?.value||'').trim().toLowerCase();
+          const rows=actors.map((actor,index)=>({actor,index})).filter(({actor})=>{
+            const matchesFilter=filter==='all'||actor.category===filter;
+            const haystack=[actor.name,actor.object_name,actor.object_path,actor.class,actor.category,...(actor.components||[]).flatMap(c=>[c.name,c.asset_name,c.asset_path])].join(' ').toLowerCase();
+            return matchesFilter&&(!search||haystack.includes(search));
+          });
+          document.getElementById('actorList').innerHTML=rows.slice(0,500).map(({actor,index})=>{
+            const location=actor.location?formatVector(actor.location):'—';
+            const componentText=(actor.components||[]).map(c=>c.asset_name||c.name).filter(Boolean).join(', ');
+            const cameraText=actor.camera?' · FOV '+numberOr(actor.camera.fov,60).toFixed(1)+'°':'';
+            const selected=selectedActor===actor?' selected':'';
+            const icon=actor.category==='Cameras'?'CAM':actor.category==='Characters'?'CHR':actor.category==='Lights'?'LGT':actor.category==='Meshes'?'MSH':'ACT';
+            return '<button type="button" class="actor-row'+selected+'" data-actor-index="'+index+'"><span class="actor-kind">'+icon+'</span><b>'+safe(actor.name)+'</b><span class="actor-meta">'+safe(actor.category)+' · '+safe(actor.class)+cameraText+'</span><span class="actor-meta">'+safe(componentText||actor.object_name||'Actor')+'</span></button>';
+          }).join('')||'<div class="actor-meta">No objects match this filter.</div>';
+          const categories={};for(const actor of actors)categories[actor.category]=(categories[actor.category]||0)+1;
           document.getElementById('sceneCounts').innerHTML=Object.entries(categories).map(([name,count])=>'<span class="pill">'+safe(name)+': '+count+'</span>').join('');
+          document.getElementById('sceneExplorerCount').textContent=actors.length+' actors · '+selectableMeshes.length+' GLB meshes';
         }
 
         async function loadActualModel(version, forceFrame=false){
@@ -1511,12 +1711,16 @@ jobs:
             const loader=new GLTFLoader();
             const gltf=await loader.loadAsync('/api/scene/model.glb?v='+encodeURIComponent(version));
             clearGroup();
+            clearSelectionBox();selectedObject=null;selectedActor=null;selectableMeshes=[];
             group.add(gltf.scene);
             gltf.scene.updateMatrixWorld(true);
             let meshCount=0, vertexCount=0;
             gltf.scene.traverse(object=>{
               if(object.isMesh){
                 meshCount++;
+                const path=[];let parent=object;
+                while(parent&&parent!==gltf.scene){if(parent.name)path.unshift(parent.name);parent=parent.parent;}
+                selectableMeshes.push({object,name:object.name||('Mesh '+meshCount),path:path.join(' / ')});
                 object.frustumCulled=false;
                 if(object.geometry){
                   if(!object.geometry.boundingBox) object.geometry.computeBoundingBox();
@@ -1540,6 +1744,7 @@ jobs:
               throw new Error('The exported mesh has invalid or zero-size bounds; cannot frame it.');
             worldBounds=modelBounds.clone();
             loadedModelVersion=Number(version);
+            renderMeshNodes();renderList();
             cameraHasBeenFramed=false;
             fitAll();
             status.textContent='Actual Unreal model loaded · '+meshCount+' meshes · '+vertexCount.toLocaleString()+' vertices · GLB '+(Number(document.getElementById('sceneModelStatus').dataset.bytes||0)/1048576).toFixed(1)+' MB';
@@ -1562,6 +1767,7 @@ jobs:
             }
             modelExportBusy=false;
             if(state.status==='ready' && Number(state.version)!==loadedModelVersion){
+              glbMeshNames=Array.isArray(state.mesh_node_names)?state.mesh_node_names:[];
               document.getElementById('sceneModelStatus').dataset.bytes=String(state.size||0);
               const shouldFrame=forceFrameAfterExport;
               forceFrameAfterExport=false;
@@ -1608,6 +1814,9 @@ jobs:
             renderActors(sceneData.actors);
             lastSceneSignature=signature;
             requestSceneModelExport(!cameraHasBeenFramed);
+          }else{
+            actors=Array.isArray(sceneData.actors)?sceneData.actors:actors;
+            renderList();
           }
           if(!stamp || stamp!==lastSceneTimestamp) lastSceneTimestamp=stamp;
           document.getElementById('sceneStatus').textContent=(sceneData.level||'Level')+' · '+(sceneData.count??sceneData.actors.length)+' actors · updated '+new Date((stamp||Date.now()/1000)*1000).toLocaleTimeString();
@@ -1659,6 +1868,21 @@ jobs:
           document.getElementById('sceneRefresh').onclick=()=>refreshSceneSnapshot(true);
           document.getElementById('sceneModelRefresh').onclick=()=>requestSceneModelExport(true);
           document.getElementById('sceneFilter').addEventListener('change',renderList);
+          document.getElementById('sceneSearch').addEventListener('input',renderList);
+          document.getElementById('actorList').addEventListener('click',event=>{
+            const row=event.target.closest('[data-actor-index]');if(!row)return;
+            const actor=actors[Number(row.dataset.actorIndex)];if(actor)selectActor(actor);
+          });
+          document.getElementById('meshNodeList').addEventListener('click',event=>{
+            const row=event.target.closest('[data-mesh-index]');if(!row)return;
+            const entry=selectableMeshes[Number(row.dataset.meshIndex)];if(entry)selectMeshEntry(entry);
+          });
+          document.getElementById('sceneExplorerToggle').onclick=()=>{
+            sceneExplorerCollapsed=!sceneExplorerCollapsed;
+            document.getElementById('sceneExplorer').classList.toggle('collapsed',sceneExplorerCollapsed);
+            document.getElementById('sceneExplorerToggle').textContent=sceneExplorerCollapsed?'Show objects':'Hide';
+            document.getElementById('sceneExplorerToggle').setAttribute('aria-expanded',String(!sceneExplorerCollapsed));
+          };
         }
 
         try{
@@ -1799,7 +2023,7 @@ jobs:
         # Full-fidelity read-only scene export. The GLB is produced by Unreal's official GLTFExporter plugin.
         SCENE_MODEL_LOCK = threading.RLock()
         SCENE_MODEL_STATE = {"status": "idle", "job_id": "", "path": "", "version": 0,
-                             "updated": 0.0, "size": 0, "error": ""}
+                             "updated": 0.0, "size": 0, "mesh_node_names": [], "error": ""}
         SCENE_MODEL_DIR = (ROOT / "Screenshots").resolve()
         SCENE_MODEL_DIR.mkdir(parents=True, exist_ok=True)
         SCENE_JOBS = {}
@@ -2036,16 +2260,58 @@ jobs:
                 except Exception:
                     origin, ext = loc, {"x": 30.0, "y": 30.0, "z": 30.0}
                 low = cls.lower()
+                component_rows = []
+                # Include component and asset names: one Actor may contain several
+                # renderable meshes, and the outliner must identify those accurately.
+                for component_class, asset_property in ((unreal.StaticMeshComponent, "static_mesh"),
+                                                        (unreal.SkeletalMeshComponent, "skeletal_mesh")):
+                    try:
+                        for component in actor.get_components_by_class(component_class):
+                            try:
+                                asset = component.get_editor_property(asset_property)
+                                if asset is None:
+                                    continue
+                                component_rows.append({
+                                    "name": str(component.get_name()),
+                                    "class": str(component.get_class().get_name()),
+                                    "asset_name": str(asset.get_name()),
+                                    "asset_path": str(asset.get_path_name())
+                                })
+                            except Exception:
+                                continue
+                    except Exception:
+                        pass
+                camera_info = None
+                try:
+                    camera_class = getattr(unreal, "CameraComponent", None)
+                    if camera_class:
+                        camera_components = actor.get_components_by_class(camera_class)
+                        if camera_components:
+                            camera_component = camera_components[0]
+                            camera_location = camera_component.get_world_location()
+                            camera_rotation = camera_component.get_world_rotation()
+                            try:
+                                camera_fov = float(camera_component.get_editor_property("field_of_view"))
+                            except Exception:
+                                camera_fov = 90.0
+                            camera_info = {
+                                "location": _v(camera_location),
+                                "rotation": {"pitch": float(camera_rotation.pitch), "yaw": float(camera_rotation.yaw), "roll": float(camera_rotation.roll)},
+                                "fov": camera_fov
+                            }
+                except Exception:
+                    camera_info = None
                 if "light" in low: category = "Lights"
-                elif "character" in low or "pawn" in low: category = "Characters"
-                elif "camera" in low: category = "Cameras"
+                elif "camera" in low or camera_info: category = "Cameras"
+                elif "skeletalmesh" in low or "character" in low or "pawn" in low: category = "Characters"
                 elif "volume" in low: category = "Volumes"
-                elif "staticmesh" in low or "mesh" in low: category = "Meshes"
+                elif "staticmesh" in low or "mesh" in low or component_rows: category = "Meshes"
                 else: category = "Actors"
                 rows.append({"name": str(label or actor.get_name()), "object_name": str(actor.get_name()),
-                    "class": str(cls), "category": category, "location": _v(loc),
-                    "rotation": {"pitch": float(rot.pitch), "yaw": float(rot.yaw), "roll": float(rot.roll)},
+                    "object_path": str(actor.get_path_name()), "class": str(cls), "category": category,
+                    "location": _v(loc), "rotation": {"pitch": float(rot.pitch), "yaw": float(rot.yaw), "roll": float(rot.roll)},
                     "scale": _v(scale), "bounds_origin": _v(origin), "bounds_extent": ext,
+                    "components": component_rows, "camera": camera_info,
                     "hidden": bool(actor.is_hidden_ed()) if hasattr(actor, "is_hidden_ed") else False})
             except Exception as exc:
                 rows.append({"name": "Actor read error", "class": "Unknown", "category": "Errors", "error": str(exc)[:180]})
@@ -2186,7 +2452,8 @@ jobs:
                 print("GLTF material baking option unavailable; using exporter defaults: " + str(material_bake_error))
             # Keep Unreal's full scene geometry, actor transforms and supported material data.
             for property_name, property_value in (("export_lights", True), ("export_cameras", True),
-                                                   ("export_vertex_colors", False), ("export_morph_targets", True)):
+                                                   ("export_vertex_colors", False), ("export_morph_targets", True),
+                                                   ("export_vertex_skin_weights", True), ("make_skinned_meshes_root", True)):
                 try:
                     options.set_editor_property(property_name, property_value)
                 except Exception:
@@ -2235,11 +2502,15 @@ jobs:
             if not isinstance(document, dict):
                 raise RuntimeError("GLB has no JSON scene description")
             mesh_count = len(document.get("meshes", []))
-            mesh_nodes = sum(1 for node in document.get("nodes", []) if "mesh" in node)
+            mesh_node_rows = [node for node in document.get("nodes", []) if "mesh" in node]
+            mesh_nodes = len(mesh_node_rows)
+            mesh_node_names = [str(node.get("name") or ("Mesh node " + str(index + 1)))[:180]
+                               for index, node in enumerate(mesh_node_rows[:500])]
             if mesh_count < 1 or mesh_nodes < 1:
-                raise RuntimeError("Unreal exported a GLB without any mesh nodes. Check that the active level contains visible Static Mesh actors.")
+                raise RuntimeError("Unreal exported a GLB without any mesh nodes. Check the active level for visible StaticMeshComponent or SkeletalMeshComponent actors.")
             report.update({"ok": True, "size": os.path.getsize(output_path),
-                           "mesh_count": mesh_count, "mesh_nodes": mesh_nodes, "error": ""})
+                           "mesh_count": mesh_count, "mesh_nodes": mesh_nodes,
+                           "mesh_node_names": mesh_node_names, "error": ""})
         except Exception as exc:
             report["error"] = str(exc)[:1800]
             report["traceback"] = traceback.format_exc()[-2500:]
@@ -2271,7 +2542,8 @@ jobs:
                     previous = SCENE_MODEL_STATE.get("path", "")
                     SCENE_MODEL_STATE.update({"status": "ready", "job_id": job_id,
                                               "path": str(temp_path), "version": int(SCENE_MODEL_STATE.get("version", 0)) + 1,
-                                              "updated": time.time(), "size": size, "error": ""})
+                                              "updated": time.time(), "size": size,
+                                              "mesh_node_names": report.get("mesh_node_names", []), "error": ""})
                 if previous and previous != str(temp_path):
                     try:
                         Path(previous).unlink(missing_ok=True)
