@@ -4597,6 +4597,64 @@ jobs:
                 return session_id
 
 
+        async def _mcp_post_modern_via_fresh_legacy_session(client, target, base_headers, request_obj, request_body):
+            """Bridge one stateless 2026 request through a fresh Unreal 2025 session.
+
+            Unreal 5.8 exposes the older session-based MCP transport. Reusing one
+            global Unreal session across unrelated ChatGPT requests can leave a stale
+            MCP-Session-Id behind and turn tools/list or tools/call into HTTP 404/502.
+            A short-lived internal session per modern request avoids cross-request
+            session state while keeping the public 2026 endpoint stateless.
+            """
+            init_id = "ue58-modern-bridge-init-" + uuid.uuid4().hex[:12]
+            init_payload = {
+                "jsonrpc": "2.0", "id": init_id, "method": "initialize",
+                "params": {
+                    "protocolVersion": MCP_LEGACY_PROTOCOL,
+                    "capabilities": {},
+                    "clientInfo": {"name": "UE58-Modern-MCP-Bridge", "version": "1.0.2"}
+                }
+            }
+            init_headers = {
+                "Accept": "application/json, text/event-stream",
+                "Content-Type": "application/json"
+            }
+            init_status, init_response_headers, _, init_raw, init_result, _ = await mcp_post_and_read(
+                client, target, init_headers, init_payload, json_body=init_payload)
+            if init_status != 200 or not isinstance(init_result, dict) or init_result.get("error") or not isinstance(init_result.get("result"), dict):
+                raise RuntimeError("Fresh Unreal MCP initialize failed (HTTP %s): %s" % (
+                    init_status, init_raw.decode("utf-8", errors="replace")[:900]))
+
+            session_id = init_response_headers.get("mcp-session-id", "")
+            notify_headers = {
+                "Accept": "application/json, text/event-stream",
+                "Content-Type": "application/json",
+                "MCP-Protocol-Version": MCP_LEGACY_PROTOCOL
+            }
+            if session_id:
+                notify_headers["Mcp-Session-Id"] = session_id
+            notify_response = await client.post(
+                target, headers=notify_headers, json={"jsonrpc": "2.0", "method": "notifications/initialized"})
+            if notify_response.status_code not in (200, 202, 204):
+                raise RuntimeError("Fresh Unreal MCP initialized notification failed (HTTP %s): %s" % (
+                    notify_response.status_code, notify_response.text[:700]))
+
+            request_headers = dict(base_headers or {})
+            for header_name in ("content-length", "content-encoding", "transfer-encoding", "mcp-session-id", "mcp-method", "mcp-name"):
+                request_headers.pop(header_name, None)
+            request_headers["accept"] = "application/json, text/event-stream"
+            request_headers["content-type"] = "application/json"
+            request_headers["mcp-protocol-version"] = MCP_LEGACY_PROTOCOL
+            if session_id:
+                request_headers["mcp-session-id"] = session_id
+
+            status, response_headers, raw_headers, raw, parsed, was_sse = await mcp_post_and_read(
+                client, target, request_headers, request_obj, content=request_body)
+            log("Modern MCP bridge request=%s internal_initialize=200 session=%s upstream_status=%s sse=%s" % (
+                request_obj.get("method", "unknown"), bool(session_id), status, was_sse))
+            return status, response_headers, raw_headers, raw, parsed, was_sse
+
+
         def _mcp_decode_header_value(value):
             value = str(value or "")
             if value.startswith("=?base64?") and value.endswith("?="):
@@ -4971,19 +5029,16 @@ jobs:
                 mcp_timeout = httpx.Timeout(connect=10.0, read=90.0, write=30.0, pool=10.0)
                 async with httpx.AsyncClient(timeout=mcp_timeout, trust_env=False) as client:
                     upstream_body = bytes(body)
-                    if modern_mode:
-                        internal_session = await _ensure_legacy_unreal_mcp_session(client, target)
-                        if internal_session:
-                            forwarded["mcp-session-id"] = internal_session
                     # tools/list: stop at the matching SSE event rather than waiting for EOF.
+                    # Modern/stateless clients get a fresh private Unreal legacy session per request.
                     if method == "tools/list" and scope.get("method", "POST").upper() == "POST":
-                        status, response_headers, raw_headers, raw, parsed, was_sse = await mcp_post_and_read(
-                            client, target, forwarded, request_obj, content=upstream_body)
-                        if modern_mode and status == 404:
-                            await _reset_legacy_unreal_mcp_session()
-                            internal_session = await _ensure_legacy_unreal_mcp_session(client, target)
-                            if internal_session:
-                                forwarded["mcp-session-id"] = internal_session
+                        if modern_mode:
+                            status, response_headers, raw_headers, raw, parsed, was_sse = await _mcp_post_modern_via_fresh_legacy_session(
+                                client, target, forwarded, request_obj, upstream_body)
+                            if status == 404:
+                                status, response_headers, raw_headers, raw, parsed, was_sse = await _mcp_post_modern_via_fresh_legacy_session(
+                                    client, target, forwarded, request_obj, upstream_body)
+                        else:
                             status, response_headers, raw_headers, raw, parsed, was_sse = await mcp_post_and_read(
                                 client, target, forwarded, request_obj, content=upstream_body)
                         native_session = response_headers.get("mcp-session-id", "")
@@ -5019,15 +5074,11 @@ jobs:
                         return
 
                     if modern_mode:
-                        status, response_headers_obj, raw_headers, raw, parsed, was_sse = await mcp_post_and_read(
-                            client, target, forwarded, request_obj, content=upstream_body)
+                        status, response_headers_obj, raw_headers, raw, parsed, was_sse = await _mcp_post_modern_via_fresh_legacy_session(
+                            client, target, forwarded, request_obj, upstream_body)
                         if method == "tools/call" and status == 404:
-                            await _reset_legacy_unreal_mcp_session()
-                            internal_session = await _ensure_legacy_unreal_mcp_session(client, target)
-                            if internal_session:
-                                forwarded["mcp-session-id"] = internal_session
-                            status, response_headers_obj, raw_headers, raw, parsed, was_sse = await mcp_post_and_read(
-                                client, target, forwarded, request_obj, content=upstream_body)
+                            status, response_headers_obj, raw_headers, raw, parsed, was_sse = await _mcp_post_modern_via_fresh_legacy_session(
+                                client, target, forwarded, request_obj, upstream_body)
                         response_headers = _mcp_downstream_headers(raw_headers, modern_mode=True)
                         if isinstance(parsed, dict):
                             _normalize_modern_mcp_result(parsed, method)
@@ -5113,13 +5164,14 @@ jobs:
         async def public_app(scope, receive, send):
             if scope.get("type") == "http":
                 request_path = scope.get("path", "/") or "/"
-                # Canonical endpoint is /mcp. Also accept the domain root as a safe
-                # compatibility alias in case a client setup form drops the path.
-                # /health and /monitor remain routed to the Flask REST application.
-                if request_path in ("", "/") or request_path == "/mcp" or request_path.startswith("/mcp/"):
+                canonical_request_path = request_path.rstrip("/") or "/"
+                # Canonical endpoint is exactly /mcp (no trailing slash). Both /mcp
+                # and /mcp/ are accepted without redirect so POST bodies are preserved.
+                # Root is a compatibility alias; /health and /monitor stay on Flask.
+                if canonical_request_path in ("/", "/mcp"):
                     mcp_scope = dict(scope)
-                    if request_path.startswith("/mcp"):
-                        remainder = request_path[len("/mcp"): ]
+                    if canonical_request_path == "/mcp":
+                        remainder = "/"
                     else:
                         remainder = "/"
                     mcp_scope["path"] = remainder or "/"
@@ -5542,9 +5594,9 @@ jobs:
 
         Write-Host 'REST endpoints: GET /health; authenticated read-only monitor at GET /monitor; authenticated file, Drive, GitHub Release, project and unified logs endpoints.'
         Write-Host "MCP_ENDPOINT=$mcpEndpoint"
-        Write-Host "MCP_ENDPOINT_COPY=$mcpEndpoint"
+        Write-Host "MCP_ENDPOINT_COPY=$($mcpEndpoint.TrimEnd('/'))"
         Write-Host "MCP_CONNECTOR_AUTH=No authentication"
-        Write-Host 'IMPORTANT: In ChatGPT Connection, paste the current MCP_ENDPOINT_COPY exactly. Keep /mcp; remove any trailing slash. Do not reuse a trycloudflare.com URL from an older workflow run.'
+        Write-Host 'IMPORTANT: Paste MCP_ENDPOINT_COPY exactly in ChatGPT Connection: HTTPS host plus /mcp, with NO trailing slash. Never reuse a URL from an older workflow run.'
         Write-Host 'Single MCP endpoint only: /mcp -> native Unreal AllToolsets plus monitor, binary-upload and guarded GitHub Release tools. No second MCP URL.'
         Write-Host 'Bridge startup: Python StartupScripts plus -ExecCmds py fallback; duplicate initialization is guarded. No -ExecutePythonScript is used.'
         Write-Host 'Binary transfer: unreal_upload_binary_file accepts files up to 8 MiB per MCP call; place larger files under D:\UE58\Uploads through the authenticated API before publishing them.'
