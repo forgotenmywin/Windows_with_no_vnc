@@ -2458,58 +2458,199 @@ jobs:
                     options.set_editor_property(property_name, property_value)
                 except Exception:
                     pass
-            raw_result = unreal.GLTFExporter.export_to_gltf(world, output_path, options, set())
-            # UE's Python wrapper has exposed this call as either a bool/tuple or an
-            # optional GLTFExportMessages struct depending on engine build. Do not treat
-            # a successful None/empty message return as export failure; validate the
-            # resulting GLB file and its actual mesh nodes below instead.
-            export_messages = None
-            if isinstance(raw_result, tuple):
-                if raw_result and isinstance(raw_result[0], bool) and not raw_result[0]:
-                    raise RuntimeError("Unreal GLTFExporter returned failure: " + str(raw_result))
-                export_messages = raw_result[-1] if len(raw_result) > 1 else None
-            elif isinstance(raw_result, bool):
-                if not raw_result:
-                    raise RuntimeError("Unreal GLTFExporter returned false")
-            else:
-                export_messages = raw_result
-            export_errors = getattr(export_messages, "errors", None) if export_messages is not None else None
-            if export_errors:
-                raise RuntimeError("Unreal GLTFExporter errors: " + "; ".join(str(item) for item in export_errors)[:1600])
-            if not os.path.isfile(output_path) or os.path.getsize(output_path) < 32:
-                raise RuntimeError("GLTFExporter reported success but no valid GLB file was created")
-            import struct
-            with open(output_path, "rb") as stream:
-                header = stream.read(12)
-                if len(header) != 12:
-                    raise RuntimeError("Exported GLB header is incomplete")
-                magic, glb_version, total_length = struct.unpack("<4sII", header)
-                if magic != b"glTF" or glb_version != 2 or total_length > os.path.getsize(output_path):
-                    raise RuntimeError("Exported file is not a valid glTF 2.0 binary container")
-                document = None
-                offset = 12
-                while offset + 8 <= total_length:
-                    chunk_header = stream.read(8)
-                    if len(chunk_header) != 8:
-                        break
-                    chunk_length, chunk_type = struct.unpack("<II", chunk_header)
-                    chunk_data = stream.read(chunk_length)
-                    if len(chunk_data) != chunk_length:
-                        raise RuntimeError("GLB contains a truncated data chunk")
-                    if chunk_type == 0x4E4F534A:
-                        document = json.loads(chunk_data.decode("utf-8").rstrip(" \t\r\n\x00"))
-                    offset += 8 + chunk_length
-            if not isinstance(document, dict):
-                raise RuntimeError("GLB has no JSON scene description")
-            mesh_count = len(document.get("meshes", []))
-            mesh_node_rows = [node for node in document.get("nodes", []) if "mesh" in node]
-            mesh_nodes = len(mesh_node_rows)
+            # Explicitly collect renderable actor components from the active editor level.
+            # Passing a populated SelectedActors set avoids ambiguity between the editor world
+            # and the level actor list in some UE 5.8 Python builds.
+            try:
+                actor_subsystem = unreal.get_editor_subsystem(unreal.EditorActorSubsystem)
+                level_actors = list(actor_subsystem.get_all_level_actors() or [])
+            except Exception as actor_subsystem_error:
+                print("EditorActorSubsystem unavailable; using EditorLevelLibrary: " + str(actor_subsystem_error))
+                level_actors = list(unreal.EditorLevelLibrary.get_all_level_actors() or [])
+
+            mesh_actor_list = []
+            static_component_count = 0
+            skeletal_component_count = 0
+            skipped_hidden_component_count = 0
+            for actor in level_actors:
+                if actor is None:
+                    continue
+                actor_has_mesh = False
+                try:
+                    static_components = actor.get_components_by_class(unreal.StaticMeshComponent)
+                except Exception:
+                    static_components = []
+                for component in static_components or []:
+                    if component is None:
+                        continue
+                    try:
+                        mesh_asset = component.get_editor_property("static_mesh")
+                    except Exception:
+                        mesh_asset = None
+                    if mesh_asset is None:
+                        continue
+                    try:
+                        component_visible = bool(component.get_editor_property("visible"))
+                    except Exception:
+                        component_visible = True
+                    if not component_visible:
+                        skipped_hidden_component_count += 1
+                        continue
+                    static_component_count += 1
+                    actor_has_mesh = True
+
+                try:
+                    skeletal_components = actor.get_components_by_class(unreal.SkeletalMeshComponent)
+                except Exception:
+                    skeletal_components = []
+                for component in skeletal_components or []:
+                    if component is None:
+                        continue
+                    try:
+                        mesh_asset = component.get_editor_property("skeletal_mesh")
+                    except Exception:
+                        mesh_asset = None
+                    if mesh_asset is None:
+                        continue
+                    try:
+                        component_visible = bool(component.get_editor_property("visible"))
+                    except Exception:
+                        component_visible = True
+                    if not component_visible:
+                        skipped_hidden_component_count += 1
+                        continue
+                    skeletal_component_count += 1
+                    actor_has_mesh = True
+
+                if actor_has_mesh:
+                    mesh_actor_list.append(actor)
+
+            if not mesh_actor_list:
+                raise RuntimeError(
+                    "No visible mesh components were found in the active level. "
+                    "Actor count=%d, static mesh components=%d, skeletal mesh components=%d."
+                    % (len(level_actors), static_component_count, skeletal_component_count)
+                )
+
+            try:
+                export_actor_set = set(mesh_actor_list)
+            except Exception as selection_error:
+                raise RuntimeError("Could not build Unreal SelectedActors set: " + str(selection_error))
+
+            def _read_glb_json(file_name):
+                import struct
+                if not os.path.isfile(file_name) or os.path.getsize(file_name) < 32:
+                    raise RuntimeError("GLTFExporter did not create a valid GLB: " + str(file_name))
+                with open(file_name, "rb") as stream:
+                    header = stream.read(12)
+                    if len(header) != 12:
+                        raise RuntimeError("Exported GLB header is incomplete")
+                    magic, glb_version, total_length = struct.unpack("<4sII", header)
+                    file_size = os.path.getsize(file_name)
+                    if magic != b"glTF" or glb_version != 2 or total_length > file_size:
+                        raise RuntimeError("Exported file is not a valid glTF 2.0 binary container")
+                    document = None
+                    offset = 12
+                    while offset + 8 <= total_length:
+                        chunk_header = stream.read(8)
+                        if len(chunk_header) != 8:
+                            break
+                        chunk_length, chunk_type = struct.unpack("<II", chunk_header)
+                        chunk_data = stream.read(chunk_length)
+                        if len(chunk_data) != chunk_length:
+                            raise RuntimeError("GLB contains a truncated data chunk")
+                        if chunk_type == 0x4E4F534A:
+                            document = json.loads(chunk_data.decode("utf-8").rstrip(" \t\r\n\x00"))
+                        offset += 8 + chunk_length
+                if not isinstance(document, dict):
+                    raise RuntimeError("GLB has no JSON scene description")
+                return document
+
+            def _run_gltf_export(target_path, selected_set):
+                raw = unreal.GLTFExporter.export_to_gltf(world, target_path, options, selected_set)
+                messages = None
+                if isinstance(raw, tuple):
+                    if raw and isinstance(raw[0], bool) and not raw[0]:
+                        raise RuntimeError("Unreal GLTFExporter returned failure: " + str(raw))
+                    messages = raw[-1] if len(raw) > 1 else None
+                elif isinstance(raw, bool):
+                    if not raw:
+                        raise RuntimeError("Unreal GLTFExporter returned false")
+                else:
+                    messages = raw
+                errors = getattr(messages, "errors", None) if messages is not None else None
+                if errors:
+                    raise RuntimeError("Unreal GLTFExporter errors: " + "; ".join(str(item) for item in errors)[:1600])
+                return _read_glb_json(target_path)
+
+            report.update({
+                "scene_actor_count": len(level_actors),
+                "selected_mesh_actor_count": len(mesh_actor_list),
+                "static_mesh_components": static_component_count,
+                "skeletal_mesh_components": skeletal_component_count,
+                "skipped_hidden_components": skipped_hidden_component_count,
+            })
+            print("[UE58 GLB] level_actors=%d mesh_actors=%d static_components=%d skeletal_components=%d" % (
+                len(level_actors), len(mesh_actor_list), static_component_count, skeletal_component_count
+            ))
+
+            primary_export_error = ""
+            try:
+                document = _run_gltf_export(output_path, export_actor_set)
+                mesh_count = len(document.get("meshes", []))
+                mesh_node_rows = [node for node in document.get("nodes", []) if "mesh" in node]
+            except Exception as primary_error:
+                primary_export_error = str(primary_error)[:900]
+                try:
+                    if os.path.isfile(output_path):
+                        os.remove(output_path)
+                except Exception:
+                    pass
+                document = {}
+                mesh_count = 0
+                mesh_node_rows = []
+
+            report["export_mode"] = "selected_mesh_actors"
+            report["primary_export_error"] = primary_export_error
+            # Some UE builds accept the populated actor set but still produce an empty scene.
+            # Retry with the documented all-actors mode before reporting a failure.
+            if mesh_count < 1 or not mesh_node_rows:
+                fallback_path = output_path + ".all_actors.glb"
+                try:
+                    if os.path.isfile(fallback_path):
+                        os.remove(fallback_path)
+                    fallback_document = _run_gltf_export(fallback_path, set())
+                    fallback_meshes = len(fallback_document.get("meshes", []))
+                    fallback_nodes = [node for node in fallback_document.get("nodes", []) if "mesh" in node]
+                    if fallback_meshes > 0 and fallback_nodes:
+                        os.replace(fallback_path, output_path)
+                        document = fallback_document
+                        mesh_count = fallback_meshes
+                        mesh_node_rows = fallback_nodes
+                        report["export_mode"] = "all_actors_fallback"
+                    else:
+                        os.remove(fallback_path)
+                except Exception as fallback_error:
+                    try:
+                        if os.path.isfile(fallback_path):
+                            os.remove(fallback_path)
+                    except Exception:
+                        pass
+                    report["fallback_error"] = str(fallback_error)[:900]
+
             mesh_node_names = [str(node.get("name") or ("Mesh node " + str(index + 1)))[:180]
                                for index, node in enumerate(mesh_node_rows[:500])]
-            if mesh_count < 1 or mesh_nodes < 1:
-                raise RuntimeError("Unreal exported a GLB without any mesh nodes. Check the active level for visible StaticMeshComponent or SkeletalMeshComponent actors.")
+            if mesh_count < 1 or not mesh_node_rows:
+                raise RuntimeError(
+                    "GLTFExporter created a GLB without mesh nodes after both export modes. "
+                    "Level actors=%d, mesh actors=%d, static components=%d, skeletal components=%d. "
+                    "Primary=%s; Fallback=%s"
+                    % (len(level_actors), len(mesh_actor_list), static_component_count,
+                       skeletal_component_count, report.get("primary_export_error", "none"),
+                       report.get("fallback_error", "no fallback error"))
+                )
             report.update({"ok": True, "size": os.path.getsize(output_path),
-                           "mesh_count": mesh_count, "mesh_nodes": mesh_nodes,
+                           "mesh_count": mesh_count, "mesh_nodes": len(mesh_node_rows),
                            "mesh_node_names": mesh_node_names, "error": ""})
         except Exception as exc:
             report["error"] = str(exc)[:1800]
@@ -2543,7 +2684,12 @@ jobs:
                     SCENE_MODEL_STATE.update({"status": "ready", "job_id": job_id,
                                               "path": str(temp_path), "version": int(SCENE_MODEL_STATE.get("version", 0)) + 1,
                                               "updated": time.time(), "size": size,
-                                              "mesh_node_names": report.get("mesh_node_names", []), "error": ""})
+                                              "mesh_node_names": report.get("mesh_node_names", []),
+                                              "mesh_count": report.get("mesh_count", 0),
+                                              "selected_mesh_actor_count": report.get("selected_mesh_actor_count", 0),
+                                              "static_mesh_components": report.get("static_mesh_components", 0),
+                                              "skeletal_mesh_components": report.get("skeletal_mesh_components", 0),
+                                              "error": ""})
                 if previous and previous != str(temp_path):
                     try:
                         Path(previous).unlink(missing_ok=True)
