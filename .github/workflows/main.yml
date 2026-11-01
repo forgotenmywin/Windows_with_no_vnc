@@ -1187,10 +1187,10 @@ jobs:
         <button id="uploadBtn">Save latest screenshot to Release</button></div><div id="uploadStatus" class="small muted" style="margin-top:8px"></div></section></div>
         <section><div class="row" style="justify-content:space-between"><h2>Tool Activity</h2><span class="muted small">refresh every 5 sec</span></div><div id="events"><div class="muted">Waiting for MCP tool calls…</div></div></section>
         <section id="scenePanel" style="grid-column:1/-1"><div class="row" style="justify-content:space-between"><h2>Actual 3D Scene Viewer</h2><span class="pill" id="sceneStatus">Waiting for scene data</span></div>
-        <div class="small muted">Shows the real meshes exported from the active Unreal level, including supported materials, textures and transforms — not placeholder boxes. One finger / left mouse drag: orbit · two-finger drag: pan · pinch or wheel: zoom. This is a read-only viewer and does not move objects in Unreal.</div>
-        <div class="scene-model-status" id="sceneModelStatus">Waiting to export actual scene geometry from Unreal…</div>
-        <div class="scene-toolbar" aria-label="3D camera controls"><button id="sceneFitAll" class="primary" type="button">Frame actual model</button><button id="sceneZoomIn" type="button">Zoom +</button><button id="sceneZoomOut" type="button">Zoom −</button><button id="sceneViewIso" type="button">Isometric</button><button id="sceneViewTop" type="button">Top</button><button id="sceneViewFront" type="button">Front</button><button id="sceneViewSide" type="button">Side</button><button id="sceneViewBack" type="button">Back</button><button id="sceneRefresh" type="button">Refresh scene data</button><button id="sceneModelRefresh" class="primary" type="button">Reload real geometry</button></div>
-        <div class="scene-layout"><div id="scene3d"><div id="sceneFallback">Exporting the actual Unreal model. The 3D object will appear here when the GLB export finishes.</div>
+        <div class="small muted">Offline snapshot viewer: press Capture offline scene snapshot once to scan and export the active Unreal level's actual geometry. After capture, the browser keeps a read-only copy for orbit, pan, zoom and object identification; no edits are sent back to Unreal. Refreshing actor metadata does not recapture geometry.</div>
+        <div class="scene-model-status" id="sceneModelStatus">No offline snapshot yet · press Capture offline scene snapshot</div>
+        <div class="scene-toolbar" aria-label="3D camera controls"><button id="sceneFitAll" class="primary" type="button">Frame actual model</button><button id="sceneZoomIn" type="button">Zoom +</button><button id="sceneZoomOut" type="button">Zoom −</button><button id="sceneViewIso" type="button">Isometric</button><button id="sceneViewTop" type="button">Top</button><button id="sceneViewFront" type="button">Front</button><button id="sceneViewSide" type="button">Side</button><button id="sceneViewBack" type="button">Back</button><button id="sceneRefresh" type="button">Scan Unreal objects</button><button id="sceneModelRefresh" class="primary" type="button">Capture offline scene snapshot</button></div>
+        <div class="scene-layout"><div id="scene3d"><div id="sceneFallback">No offline geometry snapshot yet. Press “Capture offline scene snapshot” to export the current Unreal level.</div>
         <aside id="sceneExplorer" class="scene-explorer" aria-label="Unreal object and camera explorer">
           <div class="scene-explorer-head"><div><b>WORLD OUTLINER</b><div class="actor-meta" id="sceneExplorerCount">Loading actors…</div></div><button id="sceneExplorerToggle" type="button" aria-expanded="true">Hide</button></div>
           <div id="sceneExplorerBody"><input id="sceneSearch" class="scene-search" type="search" placeholder="Search object, mesh, camera…" autocomplete="off">
@@ -1473,7 +1473,7 @@ jobs:
             const half = new THREE.Vector3(Math.max(1,Math.abs(numberOr(extent.x,25))),
                                            Math.max(1,Math.abs(numberOr(extent.z,25))),
                                            Math.max(1,Math.abs(numberOr(extent.y,25))));
-            const center = new THREE.Vector3(px,pz,py);
+            const center = new THREE.Vector3(px,pz,-py);
             bounds.expandByPoint(center.clone().sub(half));
             bounds.expandByPoint(center.clone().add(half));
           }
@@ -1592,14 +1592,14 @@ jobs:
         function actorBounds(actor){
           const p=actor?.bounds_origin||actor?.location,e=actor?.bounds_extent;
           if(!p||!e)return null;
-          const center=new THREE.Vector3(numberOr(p.x)*0.01,numberOr(p.z)*0.01,numberOr(p.y)*0.01);
+          const center=new THREE.Vector3(numberOr(p.x)*0.01,numberOr(p.z)*0.01,-numberOr(p.y)*0.01);
           const half=new THREE.Vector3(Math.max(.01,Math.abs(numberOr(e.x,25))*.01),Math.max(.01,Math.abs(numberOr(e.z,25))*.01),Math.max(.01,Math.abs(numberOr(e.y,25))*.01));
           return new THREE.Box3(center.clone().sub(half),center.clone().add(half));
         }
         function frameActor(actor){const bounds=actorBounds(actor);if(bounds&&focusBounds(bounds)){document.getElementById('sceneFallback').hidden=true;return true;}return false;}
         function selectMeshEntry(entry, actorOverride=null, shouldFrame=true){
           if(!entry?.object)return;
-          selectedObject=entry.object;selectedActor=actorOverride||matchActorForMesh(entry);
+          selectedObject=entry.object;selectedActor=actorOverride||entry.actor||matchActorForMesh(entry);
           clearSelectionBox();selectedBox=new THREE.BoxHelper(selectedObject,0x38bdf8);selectedBox.renderOrder=999;
           if(selectedBox.material){selectedBox.material.depthTest=false;selectedBox.material.transparent=true;selectedBox.material.opacity=1;}
           scene.add(selectedBox);
@@ -1635,7 +1635,7 @@ jobs:
             let best=null,bestDistance=Infinity;
             for(const candidate of selectableMeshes){
               const c=new THREE.Box3().setFromObject(candidate.object,true).getCenter(new THREE.Vector3());
-              const d=c.distanceTo(new THREE.Vector3(numberOr(actorCenter.x)*.01,numberOr(actorCenter.z)*.01,numberOr(actorCenter.y)*.01));
+              const d=c.distanceTo(new THREE.Vector3(numberOr(actorCenter.x)*.01,numberOr(actorCenter.z)*.01,-numberOr(actorCenter.y)*.01));
               if(d<bestDistance){bestDistance=d;best=candidate;}
             }
             if(best && bestDistance<Math.max(3,Math.abs(numberOr(actor.bounds_extent?.x,100))*.04)) entry=best;
@@ -1655,7 +1655,7 @@ jobs:
           const p=cam.location,r=cam.rotation||actor.rotation||{};
           const pitch=THREE.MathUtils.degToRad(numberOr(r.pitch)),yaw=THREE.MathUtils.degToRad(numberOr(r.yaw));
           // Convert Unreal centimeters / Z-up coordinates to the GLB viewer's meter / Y-up space.
-          const position=new THREE.Vector3(numberOr(p.x)*.01,numberOr(p.z)*.01,numberOr(p.y)*.01);
+          const position=new THREE.Vector3(numberOr(p.x)*.01,numberOr(p.z)*.01,-numberOr(p.y)*.01);
           const forward=new THREE.Vector3(Math.cos(pitch)*Math.cos(yaw),Math.sin(pitch),Math.cos(pitch)*Math.sin(yaw)).normalize();
           const distance=Math.max(2,Math.abs(numberOr(actor.bounds_extent?.x,100))*.05);
           camera.position.copy(position);target.copy(position).add(forward.multiplyScalar(distance));
@@ -1672,7 +1672,7 @@ jobs:
           const hit=hits.find(item=>item.object?.isMesh);
           if(!hit)return;
           const entry=selectableMeshes.find(item=>item.object===hit.object);
-          if(entry)selectMeshEntry(entry);
+          if(entry)selectMeshEntry(entry,entry.actor||null);
         }
         function renderMeshNodes(){
           const list=document.getElementById('meshNodeList');
@@ -1704,51 +1704,62 @@ jobs:
           document.getElementById('sceneExplorerCount').textContent=actors.length+' actors · '+selectableMeshes.length+' GLB meshes';
         }
 
-        async function loadActualModel(version, forceFrame=false){
+        async function loadActualModel(version, forceFrame=false, modelFiles=[], snapshotJob=''){
           const status=document.getElementById('sceneModelStatus');
-          status.textContent='Loading actual Unreal geometry and materials…';
+          status.textContent='Loading offline Unreal geometry and materials…';
           try{
             const loader=new GLTFLoader();
-            const gltf=await loader.loadAsync('/api/scene/model.glb?v='+encodeURIComponent(version));
             clearGroup();
             clearSelectionBox();selectedObject=null;selectedActor=null;selectableMeshes=[];
-            group.add(gltf.scene);
-            gltf.scene.updateMatrixWorld(true);
             let meshCount=0, vertexCount=0;
-            gltf.scene.traverse(object=>{
-              if(object.isMesh){
-                meshCount++;
-                const path=[];let parent=object;
-                while(parent&&parent!==gltf.scene){if(parent.name)path.unshift(parent.name);parent=parent.parent;}
-                selectableMeshes.push({object,name:object.name||('Mesh '+meshCount),path:path.join(' / ')});
-                object.frustumCulled=false;
-                if(object.geometry){
-                  if(!object.geometry.boundingBox) object.geometry.computeBoundingBox();
-                  if(!object.geometry.boundingSphere) object.geometry.computeBoundingSphere();
-                  if(object.geometry.attributes?.position) vertexCount+=object.geometry.attributes.position.count;
+            const sources=Array.isArray(modelFiles)&&modelFiles.length ? modelFiles : [{url:'/api/scene/model.glb',actor_label:'Full Unreal scene',object_name:'',file:'scene_model.glb'}];
+            for(const source of sources){
+              const gltf=await loader.loadAsync((source.url||('/api/scene/model/file/'+encodeURIComponent(snapshotJob)+'/'+encodeURIComponent(source.file)))+'?v='+encodeURIComponent(version));
+              if(source.transform){
+                const tr=source.transform,loc=tr.location||{},rot=tr.rotation||{},sc=tr.scale||{};
+                gltf.scene.position.set(numberOr(loc.x)*0.01,numberOr(loc.z)*0.01,-numberOr(loc.y)*0.01);
+                // UE's X-forward/Y-right/Z-up basis to glTF's right-handed Y-up basis.
+                const basis=new THREE.Quaternion(-Math.SQRT1_2,0,0,Math.SQRT1_2);
+                const ueRotation=new THREE.Quaternion(numberOr(rot.x),numberOr(rot.y),numberOr(rot.z),numberOr(rot.w,1));
+                gltf.scene.quaternion.copy(basis.clone().multiply(ueRotation).multiply(basis.clone().invert()));
+                gltf.scene.scale.set(numberOr(sc.x,1),numberOr(sc.z,1),numberOr(sc.y,1));
+              }
+              group.add(gltf.scene);
+              gltf.scene.updateMatrixWorld(true);
+              const ownerActor=actors.find(a=>a.object_name===source.object_name || a.name===source.actor_label) || null;
+              gltf.scene.traverse(object=>{
+                if(object.isMesh){
+                  meshCount++;
+                  const path=[];let parent=object;
+                  while(parent&&parent!==gltf.scene){if(parent.name)path.unshift(parent.name);parent=parent.parent;}
+                  const componentPath=source.component_name ? source.component_name+(path.length?' / '+path.join(' / '):'') : path.join(' / ');
+                  selectableMeshes.push({object,name:source.actor_label||object.name||('Mesh '+meshCount),path:componentPath,actor:ownerActor});
+                  object.frustumCulled=false;
+                  if(object.geometry){
+                    if(!object.geometry.boundingBox) object.geometry.computeBoundingBox();
+                    if(!object.geometry.boundingSphere) object.geometry.computeBoundingSphere();
+                    if(object.geometry.attributes?.position) vertexCount+=object.geometry.attributes.position.count;
+                  }
+                  if(object.material){
+                    const mats=Array.isArray(object.material)?object.material:[object.material];
+                    mats.forEach(m=>{if(m.map)m.map.colorSpace=THREE.SRGBColorSpace;m.side=THREE.DoubleSide;m.needsUpdate=true;});
+                  }
                 }
-              }
-              if(object.isMesh && object.material){
-                const mats=Array.isArray(object.material)?object.material:[object.material];
-                mats.forEach(m=>{
-                  if(m.map) m.map.colorSpace=THREE.SRGBColorSpace;
-                  m.side=THREE.DoubleSide;
-                  m.needsUpdate=true;
-                });
-              }
-            });
-            if(meshCount===0 || vertexCount===0) throw new Error('The GLB contains no renderable mesh data. The active Unreal level may be empty.');
-            modelBounds=new THREE.Box3().setFromObject(gltf.scene, true);
+              });
+            }
+            if(meshCount===0 || vertexCount===0) throw new Error('The offline snapshot contains no renderable mesh data.');
+            group.updateMatrixWorld(true);
+            modelBounds=new THREE.Box3().setFromObject(group, true);
             const modelSize=modelBounds.getSize(new THREE.Vector3());
             if(modelBounds.isEmpty() || !Number.isFinite(modelSize.length()) || modelSize.length()<0.000001)
-              throw new Error('The exported mesh has invalid or zero-size bounds; cannot frame it.');
+              throw new Error('The exported meshes have invalid or zero-size bounds; cannot frame them.');
             worldBounds=modelBounds.clone();
             loadedModelVersion=Number(version);
             renderMeshNodes();renderList();
             cameraHasBeenFramed=false;
             fitAll();
-            status.textContent='Actual Unreal model loaded · '+meshCount+' meshes · '+vertexCount.toLocaleString()+' vertices · GLB '+(Number(document.getElementById('sceneModelStatus').dataset.bytes||0)/1048576).toFixed(1)+' MB';
-            document.getElementById('sceneStatus').textContent='Real geometry loaded · '+meshCount+' meshes';
+            status.textContent='Offline snapshot loaded · '+meshCount+' meshes · '+vertexCount.toLocaleString()+' vertices · '+(sources.length>1?sources.length+' actor files':'one GLB');
+            document.getElementById('sceneStatus').textContent='Offline geometry loaded · '+meshCount+' meshes';
           }catch(error){
             const fallback=document.getElementById('sceneFallback');
             if(fallback){fallback.hidden=false;fallback.textContent='3D model could not be displayed: '+error.message;}
@@ -1771,10 +1782,10 @@ jobs:
               document.getElementById('sceneModelStatus').dataset.bytes=String(state.size||0);
               const shouldFrame=forceFrameAfterExport;
               forceFrameAfterExport=false;
-              await loadActualModel(state.version,shouldFrame);
+              await loadActualModel(state.version,shouldFrame,state.model_files||[],state.job_id||'');
               if(modelExportPending){ modelExportPending=false; requestSceneModelExport(false); }
             }else if(state.status==='ready'){
-              document.getElementById('sceneModelStatus').textContent='Actual Unreal model is up to date · '+(Number(state.size||0)/1048576).toFixed(1)+' MB';
+              document.getElementById('sceneModelStatus').textContent='Offline snapshot is ready · '+(Number(state.mesh_count||0))+' meshes · '+(Number(state.size||0)/1048576).toFixed(1)+' MB';
               if(modelExportPending){ modelExportPending=false; requestSceneModelExport(false); }
             }else if(state.status==='failed'){
               const message='Model export failed: '+(state.error||'unknown error');
@@ -1782,7 +1793,7 @@ jobs:
               const fallback=document.getElementById('sceneFallback');
               if(fallback){fallback.hidden=false;fallback.textContent=message;}
             }else{
-              document.getElementById('sceneModelStatus').textContent='Waiting for the first actual scene export…';
+              document.getElementById('sceneModelStatus').textContent='No offline snapshot yet · press Capture offline scene snapshot';
             }
           }catch(error){
             modelExportBusy=false;
@@ -1793,7 +1804,7 @@ jobs:
         async function requestSceneModelExport(forceFrame=false){
           if(modelExportBusy){ modelExportPending=true; if(forceFrame) forceFrameAfterExport=true; return; }
           modelExportBusy=true; forceFrameAfterExport=forceFrame;
-          document.getElementById('sceneModelStatus').textContent='Requesting full-fidelity GLB export from Unreal…';
+          document.getElementById('sceneModelStatus').textContent='Capturing a read-only offline snapshot from Unreal…';
           try{
             const response=await fetch('/api/scene/model/export',{method:'POST',cache:'no-store'});
             const payload=await response.json();
@@ -1802,7 +1813,7 @@ jobs:
             modelPollTimer=setTimeout(pollSceneModel,700);
           }catch(error){
             modelExportBusy=false;
-            document.getElementById('sceneModelStatus').textContent='Could not start actual model export: '+error.message;
+            document.getElementById('sceneModelStatus').textContent='Offline snapshot capture could not start: '+error.message;
           }
         }
 
@@ -1813,7 +1824,9 @@ jobs:
           if(signature!==lastSceneSignature){
             renderActors(sceneData.actors);
             lastSceneSignature=signature;
-            requestSceneModelExport(!cameraHasBeenFramed);
+            if(loadedModelVersion>=0){
+              document.getElementById('sceneModelStatus').textContent='Unreal object list changed · displayed geometry is the previous offline snapshot. Capture again to update it.';
+            }
           }else{
             actors=Array.isArray(sceneData.actors)?sceneData.actors:actors;
             renderList();
@@ -1891,7 +1904,9 @@ jobs:
           init(); bindControls();
           window.refreshSceneSnapshot=()=>refreshSceneSnapshot(true);
           refreshSceneSnapshot();
-          setInterval(()=>{if(activeSceneJob)pollSceneJob();else refreshSceneSnapshot(false);},4000);
+          pollSceneModel();
+          // Deliberately no periodic Unreal scene scan or re-export: this page is an offline snapshot viewer.
+          // Metadata can be refreshed manually; geometry is recaptured only with the explicit button.
         }catch(error){
           document.getElementById('sceneFallback').textContent='3D viewer failed to load: '+error.message+' (check access to jsdelivr.net)';
         }
@@ -2022,8 +2037,8 @@ jobs:
         SCENE_LOCK = threading.RLock()
         # Full-fidelity read-only scene export. The GLB is produced by Unreal's official GLTFExporter plugin.
         SCENE_MODEL_LOCK = threading.RLock()
-        SCENE_MODEL_STATE = {"status": "idle", "job_id": "", "path": "", "version": 0,
-                             "updated": 0.0, "size": 0, "mesh_node_names": [], "error": ""}
+        SCENE_MODEL_STATE = {"status": "idle", "job_id": "", "path": "", "job_dir": "", "model_files": [], "version": 0,
+                             "updated": 0.0, "size": 0, "mesh_node_names": [], "mesh_count": 0, "error": ""}
         SCENE_MODEL_DIR = (ROOT / "Screenshots").resolve()
         SCENE_MODEL_DIR.mkdir(parents=True, exist_ok=True)
         SCENE_JOBS = {}
@@ -2426,7 +2441,9 @@ jobs:
 
         def _scene_model_export_worker(job_id):
             """Export the active Unreal world to a real, textured GLB without modifying the level."""
-            temp_path = (SCENE_MODEL_DIR / ("scene_model_" + job_id + ".glb")).resolve()
+            job_dir = (SCENE_MODEL_DIR / ("offline_scene_" + job_id)).resolve()
+            job_dir.mkdir(parents=True, exist_ok=True)
+            temp_path = (job_dir / "scene_model.glb").resolve()
             try:
                 if not bridge_connected():
                     raise RuntimeError("Unreal Python Bridge is offline")
@@ -2566,8 +2583,9 @@ jobs:
                     raise RuntimeError("GLB has no JSON scene description")
                 return document
 
-            def _run_gltf_export(target_path, selected_set):
-                raw = unreal.GLTFExporter.export_to_gltf(world, target_path, options, selected_set)
+            def _run_gltf_export(target_path, selected_set, export_object=None):
+                export_target = export_object if export_object is not None else world
+                raw = unreal.GLTFExporter.export_to_gltf(export_target, target_path, options, selected_set)
                 messages = None
                 if isinstance(raw, tuple):
                     if raw and isinstance(raw[0], bool) and not raw[0]:
@@ -2638,18 +2656,131 @@ jobs:
                         pass
                     report["fallback_error"] = str(fallback_error)[:900]
 
+            per_actor_files = []
+            # Last-resort export path: export one selected actor at a time. This avoids
+            # Unreal 5.8 builds which accept the whole-world export call but silently
+            # write a scene with zero mesh nodes for a multi-actor level.
+            if mesh_count < 1 or not mesh_node_rows:
+                try:
+                    if os.path.isfile(output_path):
+                        os.remove(output_path)
+                except Exception:
+                    pass
+                for actor_index, actor in enumerate(mesh_actor_list):
+                    actor_file = os.path.join(os.path.dirname(output_path), "actor_%04d.glb" % actor_index)
+                    try:
+                        if os.path.isfile(actor_file):
+                            os.remove(actor_file)
+                        actor_doc = _run_gltf_export(actor_file, {actor})
+                        actor_meshes = len(actor_doc.get("meshes", []))
+                        actor_nodes = [node for node in actor_doc.get("nodes", []) if "mesh" in node]
+                        if actor_meshes < 1 or not actor_nodes:
+                            raise RuntimeError("actor export contained no mesh nodes")
+                        try:
+                            actor_label = str(actor.get_actor_label() or actor.get_name())
+                        except Exception:
+                            actor_label = str(actor.get_name())
+                        per_actor_files.append({
+                            "file": os.path.basename(actor_file),
+                            "actor_label": actor_label[:180],
+                            "object_name": str(actor.get_name())[:180],
+                            "mesh_count": actor_meshes,
+                            "node_names": [str(node.get("name") or ("Mesh node " + str(i + 1)))[:180]
+                                           for i, node in enumerate(actor_nodes[:100])]
+                        })
+                    except Exception as actor_error:
+                        # Asset-level fallback: export each actual StaticMesh asset directly,
+                        # then preserve the component's world transform as viewer metadata.
+                        # This is still real Unreal mesh data; no placeholder geometry is made.
+                        asset_exports = 0
+                        try:
+                            components = actor.get_components_by_class(unreal.StaticMeshComponent) or []
+                        except Exception:
+                            components = []
+                        for component_index, component in enumerate(components):
+                            asset_file = ""
+                            try:
+                                mesh_asset = component.get_editor_property("static_mesh")
+                                if mesh_asset is None:
+                                    continue
+                                try:
+                                    visible = bool(component.get_editor_property("visible"))
+                                except Exception:
+                                    visible = True
+                                if not visible:
+                                    continue
+                                asset_file = os.path.join(os.path.dirname(output_path),
+                                                          "asset_%04d_%03d.glb" % (actor_index, component_index))
+                                if os.path.isfile(asset_file):
+                                    os.remove(asset_file)
+                                asset_doc = _run_gltf_export(asset_file, set(), mesh_asset)
+                                asset_meshes = len(asset_doc.get("meshes", []))
+                                asset_nodes = [node for node in asset_doc.get("nodes", []) if "mesh" in node]
+                                if asset_meshes < 1 or not asset_nodes:
+                                    raise RuntimeError("mesh asset export contained no mesh nodes")
+                                world_transform = component.get_world_transform()
+                                translation = world_transform.translation
+                                rotation = world_transform.rotation
+                                scale3d = world_transform.scale3d
+                                transform_payload = {
+                                    "location": {"x": float(translation.x), "y": float(translation.y), "z": float(translation.z)},
+                                    "rotation": {"x": float(rotation.x), "y": float(rotation.y),
+                                                 "z": float(rotation.z), "w": float(rotation.w)},
+                                    "scale": {"x": float(scale3d.x), "y": float(scale3d.y), "z": float(scale3d.z)}
+                                }
+                                try:
+                                    actor_label = str(actor.get_actor_label() or actor.get_name())
+                                except Exception:
+                                    actor_label = str(actor.get_name())
+                                per_actor_files.append({
+                                    "file": os.path.basename(asset_file),
+                                    "actor_label": actor_label[:180],
+                                    "object_name": str(actor.get_name())[:180],
+                                    "component_name": str(component.get_name())[:180],
+                                    "asset_path": str(mesh_asset.get_path_name())[:300],
+                                    "transform": transform_payload,
+                                    "mesh_count": asset_meshes,
+                                    "node_names": [str(node.get("name") or ("Mesh node " + str(i + 1)))[:180]
+                                                   for i, node in enumerate(asset_nodes[:100])]
+                                })
+                                asset_exports += 1
+                            except Exception as asset_error:
+                                report.setdefault("asset_fallback_errors", []).append(
+                                    str(actor.get_name()) + "/" + str(component.get_name()) + ": " + str(asset_error)[:300])
+                                try:
+                                    if asset_file and os.path.isfile(asset_file):
+                                        os.remove(asset_file)
+                                except Exception:
+                                    pass
+                        if asset_exports < 1:
+                            report.setdefault("per_actor_errors", []).append(
+                                str(actor.get_name()) + ": " + str(actor_error)[:350])
+                        try:
+                            if os.path.isfile(actor_file):
+                                os.remove(actor_file)
+                        except Exception:
+                            pass
+                if per_actor_files:
+                    report["export_mode"] = "one_world_export_per_mesh_actor"
+                    report["mesh_files"] = per_actor_files
+                    mesh_count = sum(int(row.get("mesh_count", 0)) for row in per_actor_files)
+                    mesh_node_rows = [{"name": row.get("actor_label", "Mesh")} for row in per_actor_files]
+                else:
+                    raise RuntimeError(
+                        "GLTFExporter created no renderable meshes in whole-level, all-actor, or per-actor export. "
+                        "Level actors=%d, mesh actors=%d, static components=%d, skeletal components=%d. "
+                        "Primary=%s; Fallback=%s; PerActor=%s"
+                        % (len(level_actors), len(mesh_actor_list), static_component_count,
+                           skeletal_component_count, report.get("primary_export_error", "none"),
+                           report.get("fallback_error", "no fallback error"),
+                           "; ".join(report.get("per_actor_errors", [])[:8]))
+                    )
+
             mesh_node_names = [str(node.get("name") or ("Mesh node " + str(index + 1)))[:180]
                                for index, node in enumerate(mesh_node_rows[:500])]
-            if mesh_count < 1 or not mesh_node_rows:
-                raise RuntimeError(
-                    "GLTFExporter created a GLB without mesh nodes after both export modes. "
-                    "Level actors=%d, mesh actors=%d, static components=%d, skeletal components=%d. "
-                    "Primary=%s; Fallback=%s"
-                    % (len(level_actors), len(mesh_actor_list), static_component_count,
-                       skeletal_component_count, report.get("primary_export_error", "none"),
-                       report.get("fallback_error", "no fallback error"))
-                )
-            report.update({"ok": True, "size": os.path.getsize(output_path),
+            size_bytes = (sum(os.path.getsize(os.path.join(os.path.dirname(output_path), row["file"]))
+                              for row in per_actor_files) if per_actor_files else os.path.getsize(output_path))
+            report.update({"ok": True, "size": size_bytes,
                            "mesh_count": mesh_count, "mesh_nodes": len(mesh_node_rows),
                            "mesh_node_names": mesh_node_names, "error": ""})
         except Exception as exc:
@@ -2673,30 +2804,47 @@ jobs:
                 report = json.loads(line.split(marker, 1)[1])
                 if not report.get("ok"):
                     raise RuntimeError(report.get("error") or "Unreal GLB export failed")
-                if not temp_path.is_file() or temp_path.stat().st_size < 32:
-                    raise RuntimeError("The exported GLB file is missing or empty")
-                with temp_path.open("rb") as stream:
-                    if stream.read(4) != b"glTF":
-                        raise RuntimeError("The exported file is not a valid binary glTF (GLB)")
-                size = temp_path.stat().st_size
+                model_files = report.get("mesh_files", []) or []
+                if model_files:
+                    for item in model_files:
+                        file_path = (job_dir / str(item.get("file", ""))).resolve()
+                        if file_path.parent != job_dir or not file_path.is_file() or file_path.stat().st_size < 32:
+                            raise RuntimeError("Per-actor GLB file is missing or invalid: " + str(item.get("file")))
+                        with file_path.open("rb") as stream:
+                            if stream.read(4) != b"glTF":
+                                raise RuntimeError("Per-actor export is not a binary GLB: " + str(item.get("file")))
+                    size = sum((job_dir / item["file"]).stat().st_size for item in model_files)
+                    stored_path = ""
+                else:
+                    if not temp_path.is_file() or temp_path.stat().st_size < 32:
+                        raise RuntimeError("The exported GLB file is missing or empty")
+                    with temp_path.open("rb") as stream:
+                        if stream.read(4) != b"glTF":
+                            raise RuntimeError("The exported file is not a valid binary glTF (GLB)")
+                    size = temp_path.stat().st_size
+                    stored_path = str(temp_path)
                 with SCENE_MODEL_LOCK:
-                    previous = SCENE_MODEL_STATE.get("path", "")
+                    previous_dir = SCENE_MODEL_STATE.get("job_dir", "")
                     SCENE_MODEL_STATE.update({"status": "ready", "job_id": job_id,
-                                              "path": str(temp_path), "version": int(SCENE_MODEL_STATE.get("version", 0)) + 1,
+                                              "path": stored_path, "job_dir": str(job_dir),
+                                              "model_files": model_files,
+                                              "version": int(SCENE_MODEL_STATE.get("version", 0)) + 1,
                                               "updated": time.time(), "size": size,
                                               "mesh_node_names": report.get("mesh_node_names", []),
                                               "mesh_count": report.get("mesh_count", 0),
                                               "selected_mesh_actor_count": report.get("selected_mesh_actor_count", 0),
                                               "static_mesh_components": report.get("static_mesh_components", 0),
                                               "skeletal_mesh_components": report.get("skeletal_mesh_components", 0),
+                                              "export_mode": report.get("export_mode", "whole_level"),
                                               "error": ""})
-                if previous and previous != str(temp_path):
+                if previous_dir and previous_dir != str(job_dir):
                     try:
-                        Path(previous).unlink(missing_ok=True)
+                        shutil.rmtree(previous_dir, ignore_errors=True)
                     except Exception:
                         pass
-                log("Actual scene geometry exported: job=%s size=%s bytes meshes=%s nodes=%s" % (
-                    job_id, size, report.get("mesh_count", 0), report.get("mesh_nodes", 0)))
+                log("Offline scene snapshot exported: job=%s size=%s bytes meshes=%s nodes=%s mode=%s" % (
+                    job_id, size, report.get("mesh_count", 0), report.get("mesh_nodes", 0),
+                    report.get("export_mode", "whole_level")))
             except Exception as exc:
                 temp_path.unlink(missing_ok=True)
                 with SCENE_MODEL_LOCK:
@@ -2726,9 +2874,32 @@ jobs:
             with SCENE_MODEL_LOCK:
                 state = dict(SCENE_MODEL_STATE)
             state.pop("path", None)
-            state["model_url"] = "/api/scene/model.glb" if state.get("status") == "ready" else ""
+            state["model_url"] = "/api/scene/model.glb" if state.get("status") == "ready" and state.get("path") else ""
+            state["model_files"] = [dict(item, url="/api/scene/model/file/%s/%s" %
+                                          (state.get("job_id", ""), item.get("file", "")))
+                                    for item in (state.get("model_files", []) or [])]
+            state.pop("job_dir", None)
+            state["offline_snapshot"] = True
             state["ok"] = state.get("status") != "failed"
             return jsonify(state)
+
+
+        @app.get("/api/scene/model/file/<job_id>/<filename>")
+        @monitor_auth
+        def api_scene_model_file(job_id, filename):
+            with SCENE_MODEL_LOCK:
+                current_job = SCENE_MODEL_STATE.get("job_id", "")
+                job_dir = SCENE_MODEL_STATE.get("job_dir", "")
+                allowed = {str(item.get("file", "")) for item in (SCENE_MODEL_STATE.get("model_files", []) or [])}
+            if job_id != current_job or filename not in allowed or not job_dir:
+                return jsonify(ok=False, error="offline_scene_mesh_not_found"), 404
+            target = (Path(job_dir).resolve() / filename).resolve()
+            if target.parent != Path(job_dir).resolve() or not target.is_file() or not _inside_root(target):
+                return jsonify(ok=False, error="offline_scene_mesh_not_found"), 404
+            response = send_file(target, mimetype="model/gltf-binary", conditional=False, max_age=0)
+            response.headers["Cache-Control"] = "no-store, max-age=0"
+            response.headers["X-Scene-Model-Version"] = str(SCENE_MODEL_STATE.get("version", 0))
+            return response
 
 
         @app.get("/api/scene/model.glb")
