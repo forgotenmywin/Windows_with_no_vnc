@@ -10,51 +10,74 @@ jobs:
     steps:
     - name: Prepare D drive
       shell: pwsh
-      run: '$ErrorActionPreference = ''Stop''
-
-        $root = ''D:\UE58''
-
-        New-Item -ItemType Directory -Force -Path $root, "$root\parts", "$root\Logs", "$root\Projects", "$root\Screenshots",
-        "$root\Uploads" | Out-Null
-
+      run: |
+        $ErrorActionPreference = 'Stop'
+        $root = 'D:\UE58'
+        New-Item -ItemType Directory -Force -Path $root, "$root\parts", "$root\Logs", "$root\Projects", "$root\Screenshots", "$root\Uploads" | Out-Null
         try { Start-Transcript -Path "$root\Logs\workflow-prepare-transcript.log" -Append -Force | Out-Null } catch { }
-
         $drive = Get-PSDrive D -ErrorAction SilentlyContinue
-
-        if (-not $drive) { throw ''Drive D is not available on this runner.'' }
-
+        if (-not $drive) { throw 'Drive D is not available on this runner.' }
         Write-Host ("D: available space: {0:N2} GB" -f ($drive.Free / 1GB))
-
         "UE_ROOT=$root" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-
-        '
     - name: Download and extract Unreal Engine 5.8
       shell: pwsh
       env:
         GH_TOKEN: ${{ github.token }}
-      run: "$ErrorActionPreference = 'Stop'\n$root = 'D:\\UE58'\ntry { Start-Transcript -Path \"$root\\Logs\\workflow-extract-transcript.log\"\
-        \ -Append -Force | Out-Null } catch { }\n$partsDir = \"$root\\parts\"\n$archive = \"$root\\UE_5.8.zip\"\n$extract\
-        \ = \"$root\\Extracted\"\n\ngh release download ue5.8 --repo forgotenmywin/Windows_with_no_vnc --pattern 'UE_5.8.zip.*'\
-        \ --dir $partsDir --clobber\nif ($LASTEXITCODE -ne 0) { throw 'Could not download release assets UE_5.8.zip.*.' }\n\
-        \n$parts = @(Get-ChildItem -LiteralPath $partsDir -File | Where-Object { $_.Name -like 'UE_5.8.zip.*' } | Sort-Object\
-        \ Name)\nif ($parts.Count -lt 2) { throw \"Expected split ZIP parts; found $($parts.Count). Check release tag/assets.\"\
-        \ }\n\nif (Test-Path -LiteralPath $archive) { Remove-Item -LiteralPath $archive -Force }\n$destination = [System.IO.File]::Open($archive,\
-        \ [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)\ntry {\n  $buffer =\
-        \ New-Object byte[] (4MB)\n  foreach ($part in $parts) {\n    Write-Host (\"Joining {0} ({1:N2} GB)\" -f $part.Name,\
-        \ ($part.Length / 1GB))\n    $source = [System.IO.File]::OpenRead($part.FullName)\n    try {\n      while (($read\
-        \ = $source.Read($buffer, 0, $buffer.Length)) -gt 0) {\n        $destination.Write($buffer, 0, $read)\n      }\n \
-        \   }\n    finally { $source.Dispose() }\n  }\n}\nfinally { $destination.Dispose() }\n\n$sevenZip = (Get-Command 7z.exe\
-        \ -ErrorAction SilentlyContinue).Source\nif (-not $sevenZip) {\n  $sevenZip = @('C:\\Program Files\\7-Zip\\7z.exe','C:\\\
-        Program Files (x86)\\7-Zip\\7z.exe') | Where-Object { Test-Path $_ } | Select-Object -First 1\n}\nif (-not $sevenZip)\
-        \ {\n  choco install 7zip -y --no-progress\n  if ($LASTEXITCODE -ne 0) { throw '7-Zip installation failed.' }\n  $sevenZip\
-        \ = 'C:\\Program Files\\7-Zip\\7z.exe'\n}\nif (-not (Test-Path -LiteralPath $sevenZip)) { throw '7z.exe was not found.'\
-        \ }\n\n& $sevenZip t $archive\nif ($LASTEXITCODE -ne 0) { throw 'Joined ZIP failed integrity testing.' }\nif (Test-Path\
-        \ -LiteralPath $extract) { Remove-Item -LiteralPath $extract -Recurse -Force }\nNew-Item -ItemType Directory -Force\
-        \ -Path $extract | Out-Null\n& $sevenZip x $archive \"-o$extract\" -y\nif ($LASTEXITCODE -ne 0) { throw 'Unreal Engine\
-        \ extraction failed.' }\n\n$editor = Get-ChildItem -LiteralPath $extract -Filter UnrealEditor.exe -File -Recurse -ErrorAction\
-        \ SilentlyContinue |\n  Where-Object { $_.FullName -match '\\\\Engine\\\\Binaries\\\\Win64\\\\UnrealEditor\\.exe$'\
-        \ } |\n  Select-Object -First 1\nif (-not $editor) { throw 'UnrealEditor.exe was not found.' }\nWrite-Host \"EDITOR_EXE=$($editor.FullName)\"\
-        \n\"UE_EDITOR_EXE=$($editor.FullName)\" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8\n"
+      run: |
+        $ErrorActionPreference = 'Stop'
+        $root = 'D:\UE58'
+        try { Start-Transcript -Path "$root\Logs\workflow-extract-transcript.log" -Append -Force | Out-Null } catch { }
+        $partsDir = "$root\parts"
+        $archive = "$root\UE_5.8.zip"
+        $extract = "$root\Extracted"
+
+        gh release download ue5.8 --repo forgotenmywin/Windows_with_no_vnc --pattern 'UE_5.8.zip.*' --dir $partsDir --clobber
+        if ($LASTEXITCODE -ne 0) { throw 'Could not download release assets UE_5.8.zip.*.' }
+
+        $parts = @(Get-ChildItem -LiteralPath $partsDir -File | Where-Object { $_.Name -like 'UE_5.8.zip.*' } | Sort-Object Name)
+        if ($parts.Count -lt 2) { throw "Expected split ZIP parts; found $($parts.Count). Check release tag/assets." }
+
+        if (Test-Path -LiteralPath $archive) { Remove-Item -LiteralPath $archive -Force }
+        $destination = [System.IO.File]::Open($archive, [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
+        try {
+          $buffer = New-Object byte[] (4MB)
+          foreach ($part in $parts) {
+            Write-Host ("Joining {0} ({1:N2} GB)" -f $part.Name, ($part.Length / 1GB))
+            $source = [System.IO.File]::OpenRead($part.FullName)
+            try {
+              while (($read = $source.Read($buffer, 0, $buffer.Length)) -gt 0) {
+                $destination.Write($buffer, 0, $read)
+              }
+            }
+            finally { $source.Dispose() }
+          }
+        }
+        finally { $destination.Dispose() }
+
+        $sevenZip = (Get-Command 7z.exe -ErrorAction SilentlyContinue).Source
+        if (-not $sevenZip) {
+          $sevenZip = @('C:\Program Files\7-Zip\7z.exe','C:\Program Files (x86)\7-Zip\7z.exe') | Where-Object { Test-Path $_ } | Select-Object -First 1
+        }
+        if (-not $sevenZip) {
+          choco install 7zip -y --no-progress
+          if ($LASTEXITCODE -ne 0) { throw '7-Zip installation failed.' }
+          $sevenZip = 'C:\Program Files\7-Zip\7z.exe'
+        }
+        if (-not (Test-Path -LiteralPath $sevenZip)) { throw '7z.exe was not found.' }
+
+        & $sevenZip t $archive
+        if ($LASTEXITCODE -ne 0) { throw 'Joined ZIP failed integrity testing.' }
+        if (Test-Path -LiteralPath $extract) { Remove-Item -LiteralPath $extract -Recurse -Force }
+        New-Item -ItemType Directory -Force -Path $extract | Out-Null
+        & $sevenZip x $archive "-o$extract" -y
+        if ($LASTEXITCODE -ne 0) { throw 'Unreal Engine extraction failed.' }
+
+        $editor = Get-ChildItem -LiteralPath $extract -Filter UnrealEditor.exe -File -Recurse -ErrorAction SilentlyContinue |
+          Where-Object { $_.FullName -match '\\Engine\\Binaries\\Win64\\UnrealEditor\.exe$' } |
+          Select-Object -First 1
+        if (-not $editor) { throw 'UnrealEditor.exe was not found.' }
+        Write-Host "EDITOR_EXE=$($editor.FullName)"
+        "UE_EDITOR_EXE=$($editor.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
     - name: Set up Python
       uses: actions/setup-python@v5
       with:
@@ -2190,18 +2213,21 @@ jobs:
         \        translated_params = dict(params) if isinstance(params, dict) else {}\n        translated_params.pop(\"_meta\"\
         , None)\n        translated[\"params\"] = translated_params\n        request_obj = translated\n        params = translated_params\n\
         \        body = bytearray(json.dumps(request_obj, ensure_ascii=False, separators=(\",\", \":\")).encode(\"utf-8\"\
-        ))\n        forwarded.pop(\"mcp-method\", None)\n        forwarded.pop(\"mcp-name\", None)\n        for header_name\
-        \ in list(forwarded):\n            if header_name.startswith(\"mcp-param-\"):\n                forwarded.pop(header_name,\
-        \ None)\n        forwarded[\"accept\"] = \"application/json, text/event-stream\"\n        forwarded[\"content-type\"\
-        ] = \"application/json\"\n        forwarded[\"mcp-protocol-version\"] = MCP_LEGACY_PROTOCOL\n\n    incoming_session\
-        \ = next((value.decode(\"latin1\") for key, value in scope.get(\"headers\", []) if key.lower() == b\"mcp-session-id\"\
-        ), \"\")\n    if not modern_mode and not incoming_session and method not in (\"initialize\", \"ping\"):\n        #\
-        \ Some MCP clients intermittently omit the session header on later calls.\n        # Reuse the most recently established\
-        \ native session for this single-tenant\n        # tunnel; the native server still validates the session id itself.\n\
-        \        with MCP_SESSION_LOCK:\n            active_sessions = sorted(MCP_NATIVE_SESSIONS.items(), key=lambda item:\
-        \ item[1].get(\"seen\", 0), reverse=True)\n            fallback = active_sessions[0] if active_sessions and (time.time()\
-        \ - active_sessions[0][1].get(\"seen\", 0) < 3600) else None\n        if fallback:\n            incoming_session =\
-        \ fallback[0]\n            forwarded[\"mcp-session-id\"] = incoming_session\n            with MCP_SESSION_LOCK:\n\
+        ))\n        # The modern request body has changed after removing _meta. Never forward\n        # the original client's\
+        \ Content-Length/encoding framing to Unreal: doing\n        # so makes HTTPX wait for bytes that will never arrive\
+        \ and returns 502.\n        forwarded.pop(\"content-length\", None)\n        forwarded.pop(\"content-encoding\", None)\n\
+        \        forwarded.pop(\"transfer-encoding\", None)\n        forwarded.pop(\"mcp-method\", None)\n        forwarded.pop(\"\
+        mcp-name\", None)\n        for header_name in list(forwarded):\n            if header_name.startswith(\"mcp-param-\"\
+        ):\n                forwarded.pop(header_name, None)\n        forwarded[\"accept\"] = \"application/json, text/event-stream\"\
+        \n        forwarded[\"content-type\"] = \"application/json\"\n        forwarded[\"mcp-protocol-version\"] = MCP_LEGACY_PROTOCOL\n\
+        \n    incoming_session = next((value.decode(\"latin1\") for key, value in scope.get(\"headers\", []) if key.lower()\
+        \ == b\"mcp-session-id\"), \"\")\n    if not modern_mode and not incoming_session and method not in (\"initialize\"\
+        , \"ping\"):\n        # Some MCP clients intermittently omit the session header on later calls.\n        # Reuse the\
+        \ most recently established native session for this single-tenant\n        # tunnel; the native server still validates\
+        \ the session id itself.\n        with MCP_SESSION_LOCK:\n            active_sessions = sorted(MCP_NATIVE_SESSIONS.items(),\
+        \ key=lambda item: item[1].get(\"seen\", 0), reverse=True)\n            fallback = active_sessions[0] if active_sessions\
+        \ and (time.time() - active_sessions[0][1].get(\"seen\", 0) < 3600) else None\n        if fallback:\n            incoming_session\
+        \ = fallback[0]\n            forwarded[\"mcp-session-id\"] = incoming_session\n            with MCP_SESSION_LOCK:\n\
         \                MCP_NATIVE_SESSIONS[incoming_session] = {\"seen\": time.time()}\n            with MONITOR_LOCK:\n\
         \                MCP_CONNECTION[\"session_fallback_count\"] += 1\n            log(\"MCP session header missing; using\
         \ most-recent active session fallback\")\n    elif incoming_session:\n        with MCP_SESSION_LOCK:\n           \
@@ -2389,20 +2415,13 @@ jobs:
         \ utf8\nWrite-Host 'Created UE project, bridge, and API server.'\n"
     - name: Validate generated Python scripts
       shell: pwsh
-      run: '$ErrorActionPreference = ''Stop''
-
-        try { Start-Transcript -Path ''D:\UE58\Logs\workflow-validation-transcript.log'' -Append -Force | Out-Null } catch
-        { }
-
+      run: |
+        $ErrorActionPreference = 'Stop'
+        try { Start-Transcript -Path 'D:\UE58\Logs\workflow-validation-transcript.log' -Append -Force | Out-Null } catch { }
         $python = (Get-Command python).Source
-
-        & $python -m py_compile ''D:\UE58\api_server.py'' ''D:\UE58\UEControl\Content\Python\init_unreal.py''
-
-        if ($LASTEXITCODE -ne 0) { throw ''Generated Python scripts failed syntax validation.'' }
-
-        Write-Host ''PYTHON_SYNTAX_VALIDATION=true''
-
-        '
+        & $python -m py_compile 'D:\UE58\api_server.py' 'D:\UE58\UEControl\Content\Python\init_unreal.py'
+        if ($LASTEXITCODE -ne 0) { throw 'Generated Python scripts failed syntax validation.' }
+        Write-Host 'PYTHON_SYNTAX_VALIDATION=true'
     - name: Launch API, Unreal and Cloudflare tunnel
       shell: pwsh
       env:
@@ -2410,327 +2429,596 @@ jobs:
         GITHUB_TOKEN: ${{ github.token }}
         GITHUB_REPOSITORY: ${{ github.repository }}
         MONITOR_PASSWORD: ${{ secrets.MONITOR_PASSWORD }}
-      run: "$ErrorActionPreference = 'Stop'\n$root = 'D:\\UE58'\ntry { Start-Transcript -Path \"$root\\Logs\\workflow-runtime-transcript.log\"\
-        \ -Append -Force | Out-Null } catch { }\n$env:UE_ROOT = $root\n$env:UE_PYTHONPATH = \"$root\\UEControl\\Content\\\
-        Python\"\nif ([string]::IsNullOrWhiteSpace($env:MONITOR_PASSWORD) -or $env:MONITOR_PASSWORD.Length -lt 16) {\n  throw\
-        \ 'Create repository Actions secret MONITOR_PASSWORD with a strong password of at least 16 characters before running\
-        \ this workflow.'\n}\nif ([string]::IsNullOrWhiteSpace($env:GG_UE_TOKEN)) {\n  Write-Warning 'GG_UE_TOKEN is empty;\
-        \ Google Drive endpoints will fail until authorized_user.json or service-account JSON is saved as this Actions secret.'\n\
-        }\n\n# The bridge token is only for local API <-> Unreal communication.\n$env:BRIDGE_TOKEN = [guid]::NewGuid().ToString('N')\
-        \ + [guid]::NewGuid().ToString('N')\n$python = (Get-Command python).Source\n& $python -m pip install --disable-pip-version-check\
-        \ --upgrade Flask google-api-python-client google-auth google-auth-httplib2 requests urllib3 httpx Pillow psutil \"\
-        mcp>=2,<3\" uvicorn starlette\nif ($LASTEXITCODE -ne 0) { throw 'Python package installation failed.' }\n\n$apiOut\
-        \ = \"$root\\Logs\\api-stdout.log\"\n$apiErr = \"$root\\Logs\\api-stderr.log\"\n$apiProc = Start-Process -FilePath\
-        \ $python -ArgumentList @(\"$root\\api_server.py\") -WorkingDirectory $root -PassThru -WindowStyle Hidden -RedirectStandardOutput\
-        \ $apiOut -RedirectStandardError $apiErr\nWrite-Host \"API_PID=$($apiProc.Id)\"\n\n$localReady = $false\nfor ($i =\
-        \ 0; $i -lt 45; $i++) {\n  Start-Sleep -Seconds 2\n  try {\n    $health = Invoke-RestMethod -Uri 'http://127.0.0.1:8765/health'\
-        \ -TimeoutSec 4\n    if ($health.ok) { $localReady = $true; break }\n  } catch { }\n  if ($apiProc.HasExited) { break\
-        \ }\n}\nif (-not $localReady) {\n  if (Test-Path $apiErr) { Get-Content $apiErr -Tail 100 }\n  if (Test-Path $apiOut)\
-        \ { Get-Content $apiOut -Tail 100 }\n  throw 'Local API did not start.'\n}\nWrite-Host 'API_LOCAL_READY=true'\n\n\
-        # API already inherited the Drive and GitHub credentials when it started.\n# Keep only the local bridge token available\
-        \ to the Unreal child process.\n$env:GG_UE_TOKEN = $null\n$env:GITHUB_TOKEN = $null\n$env:GITHUB_REPOSITORY = $null\n\
-        $env:MONITOR_PASSWORD = $null\n\n$editor = $env:UE_EDITOR_EXE\nif ([string]::IsNullOrWhiteSpace($editor) -or -not\
-        \ (Test-Path -LiteralPath $editor)) {\n  throw 'UE_EDITOR_EXE was not found from the extraction step.'\n}\n$engineDir\
-        \ = Split-Path -Parent (Split-Path -Parent (Split-Path -Parent $editor))\n$gltfPlugin = Join-Path $engineDir 'Plugins\\\
-        Enterprise\\GLTFExporter\\GLTFExporter.uplugin'\nif (-not (Test-Path -LiteralPath $gltfPlugin)) { throw \"Unreal GLTFExporter\
-        \ plugin was not found: $gltfPlugin\" }\nWrite-Host 'GLTF_EXPORTER_PLUGIN_FOUND=true'\nWrite-Host \"Unreal Editor\
-        \ found: $editor\"\n$ueOut = \"$root\\Logs\\unreal-stdout.log\"\n$ueErr = \"$root\\Logs\\unreal-stderr.log\"\n$initScript\
-        \ = \"$root\\UEControl\\Content\\Python\\init_unreal.py\"\nif (-not (Test-Path -LiteralPath $initScript)) { throw\
-        \ \"Unreal bridge startup script was not found: $initScript\" }\n# IMPORTANT: do NOT pass -ExecutePythonScript here.\
-        \ Epic documents that\n# the Editor closes after a command-line ExecutePythonScript finishes.\n# Content/Python/init_unreal.py\
-        \ is auto-detected and run by the Editor.\n$ueArgs = @(\"$root\\UEControl\\UEControl.uproject\", '-log', '-stdout',\
-        \ '-FullStdOutLogOutput', '-AllowSoftwareRendering', '-d3d11', '-ModelContextProtocolStartServer', '-ModelContextProtocolPort=8000',\
-        \ '-ExecCmds=\"py D:/UE58/UEControl/Content/Python/init_unreal.py\"')\n$ueProc = Start-Process -FilePath $editor -ArgumentList\
-        \ $ueArgs -WorkingDirectory \"$root\\UEControl\" -PassThru -RedirectStandardOutput $ueOut -RedirectStandardError $ueErr\n\
-        Write-Host \"UNREAL_PID=$($ueProc.Id)\"\n\n$cloudflared = \"$root\\cloudflared.exe\"\nInvoke-WebRequest -Uri 'https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe'\
-        \ -OutFile $cloudflared\n$cfOut = \"$root\\Logs\\cloudflared-stdout.log\"\n$cfErr = \"$root\\Logs\\cloudflared-stderr.log\"\
-        \n$cfProc = Start-Process -FilePath $cloudflared -ArgumentList @('tunnel', '--url', 'http://127.0.0.1:8765', '--no-autoupdate')\
-        \ -WorkingDirectory $root -PassThru -WindowStyle Hidden -RedirectStandardOutput $cfOut -RedirectStandardError $cfErr\n\
-        \n# Extract ONLY the hostname from cloudflared output. Never build request\n# URIs from an untrimmed log line: ANSI\
-        \ escapes/CRLF can make .NET Uri parsing\n# fail with 'Invalid URI: The hostname could not be parsed'.\n$publicUri\
-        \ = $null\n$publicUrl = $null\nfor ($i = 0; $i -lt 90; $i++) {\n  Start-Sleep -Seconds 2\n  $combined = ''\n  foreach\
-        \ ($f in @($cfOut, $cfErr)) {\n    if (Test-Path $f) { try { $combined += \"`n\" + (Get-Content $f -Raw -ErrorAction\
-        \ SilentlyContinue) } catch { } }\n  }\n  $match = [regex]::Match($combined, '(?i)https://(?<host>[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\\\
-        .trycloudflare\\.com)')\n  if ($match.Success) {\n    $tunnelHost = ([string]$match.Groups['host'].Value).Trim().TrimEnd('.').ToLowerInvariant()\n\
-        \    $candidateUri = $null\n    if ([System.Uri]::TryCreate(('https://' + $tunnelHost + '/'), [System.UriKind]::Absolute,\
-        \ [ref]$candidateUri) -and\n        $candidateUri.Scheme -eq 'https' -and $candidateUri.Host -eq $tunnelHost -and\n\
-        \        $candidateUri.Host.EndsWith('.trycloudflare.com')) {\n      $publicUri = $candidateUri\n      $publicUrl\
-        \ = $candidateUri.GetLeftPart([System.UriPartial]::Authority)\n      break\n    }\n    Write-Host (\"Ignoring malformed\
-        \ Quick Tunnel hostname: [{0}]\" -f $tunnelHost)\n  }\n  if ($cfProc.HasExited) { break }\n}\nif (-not $publicUri\
-        \ -or -not $publicUrl) {\n  if (Test-Path $cfErr) { Get-Content $cfErr -Tail 100 }\n  throw 'Cloudflare Quick Tunnel\
-        \ did not provide a valid HTTPS *.trycloudflare.com hostname.'\n}\nWrite-Host \"PUBLIC_API_URL=$publicUrl\"\nWrite-Host\
-        \ (\"PUBLIC_API_URI_VALID=true HOST={0}\" -f $publicUri.DnsSafeHost)\nWrite-Host 'Waiting a maximum of 180 seconds\
-        \ for an authenticated Unreal Python bridge heartbeat...'\n$bridgeReady = $false\n$bridgeTimer = [System.Diagnostics.Stopwatch]::StartNew()\n\
-        $lastBridgeReport = -15\n$lastBridgeProbeError = ''\nwhile ($bridgeTimer.Elapsed.TotalSeconds -lt 180) {\n  if ($ueProc.HasExited)\
-        \ {\n    Write-Warning 'Unreal Editor exited before the Python bridge connected.'\n    break\n  }\n  try {\n    $health\
-        \ = Invoke-RestMethod -Uri 'http://127.0.0.1:8765/health' -TimeoutSec 2\n    if ($health.bridge_connected) {\n   \
-        \   $bridgeReady = $true\n      break\n    }\n    $lastBridgeProbeError = 'API is responding, but no authenticated\
-        \ bridge heartbeat has arrived.'\n  } catch {\n    $lastBridgeProbeError = $_.Exception.Message\n  }\n  if ([int][Math]::Floor($bridgeTimer.Elapsed.TotalSeconds)\
-        \ -ge ($lastBridgeReport + 15)) {\n    $lastBridgeReport = [int][Math]::Floor($bridgeTimer.Elapsed.TotalSeconds)\n\
-        \    Write-Host (\"BRIDGE_WAIT elapsed={0}s editor_exited={1} status={2}\" -f $lastBridgeReport, $ueProc.HasExited,\
-        \ $lastBridgeProbeError)\n  }\n  Start-Sleep -Milliseconds 1000\n}\n$bridgeTimer.Stop()\nif ($bridgeReady) {\n  Write-Host\
-        \ 'BRIDGE_READY=true'\n} else {\n  Write-Host '--- Bridge diagnostics ---'\n  foreach ($diagnosticFile in @(\n   \
-        \ \"$root\\Logs\\unreal_bridge.log\",\n    \"$root\\Logs\\api.log\",\n    $ueOut,\n    $ueErr\n  )) {\n    if ($diagnosticFile\
-        \ -and (Test-Path -LiteralPath $diagnosticFile)) {\n      Write-Host \"--- $diagnosticFile (last 80 lines) ---\"\n\
-        \      Get-Content -LiteralPath $diagnosticFile -Tail 80 -ErrorAction SilentlyContinue\n    }\n  }\n  $projectLog\
-        \ = Get-ChildItem -LiteralPath \"$root\\UEControl\\Saved\\Logs\" -Filter '*.log' -File -ErrorAction SilentlyContinue\
-        \ | Sort-Object LastWriteTime -Descending | Select-Object -First 1\n  if ($projectLog) {\n    Write-Host \"--- $($projectLog.FullName)\
-        \ (last 100 lines) ---\"\n    Get-Content -LiteralPath $projectLog.FullName -Tail 100 -ErrorAction SilentlyContinue\n\
-        \  }\n  if ($ueProc.HasExited) {\n    throw \"BRIDGE_READY=false: Unreal Editor exited with code $($ueProc.ExitCode).\
-        \ Diagnostic logs are printed above.\"\n  }\n  throw \"BRIDGE_READY=false after $([int]$bridgeTimer.Elapsed.TotalSeconds)\
-        \ seconds. The startup script did not establish an authenticated bridge connection. Diagnostic logs are printed above.\"\
-        \n}\n\n# Confirm Epic's native MCP listener is alive before publishing the endpoint.\n# Unreal documents GET /mcp\
-        \ returning HTTP 405 as a valid liveness response.\n$nativeMcpReady = $false\nfor ($i = 0; $i -lt 45; $i++) {\n  try\
-        \ {\n    $probe = Invoke-WebRequest -Uri 'http://127.0.0.1:8000/mcp' -Method Get -TimeoutSec 4 -UseBasicParsing\n\
-        \    if ([int]$probe.StatusCode -eq 405) { $nativeMcpReady = $true; break }\n    Write-Host (\"Native MCP GET probe\
-        \ returned HTTP {0}\" -f [int]$probe.StatusCode)\n  } catch {\n    $status = $null\n    try { $status = [int]$_.Exception.Response.StatusCode\
-        \ } catch { }\n    if ($status -eq 405) { $nativeMcpReady = $true; break }\n    if ($status) { Write-Host (\"Native\
-        \ MCP GET probe returned HTTP {0}\" -f $status) }\n  }\n  if ($ueProc.HasExited) { break }\n  Start-Sleep -Seconds\
-        \ 2\n}\nif ($nativeMcpReady) {\n  Write-Host 'NATIVE_MCP_LISTENER_READY=true (GET /mcp returned expected HTTP 405).'\n\
-        } else {\n  throw 'NATIVE_MCP_LISTENER_READY=false. Do not add the MCP URL in ChatGPT yet; inspect UEControl\\Saved\\\
-        Logs\\UnrealEditor.log and unreal-stdout.log for LogModelContextProtocol errors.'\n}\n\n# End-to-end public MCP test.\
-        \ A local GET/405 only proves the Unreal listener\n# exists; it does NOT prove ChatGPT can reach the public Cloudflare\
-        \ endpoint.\n# First wait for Cloudflare edge propagation and test the public health route.\n$healthUriBuilder = [System.UriBuilder]::new($publicUri)\n\
-        $healthUriBuilder.Path = '/health'\n$healthUriBuilder.Query = ''\n$healthUriBuilder.Fragment = ''\n$publicHealthUri\
-        \ = $healthUriBuilder.Uri\nif (-not $publicHealthUri.IsAbsoluteUri -or $publicHealthUri.Host -ne $publicUri.Host)\
-        \ {\n  throw 'PUBLIC_HEALTH_URI_INVALID: failed to construct a valid public health URI from the Quick Tunnel hostname.'\n\
-        }\n$publicHealthReady = $false\n$publicHealthError = ''\nfor ($i = 0; $i -lt 20; $i++) {\n  try {\n    $publicHealth\
-        \ = Invoke-RestMethod -Uri $publicHealthUri -TimeoutSec 12\n    if ($publicHealth.ok) { $publicHealthReady = $true;\
-        \ break }\n    $publicHealthError = 'Public /health returned ok=false.'\n  } catch {\n    $publicHealthError = $_.Exception.Message\n\
-        \  }\n  if ($cfProc.HasExited) { throw 'Cloudflare tunnel exited during public health test; inspect cloudflared-stderr.log.'\
-        \ }\n  Start-Sleep -Seconds 3\n}\nif (-not $publicHealthReady) {\n  if (Test-Path $cfErr) { Write-Host '--- cloudflared\
-        \ stderr (tail) ---'; Get-Content $cfErr -Tail 60 }\n  throw \"PUBLIC_TUNNEL_HEALTH_FAILED: $publicHealthError. The\
-        \ URL must not be added to ChatGPT until this passes.\"\n}\nWrite-Host 'PUBLIC_TUNNEL_HEALTH_OK=true'\n\n# Verify\
-        \ both the current stateless MCP protocol and legacy 2025 handshake compatibility through the public HTTPS URL.\n\
-        # Public Starlette mount is /mcp/; upstream Unreal listener remains /mcp. No OAuth or bearer token is used.\n# Build\
-        \ the MCP URL from the already validated System.Uri object. This\n# prevents PowerShell/.NET from parsing raw cloudflared\
-        \ console text as a URI.\n$mcpUriBuilder = [System.UriBuilder]::new($publicUri)\n$mcpUriBuilder.Path = '/mcp'\n$mcpUriBuilder.Query\
-        \ = ''\n$mcpUriBuilder.Fragment = ''\n$mcpEndpointUri = $mcpUriBuilder.Uri\nif (-not $mcpEndpointUri.IsAbsoluteUri\
-        \ -or $mcpEndpointUri.Scheme -ne 'https' -or\n    $mcpEndpointUri.Host -ne $publicUri.Host -or $mcpEndpointUri.AbsolutePath\
-        \ -ne '/mcp') {\n  throw 'PUBLIC_MCP_URI_INVALID: failed to construct a valid HTTPS /mcp URI.'\n}\n$mcpEndpoint =\
-        \ $mcpEndpointUri.AbsoluteUri\nWrite-Host (\"PUBLIC_MCP_URI_VALID=true URI={0}\" -f $mcpEndpoint)\n\n# Streamable\
-        \ HTTP GET is optional. This server intentionally does not\n# offer server-initiated streams, so GET returns 405 quickly.\
-        \ POST is\n# the actual initialize/tools/call transport used by MCP clients.\ntry {\n  $getProbe = Invoke-WebRequest\
-        \ -Uri $mcpEndpointUri -Method Get -TimeoutSec 15 -UseBasicParsing\n  throw (\"GET probe unexpectedly returned HTTP\
-        \ {0}; expected 405.\" -f [int]$getProbe.StatusCode)\n} catch {\n  $getStatus = $null\n  try { $getStatus = [int]$_.Exception.Response.StatusCode\
-        \ } catch { }\n  if ($getStatus -ne 405) { throw (\"PUBLIC_MCP_GET_CHECK_FAILED: expected 405, got [{0}]. {1}\" -f\
-        \ $getStatus, $_.Exception.Message) }\n  Write-Host 'PUBLIC_MCP_GET_METHOD_NOT_SUPPORTED_OK=true STATUS=405'\n}\n\
-        $mcpAccept = 'application/json, text/event-stream'\n$initializePayload = @{\n  jsonrpc = '2.0'\n  id = 'ue58-public-connectivity-initialize'\n\
-        \  method = 'initialize'\n  params = @{\n    protocolVersion = '2025-11-25'\n    capabilities = @{}\n    clientInfo\
-        \ = @{ name = 'ue58-workflow-connectivity-check'; version = '1.0.0' }\n  }\n} | ConvertTo-Json -Depth 12 -Compress\n\
-        try {\n  $initializeResponse = Invoke-WebRequest -Uri $mcpEndpointUri -Method Post -Headers @{ Accept = $mcpAccept\
-        \ } -ContentType 'application/json' -Body $initializePayload -TimeoutSec 30 -UseBasicParsing\n  if ([int]$initializeResponse.StatusCode\
-        \ -ne 200) { throw \"MCP initialize returned HTTP $([int]$initializeResponse.StatusCode).\" }\n  $initializeJson =\
-        \ $initializeResponse.Content | ConvertFrom-Json -ErrorAction Stop\n  if ($initializeJson.error) { throw (\"MCP initialize\
-        \ JSON-RPC error: \" + ($initializeJson.error | ConvertTo-Json -Compress -Depth 8)) }\n  if (-not $initializeJson.result\
-        \ -or -not $initializeJson.result.protocolVersion) { throw 'MCP initialize response has no result.protocolVersion.'\
-        \ }\n  $negotiatedProtocol = [string]$initializeJson.result.protocolVersion\n  $mcpSessionId = [string]$initializeResponse.Headers['Mcp-Session-Id']\n\
-        \  Write-Host (\"PUBLIC_MCP_INITIALIZE_OK=true PROTOCOL={0} SESSION_HEADER={1}\" -f $negotiatedProtocol, [bool]$mcpSessionId)\n\
-        \n  # Confirm tools/list works over the same public route and session.\n  $listHeaders = @{ Accept = $mcpAccept; 'MCP-Protocol-Version'\
-        \ = $negotiatedProtocol }\n  if ($mcpSessionId) { $listHeaders['Mcp-Session-Id'] = $mcpSessionId }\n  $listPayload\
-        \ = @{ jsonrpc = '2.0'; id = 'ue58-public-connectivity-tools'; method = 'tools/list'; params = @{} } | ConvertTo-Json\
-        \ -Depth 8 -Compress\n  $toolsResponse = Invoke-WebRequest -Uri $mcpEndpointUri -Method Post -Headers $listHeaders\
-        \ -ContentType 'application/json' -Body $listPayload -TimeoutSec 30 -UseBasicParsing\n  if ([int]$toolsResponse.StatusCode\
-        \ -ne 200) { throw \"MCP tools/list returned HTTP $([int]$toolsResponse.StatusCode).\" }\n  $toolsJson = $toolsResponse.Content\
-        \ | ConvertFrom-Json -ErrorAction Stop\n  if ($toolsJson.error) { throw (\"MCP tools/list JSON-RPC error: \" + ($toolsJson.error\
-        \ | ConvertTo-Json -Compress -Depth 8)) }\n  $toolCount = @($toolsJson.result.tools).Count\n  if ($toolCount -lt 1)\
-        \ { throw 'MCP tools/list returned no tools.' }\n          Write-Host (\"PUBLIC_MCP_LEGACY_TOOLS_LIST_OK=true TOOL_COUNT={0}\"\
-        \ -f $toolCount)\n\n          # Current MCP generation: stateless protocol, server/discover, and\n          # required\
-        \ per-request metadata headers. The API adapter translates\n          # these requests to the legacy protocol exposed\
-        \ by Unreal 5.8.\n          $modernMeta = @{\n            'io.modelcontextprotocol/protocolVersion' = '2026-07-28'\n\
-        \            'io.modelcontextprotocol/clientInfo' = @{ name = 'ue58-workflow-modern-connectivity-check'; version =\
-        \ '1.0.0' }\n            'io.modelcontextprotocol/clientCapabilities' = @{}\n          }\n          $modernBaseHeaders\
-        \ = @{\n            Accept = $mcpAccept\n            'MCP-Protocol-Version' = '2026-07-28'\n          }\n        \
-        \  $discoverPayload = @{\n            jsonrpc = '2.0'; id = 'ue58-modern-discover'; method = 'server/discover';\n\
-        \            params = @{ _meta = $modernMeta }\n          } | ConvertTo-Json -Depth 12 -Compress\n          $discoverHeaders\
-        \ = $modernBaseHeaders.Clone()\n          $discoverHeaders['Mcp-Method'] = 'server/discover'\n          $discoverResponse\
-        \ = Invoke-WebRequest -Uri $mcpEndpointUri -Method Post -Headers $discoverHeaders -ContentType 'application/json'\
-        \ -Body $discoverPayload -TimeoutSec 30 -UseBasicParsing\n          if ([int]$discoverResponse.StatusCode -ne 200)\
-        \ { throw \"Modern MCP server/discover returned HTTP $([int]$discoverResponse.StatusCode).\" }\n          $discoverJson\
-        \ = $discoverResponse.Content | ConvertFrom-Json -ErrorAction Stop\n          if ($discoverJson.error) { throw (\"\
-        Modern MCP discover JSON-RPC error: \" + ($discoverJson.error | ConvertTo-Json -Compress -Depth 8)) }\n          if\
-        \ ($discoverJson.result.resultType -ne 'complete' -or @($discoverJson.result.supportedVersions) -notcontains '2026-07-28'\
-        \ -or -not $discoverJson.result.capabilities.tools) {\n            throw 'Modern MCP server/discover response is missing\
-        \ the required protocol version or tools capability.'\n          }\n          Write-Host 'PUBLIC_MCP_MODERN_DISCOVER_OK=true\
-        \ PROTOCOL=2026-07-28'\n\n          $modernListPayload = @{\n            jsonrpc = '2.0'; id = 'ue58-modern-tools-list';\
-        \ method = 'tools/list';\n            params = @{ _meta = $modernMeta }\n          } | ConvertTo-Json -Depth 12 -Compress\n\
-        \          $modernListHeaders = $modernBaseHeaders.Clone()\n          $modernListHeaders['Mcp-Method'] = 'tools/list'\n\
-        \          $modernToolsResponse = Invoke-WebRequest -Uri $mcpEndpointUri -Method Post -Headers $modernListHeaders\
-        \ -ContentType 'application/json' -Body $modernListPayload -TimeoutSec 45 -UseBasicParsing\n          if ([int]$modernToolsResponse.StatusCode\
-        \ -ne 200) { throw \"Modern MCP tools/list returned HTTP $([int]$modernToolsResponse.StatusCode).\" }\n          $modernToolsJson\
-        \ = $modernToolsResponse.Content | ConvertFrom-Json -ErrorAction Stop\n          if ($modernToolsJson.error) { throw\
-        \ (\"Modern MCP tools/list JSON-RPC error: \" + ($modernToolsJson.error | ConvertTo-Json -Compress -Depth 8)) }\n\
-        \          $modernToolCount = @($modernToolsJson.result.tools).Count\n          if ($modernToolCount -lt 1) { throw\
-        \ 'Modern MCP tools/list returned no tools.' }\n          Write-Host (\"PUBLIC_MCP_MODERN_TOOLS_LIST_OK=true TOOL_COUNT={0}\"\
-        \ -f $modernToolCount)\n\n          # Exercise a harmless read-only modern tools/call, not just discovery.\n     \
-        \     $modernCallPayload = @{\n            jsonrpc = '2.0'; id = 'ue58-modern-safe-tool-call'; method = 'tools/call';\n\
-        \            params = @{ name = 'unreal_monitor_get_state'; arguments = @{ limit = 1 }; _meta = $modernMeta }\n  \
-        \        } | ConvertTo-Json -Depth 12 -Compress\n          $modernCallHeaders = $modernBaseHeaders.Clone()\n     \
-        \     $modernCallHeaders['Mcp-Method'] = 'tools/call'\n          $modernCallHeaders['Mcp-Name'] = 'unreal_monitor_get_state'\n\
-        \          $modernCallResponse = Invoke-WebRequest -Uri $mcpEndpointUri -Method Post -Headers $modernCallHeaders -ContentType\
-        \ 'application/json' -Body $modernCallPayload -TimeoutSec 30 -UseBasicParsing\n          if ([int]$modernCallResponse.StatusCode\
-        \ -ne 200) { throw \"Modern MCP tools/call returned HTTP $([int]$modernCallResponse.StatusCode).\" }\n          $modernCallJson\
-        \ = $modernCallResponse.Content | ConvertFrom-Json -ErrorAction Stop\n          if ($modernCallJson.error -or -not\
-        \ $modernCallJson.result.content) { throw 'Modern MCP safe tools/call did not return a valid tool result.' }\n   \
-        \       Write-Host 'PUBLIC_MCP_MODERN_TOOLS_CALL_OK=true'\n        } catch {\n  $mcpFailure = $_.Exception.Message\n\
-        \  try {\n    $response = $_.Exception.Response\n    if ($response -and $response.GetResponseStream()) {\n      $reader\
-        \ = New-Object System.IO.StreamReader($response.GetResponseStream())\n      $responseBody = $reader.ReadToEnd()\n\
-        \      $reader.Dispose()\n      if ($responseBody) { $mcpFailure += \" | response: \" + $responseBody.Substring(0,\
-        \ [Math]::Min(1500, $responseBody.Length)) }\n    }\n  } catch { }\n  if (Test-Path $cfErr) { Write-Host '--- cloudflared\
-        \ stderr (tail) ---'; Get-Content $cfErr -Tail 40 }\n  throw \"PUBLIC_MCP_HANDSHAKE_FAILED: $mcpFailure. Check API\
-        \ logs and Unreal LogModelContextProtocol before connecting ChatGPT.\"\n}\nWrite-Host 'PUBLIC_MCP_ENDPOINT_READY=true\
-        \ PROTOCOL=2026-07-28 LEGACY_COMPATIBILITY=true'\n\n$internalHeaders = @{ Authorization = \"Bearer $env:BRIDGE_TOKEN\"\
-        \ }\n# Reserve CPU capacity for the runner/API and start the first monitor snapshot.\n# The affinity limit is reversible\
-        \ from the Monitor > System panel.\ntry {\n  $cpuBody = @{ percent = 75 } | ConvertTo-Json -Compress\n  $cpuBalance\
-        \ = Invoke-RestMethod -Uri 'http://127.0.0.1:8765/internal/system/optimize-cpu' -Method Post -Headers $internalHeaders\
-        \ -ContentType 'application/json' -Body $cpuBody -TimeoutSec 15\n  Write-Host (\"UNREAL_CPU_HEADROOM=true CORES={0}/{1}\"\
-        \ -f $cpuBalance.affinity.Count, $cpuBalance.logical_cpus)\n} catch {\n  Write-Warning (\"Could not apply reversible\
-        \ Unreal CPU headroom: \" + $_.Exception.Message)\n}\ntry {\n  $captureKick = Invoke-RestMethod -Uri 'http://127.0.0.1:8765/internal/monitor/initial-capture'\
-        \ -Method Post -Headers $internalHeaders -ContentType 'application/json' -Body '{}' -TimeoutSec 10\n  Write-Host (\"\
-        MONITOR_INITIAL_CAPTURE={0}\" -f $captureKick.status)\n} catch {\n  Write-Warning (\"Initial monitor capture will\
-        \ retry when the monitor page opens: \" + $_.Exception.Message)\n}\n$urlBody = @{ public_url = $publicUrl } | ConvertTo-Json\
-        \ -Compress\n$urlRegistration = Invoke-RestMethod -Uri 'http://127.0.0.1:8765/internal/set-public-url' -Method Post\
-        \ -Headers $internalHeaders -ContentType 'application/json' -Body $urlBody -TimeoutSec 10\nif (-not $urlRegistration.ok)\
-        \ { throw 'Could not register the public monitor URL with the API.' }\n$monitorUrl = \"$publicUrl/monitor\"\nWrite-Host\
-        \ \"MONITOR_URL=$monitorUrl\"\nWrite-Host 'MONITOR_USERNAME=viewer'\nWrite-Host 'MONITOR_PASSWORD is stored only in\
-        \ the repository Actions secret MONITOR_PASSWORD.'\n$summaryText = @\"\n## Unreal Live Monitor\n- [Open read-only\
-        \ monitor]($monitorUrl)\n- **MCP endpoint for ChatGPT (No authentication):** $mcpEndpoint\n- Use the exact MCP endpoint\
-        \ above; do not paste the monitor URL or the bare PUBLIC_API_URL.\n- The Quick Tunnel URL is temporary and works only\
-        \ while this Actions workflow and cloudflared process remain running.\n- Monitor username: viewer\n- Monitor password:\
-        \ repository secret MONITOR_PASSWORD\n- GitHub Release upload: available inside the authenticated monitor; default\
-        \ tag: ue5.8.\n\"@\n$summaryText | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8\n\nWrite-Host\
-        \ 'REST endpoints: GET /health; authenticated read-only monitor at GET /monitor; authenticated file, Drive, GitHub\
-        \ Release, project and unified logs endpoints.'\nWrite-Host \"MCP_ENDPOINT=$mcpEndpoint\"\nWrite-Host \"MCP_CONNECTOR_AUTH=No\
-        \ authentication\"\nWrite-Host 'Copy the exact MCP_ENDPOINT value into ChatGPT (use the HTTPS URL ending exactly in\
-        \ /mcp, without a trailing slash). The domain root is also accepted as a compatibility alias.'\nWrite-Host 'Single\
-        \ MCP endpoint only: /mcp -> native Unreal AllToolsets plus monitor, binary-upload and guarded GitHub Release tools.\
-        \ No second MCP URL.'\nWrite-Host 'Bridge startup: Python StartupScripts plus -ExecCmds py fallback; duplicate initialization\
-        \ is guarded. No -ExecutePythonScript is used.'\nWrite-Host 'Binary transfer: unreal_upload_binary_file accepts files\
-        \ up to 8 MiB per MCP call; place larger files under D:\\UE58\\Uploads through the authenticated API before publishing\
-        \ them.'\nWrite-Host 'Monitor uses 5-second JSON polling and 640x360 JPEG snapshots after MCP tool calls; no VNC,\
-        \ desktop stream, WebSocket, or SSE.'\nWrite-Host 'MCP tool list includes Unreal AllToolsets, live arbitrary Editor\
-        \ Python, console commands, headless UnrealEditor-Cmd Python commandlets (-nullrhi), scene/project/plugin management,\
-        \ save/checkpoint/restore, packaging, Windows metrics, file transfer, GitHub Release and external MCP gateway tools.'\n\
-        Write-Host 'MCP transport: Streamable HTTP over HTTPS; POST carries JSON-RPC. GET returns 405 because server-initiated\
-        \ event streams are not offered; upstream single-message SSE POST replies are normalized to JSON-RPC JSON.'\nWrite-Host\
-        \ 'Monitor includes Logs, full-fidelity Unreal GLB scene viewer (real meshes and supported materials), orbit/pan/pinch/zoom,\
-        \ project switching, plugin ZIP installation/toggles, save/checkpoint/restore, Win64 Shipping packaging, system metrics\
-        \ and remote MCP gateway.'\nWrite-Warning 'SECURITY: the monitor and REST endpoints are password-protected, but /mcp\
-        \ is intentionally unauthenticated for ChatGPT. Anyone who obtains the MCP URL may issue Unreal commands. Do not share\
-        \ the MCP URL; stop the workflow when finished.'\n\n$lastHeartbeat = Get-Date\n$activeProjectFile = \"$root\\UEControl\\\
-        UEControl.uproject\"\n$editorCommandFile = \"$root\\control\\editor-command.json\"\nwhile ($true) {\n  Start-Sleep\
-        \ -Seconds 5\n  if ($apiProc.HasExited) { throw 'API server stopped; inspect D:\\UE58\\Logs\\api-stderr.log.' }\n\
-        \  if ($cfProc.HasExited) { throw 'Cloudflare tunnel stopped; inspect D:\\UE58\\Logs\\cloudflared-stderr.log.' }\n\
-        \n  # Run one queued headless Unreal Python commandlet. The API writes this\n  # request only after validating the\
-        \ project/script paths and, when needed,\n  # saving the live Editor session through its authenticated Python bridge.\n\
-        \  $headlessCommandFile = \"$root\\control\\headless-command.json\"\n  if (Test-Path -LiteralPath $headlessCommandFile)\
-        \ {\n    $headlessCmd = $null\n    $headlessStatusPath = $null\n    try {\n      $headlessCmd = Get-Content -LiteralPath\
-        \ $headlessCommandFile -Raw | ConvertFrom-Json\n      $rootPrefix = [System.IO.Path]::GetFullPath($root) + [System.IO.Path]::DirectorySeparatorChar\n\
-        \      $headlessRoot = [System.IO.Path]::GetFullPath(\"$root\\HeadlessJobs\") + [System.IO.Path]::DirectorySeparatorChar\n\
-        \      $targetProject = [System.IO.Path]::GetFullPath([string]$headlessCmd.project_file)\n      $scriptPath = [System.IO.Path]::GetFullPath([string]$headlessCmd.script_file)\n\
-        \      $headlessStatusPath = [System.IO.Path]::GetFullPath([string]$headlessCmd.status_file)\n      $stdoutPath =\
-        \ [System.IO.Path]::GetFullPath([string]$headlessCmd.stdout_log)\n      $stderrPath = [System.IO.Path]::GetFullPath([string]$headlessCmd.stderr_log)\n\
-        \      if (-not $targetProject.StartsWith($rootPrefix, [System.StringComparison]::OrdinalIgnoreCase) -or -not $targetProject.EndsWith('.uproject',\
-        \ [System.StringComparison]::OrdinalIgnoreCase) -or -not (Test-Path -LiteralPath $targetProject)) { throw 'Headless\
-        \ project path is invalid or outside D:\\UE58.' }\n      foreach ($path in @($scriptPath,$headlessStatusPath,$stdoutPath,$stderrPath))\
-        \ {\n        if (-not $path.StartsWith($headlessRoot, [System.StringComparison]::OrdinalIgnoreCase)) { throw 'Headless\
-        \ job files must stay inside D:\\UE58\\HeadlessJobs.' }\n      }\n      if (-not (Test-Path -LiteralPath $scriptPath))\
-        \ { throw 'Headless Python script was not found.' }\n      $jobDir = Split-Path -Parent $scriptPath\n      $cancelFlag\
-        \ = Join-Path $jobDir 'cancel-requested.flag'\n      $cmdExe = Join-Path (Split-Path -Parent $editor) 'UnrealEditor-Cmd.exe'\n\
-        \      if (-not (Test-Path -LiteralPath $cmdExe)) { throw \"UnrealEditor-Cmd.exe not found beside $editor.\" }\n \
-        \     $timeoutSeconds = [Math]::Max(30, [Math]::Min(7200, [int]$headlessCmd.timeout_seconds))\n      $stoppedEditor\
-        \ = $false\n      $resumeProject = [System.IO.Path]::GetFullPath([string]$headlessCmd.resume_project_file)\n     \
-        \ if ($headlessCmd.stop_editor -eq $true) {\n        if ($ueProc -and -not $ueProc.HasExited) {\n          Write-Host\
-        \ 'HEADLESS: stopping the live Editor after the API saved dirty packages.'\n          Stop-Process -Id $ueProc.Id\
-        \ -Force -ErrorAction SilentlyContinue\n          $ueProc.WaitForExit(20000) | Out-Null\n          $stoppedEditor\
-        \ = $true\n          $ueProc = $null\n        }\n      }\n      $status = [ordered]@{\n        ok = $true; job_id\
-        \ = [string]$headlessCmd.job_id; status = 'running'\n        project_file = $targetProject; script_file = $scriptPath\n\
-        \        stdout_log = $stdoutPath; stderr_log = $stderrPath\n        created_at = $headlessCmd.created_at; started_at\
-        \ = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()\n        finished_at = $null; exit_code = $null; pid = $null\n  \
-        \      headless = $true; renderer = 'nullrhi'; editor_stopped = $stoppedEditor\n        editor_restarted = $false;\
-        \ editor_restart_warning = ''\n        timeout_seconds = $timeoutSeconds; error = ''\n      }\n      $status | ConvertTo-Json\
-        \ -Depth 8 | ForEach-Object { [System.IO.File]::WriteAllText($headlessStatusPath + '.tmp', $_, [System.Text.UTF8Encoding]::new($false))\
-        \ }\n      Move-Item -LiteralPath ($headlessStatusPath + '.tmp') -Destination $headlessStatusPath -Force\n      $headlessArgs\
-        \ = @($targetProject, '-run=pythonscript', ('-script=\"' + $scriptPath + '\"'), '-unattended', '-nop4', '-nosplash',\
-        \ '-nosound', '-nullrhi', '-stdout', '-FullStdOutLogOutput', '-UTF8Output')\n      Write-Host (\"HEADLESS_START job={0}\
-        \ project={1} exe={2}\" -f $headlessCmd.job_id, $targetProject, $cmdExe)\n      $headlessProc = Start-Process -FilePath\
-        \ $cmdExe -ArgumentList $headlessArgs -WorkingDirectory (Split-Path -Parent $targetProject) -PassThru -WindowStyle\
-        \ Hidden -RedirectStandardOutput $stdoutPath -RedirectStandardError $stderrPath\n      $status.pid = $headlessProc.Id\n\
-        \      $null = $headlessProc.WaitForExit(1)\n      $deadline = (Get-Date).AddSeconds($timeoutSeconds)\n      $cancelled\
-        \ = $false\n      $timedOut = $false\n      while (-not $headlessProc.HasExited) {\n        if (Test-Path -LiteralPath\
-        \ $cancelFlag) {\n          $cancelled = $true\n          Stop-Process -Id $headlessProc.Id -Force -ErrorAction SilentlyContinue\n\
-        \          $headlessProc.WaitForExit(10000) | Out-Null\n          break\n        }\n        if ((Get-Date) -ge $deadline)\
-        \ {\n          $timedOut = $true\n          Stop-Process -Id $headlessProc.Id -Force -ErrorAction SilentlyContinue\n\
-        \          $headlessProc.WaitForExit(10000) | Out-Null\n          break\n        }\n        $null = $headlessProc.WaitForExit(1000)\n\
-        \      }\n      $exitCode = $null\n      try { if ($headlessProc.HasExited) { $exitCode = [int]$headlessProc.ExitCode\
-        \ } } catch { }\n      if ($cancelled) { $status.status = 'cancelled'; $status.error = 'Cancellation requested; commandlet\
-        \ process was stopped.' }\n      elseif ($timedOut) { $status.status = 'timed_out'; $status.error = \"Headless script\
-        \ exceeded $timeoutSeconds seconds and was terminated.\" }\n      elseif ($exitCode -eq 0) { $status.status = 'completed'\
-        \ }\n      else { $status.status = 'failed'; $status.error = \"UnrealEditor-Cmd.exe exited with code $exitCode.\"\
-        \ }\n      $status.exit_code = $exitCode\n      $status.finished_at = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()\n\
-        \      if ($stoppedEditor -and $headlessCmd.resume_editor -eq $true) {\n        try {\n          if (-not (Test-Path\
-        \ -LiteralPath $resumeProject)) { throw \"Saved Editor project for resume not found: $resumeProject\" }\n        \
-        \  $stamp = Get-Date -Format 'yyyyMMdd_HHmmss'\n          $ueOut = \"$root\\Logs\\unreal-resume-after-headless-$stamp-stdout.log\"\
-        \n          $ueErr = \"$root\\Logs\\unreal-resume-after-headless-$stamp-stderr.log\"\n          $ueArgs = @($resumeProject,\
-        \ '-log', '-stdout', '-FullStdOutLogOutput', '-AllowSoftwareRendering', '-d3d11', '-ModelContextProtocolStartServer',\
-        \ '-ModelContextProtocolPort=8000', '-ExecCmds=\"py D:/UE58/UEControl/Content/Python/init_unreal.py\"')\n        \
-        \  $ueProc = Start-Process -FilePath $editor -ArgumentList $ueArgs -WorkingDirectory (Split-Path -Parent $resumeProject)\
-        \ -PassThru -RedirectStandardOutput $ueOut -RedirectStandardError $ueErr\n          $activeProjectFile = $resumeProject\n\
-        \          $resumeBridgeReady = $false\n          for ($i = 0; $i -lt 90; $i++) {\n            Start-Sleep -Seconds\
-        \ 2\n            try { $health = Invoke-RestMethod -Uri 'http://127.0.0.1:8765/health' -TimeoutSec 4; if ($health.bridge_connected)\
-        \ { $resumeBridgeReady = $true; break } } catch { }\n            if ($ueProc.HasExited) { break }\n          }\n \
-        \         if (-not $resumeBridgeReady) { throw \"Editor restarted but bridge did not reconnect. Inspect $ueOut and\
-        \ $ueErr.\" }\n          $resumeMcpReady = $false\n          for ($i = 0; $i -lt 45; $i++) {\n            try { $probe\
-        \ = Invoke-WebRequest -Uri 'http://127.0.0.1:8000/mcp' -Method Get -TimeoutSec 4 -UseBasicParsing; if ([int]$probe.StatusCode\
-        \ -eq 405) { $resumeMcpReady = $true; break } } catch { try { if ([int]$_.Exception.Response.StatusCode -eq 405) {\
-        \ $resumeMcpReady = $true; break } } catch { } }\n            Start-Sleep -Seconds 2\n            if ($ueProc.HasExited)\
-        \ { break }\n          }\n          if (-not $resumeMcpReady) { throw 'Editor restarted and Bridge connected, but\
-        \ native MCP did not return the expected HTTP 405.' }\n          $status.editor_restarted = $true\n        } catch\
-        \ {\n          $status.editor_restart_warning = $_.Exception.Message\n          Write-Warning (\"HEADLESS_EDITOR_RESUME_WARNING:\
-        \ \" + $status.editor_restart_warning)\n        }\n      }\n      $status | ConvertTo-Json -Depth 8 | ForEach-Object\
-        \ { [System.IO.File]::WriteAllText($headlessStatusPath + '.tmp', $_, [System.Text.UTF8Encoding]::new($false)) }\n\
-        \      Move-Item -LiteralPath ($headlessStatusPath + '.tmp') -Destination $headlessStatusPath -Force\n      Write-Host\
-        \ (\"HEADLESS_FINISHED job={0} status={1} exit_code={2} editor_restarted={3}\" -f $headlessCmd.job_id, $status.status,\
-        \ $status.exit_code, $status.editor_restarted)\n    } catch {\n      Write-Error (\"Headless commandlet supervisor\
-        \ failed: \" + $_)\n      if ($headlessStatusPath -and (Test-Path -LiteralPath $headlessStatusPath)) {\n        try\
-        \ {\n          $failedStatus = Get-Content -LiteralPath $headlessStatusPath -Raw | ConvertFrom-Json\n          $failedStatus.status\
-        \ = 'failed'\n          $failedStatus.error = $_.Exception.Message\n          $failedStatus.finished_at = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()\n\
-        \          $failedStatus | ConvertTo-Json -Depth 8 | ForEach-Object { [System.IO.File]::WriteAllText($headlessStatusPath\
-        \ + '.tmp', $_, [System.Text.UTF8Encoding]::new($false)) }\n          Move-Item -LiteralPath ($headlessStatusPath\
-        \ + '.tmp') -Destination $headlessStatusPath -Force\n        } catch { }\n      }\n    } finally {\n      Remove-Item\
-        \ -LiteralPath $headlessCommandFile -Force -ErrorAction SilentlyContinue\n    }\n  }\n\n  # A project switch, plugin\
-        \ change or checkpoint restore is handled here.\n  if (Test-Path -LiteralPath $editorCommandFile) {\n    try {\n \
-        \     $cmd = Get-Content -LiteralPath $editorCommandFile -Raw | ConvertFrom-Json\n      $targetProject = [System.IO.Path]::GetFullPath([string]$cmd.project_file)\n\
-        \      $rootPrefix = [System.IO.Path]::GetFullPath($root) + [System.IO.Path]::DirectorySeparatorChar\n      if (-not\
-        \ $targetProject.StartsWith($rootPrefix, [System.StringComparison]::OrdinalIgnoreCase) -or -not (Test-Path -LiteralPath\
-        \ $targetProject)) { throw 'Restart request project is outside D:\\UE58 or missing.' }\n      Write-Host (\"Editor\
-        \ restart command received: {0} -> {1}\" -f $cmd.action, $targetProject)\n      if ($ueProc -and -not $ueProc.HasExited)\
-        \ { Stop-Process -Id $ueProc.Id -Force -ErrorAction SilentlyContinue; $ueProc.WaitForExit(15000) | Out-Null }\n  \
-        \    $projectDir = Split-Path -Parent $targetProject\n      if ($cmd.action -eq 'restore_checkpoint') {\n        $zipPath\
-        \ = [System.IO.Path]::GetFullPath([string]$cmd.checkpoint)\n        $backupPrefix = [System.IO.Path]::GetFullPath(\"\
-        $root\\Backups\") + [System.IO.Path]::DirectorySeparatorChar\n        if (-not $zipPath.StartsWith($backupPrefix,\
-        \ [System.StringComparison]::OrdinalIgnoreCase) -or -not (Test-Path -LiteralPath $zipPath)) { throw 'Checkpoint restore\
-        \ path is invalid.' }\n        Expand-Archive -LiteralPath $zipPath -DestinationPath $projectDir -Force\n        Write-Host\
-        \ \"CHECKPOINT_RESTORED=$zipPath\"\n      }\n      Remove-Item -LiteralPath $editorCommandFile -Force -ErrorAction\
-        \ SilentlyContinue\n      $stamp = Get-Date -Format 'yyyyMMdd_HHmmss'\n      $ueOut = \"$root\\Logs\\unreal-$stamp-stdout.log\"\
-        \n      $ueErr = \"$root\\Logs\\unreal-$stamp-stderr.log\"\n      $ueArgs = @($targetProject, '-log', '-stdout', '-FullStdOutLogOutput',\
-        \ '-AllowSoftwareRendering', '-d3d11', '-ModelContextProtocolStartServer', '-ModelContextProtocolPort=8000', '-ExecCmds=\"\
-        py D:/UE58/UEControl/Content/Python/init_unreal.py\"')\n      $ueProc = Start-Process -FilePath $editor -ArgumentList\
-        \ $ueArgs -WorkingDirectory $projectDir -PassThru -RedirectStandardOutput $ueOut -RedirectStandardError $ueErr\n \
-        \     $activeProjectFile = $targetProject\n      Write-Host \"UNREAL_RESTARTED_PID=$($ueProc.Id) PROJECT=$activeProjectFile\"\
-        \n      $restartedBridge = $false\n      for ($i = 0; $i -lt 90; $i++) {\n        Start-Sleep -Seconds 2\n       \
-        \ try { $h = Invoke-RestMethod -Uri 'http://127.0.0.1:8765/health' -TimeoutSec 4; if ($h.bridge_connected) { $restartedBridge\
-        \ = $true; break } } catch { }\n        if ($ueProc.HasExited) { break }\n      }\n      if (-not $restartedBridge)\
-        \ { throw \"Bridge did not reconnect after project restart. Inspect $ueOut and $ueErr.\" }\n      $restartedMcp =\
-        \ $false\n      for ($i = 0; $i -lt 45; $i++) {\n        try { $probe = Invoke-WebRequest -Uri 'http://127.0.0.1:8000/mcp'\
-        \ -Method Get -TimeoutSec 4 -UseBasicParsing; if ([int]$probe.StatusCode -eq 405) { $restartedMcp = $true; break }\
-        \ } catch { try { if ([int]$_.Exception.Response.StatusCode -eq 405) { $restartedMcp = $true; break } } catch { }\
-        \ }\n        Start-Sleep -Seconds 2\n      }\n      if (-not $restartedMcp) { throw 'Native MCP did not return HTTP\
-        \ 405 after restart.' }\n      Write-Host 'PROJECT_RESTART_BRIDGE_READY=true NATIVE_MCP_LISTENER_READY=true'\n   \
-        \ } catch {\n      Write-Error (\"Editor restart handler failed: \" + $_)\n      if (Test-Path -LiteralPath $editorCommandFile)\
-        \ { Remove-Item -LiteralPath $editorCommandFile -Force -ErrorAction SilentlyContinue }\n      throw\n    }\n  }\n\n\
-        \  if ($ueProc -and $ueProc.HasExited) { throw \"Unreal Editor stopped with exit code $($ueProc.ExitCode); inspect\
-        \ $ueOut, $ueErr and the active project's Saved\\Logs folder.\" }\n  if (((Get-Date) - $lastHeartbeat).TotalMinutes\
-        \ -ge 30) {\n    try {\n      $h = Invoke-RestMethod -Uri 'http://127.0.0.1:8765/health' -TimeoutSec 4\n      Write-Host\
-        \ (\"Heartbeat {0}: API_OK={1} BRIDGE_CONNECTED={2}\" -f (Get-Date), $h.ok, $h.bridge_connected)\n    } catch { Write-Warning\
-        \ (\"Heartbeat {0}: local health check failed.\" -f (Get-Date)) }\n    $lastHeartbeat = Get-Date\n  }\n}"
+      run: |-
+        $ErrorActionPreference = 'Stop'
+        $root = 'D:\UE58'
+        try { Start-Transcript -Path "$root\Logs\workflow-runtime-transcript.log" -Append -Force | Out-Null } catch { }
+        $env:UE_ROOT = $root
+        $env:UE_PYTHONPATH = "$root\UEControl\Content\Python"
+        if ([string]::IsNullOrWhiteSpace($env:MONITOR_PASSWORD) -or $env:MONITOR_PASSWORD.Length -lt 16) {
+          throw 'Create repository Actions secret MONITOR_PASSWORD with a strong password of at least 16 characters before running this workflow.'
+        }
+        if ([string]::IsNullOrWhiteSpace($env:GG_UE_TOKEN)) {
+          Write-Warning 'GG_UE_TOKEN is empty; Google Drive endpoints will fail until authorized_user.json or service-account JSON is saved as this Actions secret.'
+        }
+
+        # The bridge token is only for local API <-> Unreal communication.
+        $env:BRIDGE_TOKEN = [guid]::NewGuid().ToString('N') + [guid]::NewGuid().ToString('N')
+        $python = (Get-Command python).Source
+        & $python -m pip install --disable-pip-version-check --upgrade Flask google-api-python-client google-auth google-auth-httplib2 requests urllib3 httpx Pillow psutil "mcp>=2,<3" uvicorn starlette
+        if ($LASTEXITCODE -ne 0) { throw 'Python package installation failed.' }
+
+        $apiOut = "$root\Logs\api-stdout.log"
+        $apiErr = "$root\Logs\api-stderr.log"
+        $apiProc = Start-Process -FilePath $python -ArgumentList @("$root\api_server.py") -WorkingDirectory $root -PassThru -WindowStyle Hidden -RedirectStandardOutput $apiOut -RedirectStandardError $apiErr
+        Write-Host "API_PID=$($apiProc.Id)"
+
+        $localReady = $false
+        for ($i = 0; $i -lt 45; $i++) {
+          Start-Sleep -Seconds 2
+          try {
+            $health = Invoke-RestMethod -Uri 'http://127.0.0.1:8765/health' -TimeoutSec 4
+            if ($health.ok) { $localReady = $true; break }
+          } catch { }
+          if ($apiProc.HasExited) { break }
+        }
+        if (-not $localReady) {
+          if (Test-Path $apiErr) { Get-Content $apiErr -Tail 100 }
+          if (Test-Path $apiOut) { Get-Content $apiOut -Tail 100 }
+          throw 'Local API did not start.'
+        }
+        Write-Host 'API_LOCAL_READY=true'
+
+        # API already inherited the Drive and GitHub credentials when it started.
+        # Keep only the local bridge token available to the Unreal child process.
+        $env:GG_UE_TOKEN = $null
+        $env:GITHUB_TOKEN = $null
+        $env:GITHUB_REPOSITORY = $null
+        $env:MONITOR_PASSWORD = $null
+
+        $editor = $env:UE_EDITOR_EXE
+        if ([string]::IsNullOrWhiteSpace($editor) -or -not (Test-Path -LiteralPath $editor)) {
+          throw 'UE_EDITOR_EXE was not found from the extraction step.'
+        }
+        $engineDir = Split-Path -Parent (Split-Path -Parent (Split-Path -Parent $editor))
+        $gltfPlugin = Join-Path $engineDir 'Plugins\Enterprise\GLTFExporter\GLTFExporter.uplugin'
+        if (-not (Test-Path -LiteralPath $gltfPlugin)) { throw "Unreal GLTFExporter plugin was not found: $gltfPlugin" }
+        Write-Host 'GLTF_EXPORTER_PLUGIN_FOUND=true'
+        Write-Host "Unreal Editor found: $editor"
+        $ueOut = "$root\Logs\unreal-stdout.log"
+        $ueErr = "$root\Logs\unreal-stderr.log"
+        $initScript = "$root\UEControl\Content\Python\init_unreal.py"
+        if (-not (Test-Path -LiteralPath $initScript)) { throw "Unreal bridge startup script was not found: $initScript" }
+        # IMPORTANT: do NOT pass -ExecutePythonScript here. Epic documents that
+        # the Editor closes after a command-line ExecutePythonScript finishes.
+        # Content/Python/init_unreal.py is auto-detected and run by the Editor.
+        $ueArgs = @("$root\UEControl\UEControl.uproject", '-log', '-stdout', '-FullStdOutLogOutput', '-AllowSoftwareRendering', '-d3d11', '-ModelContextProtocolStartServer', '-ModelContextProtocolPort=8000', '-ExecCmds="py D:/UE58/UEControl/Content/Python/init_unreal.py"')
+        $ueProc = Start-Process -FilePath $editor -ArgumentList $ueArgs -WorkingDirectory "$root\UEControl" -PassThru -RedirectStandardOutput $ueOut -RedirectStandardError $ueErr
+        Write-Host "UNREAL_PID=$($ueProc.Id)"
+
+        $cloudflared = "$root\cloudflared.exe"
+        Invoke-WebRequest -Uri 'https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe' -OutFile $cloudflared
+        $cfOut = "$root\Logs\cloudflared-stdout.log"
+        $cfErr = "$root\Logs\cloudflared-stderr.log"
+        $cfProc = Start-Process -FilePath $cloudflared -ArgumentList @('tunnel', '--url', 'http://127.0.0.1:8765', '--no-autoupdate') -WorkingDirectory $root -PassThru -WindowStyle Hidden -RedirectStandardOutput $cfOut -RedirectStandardError $cfErr
+
+        # Extract ONLY the hostname from cloudflared output. Never build request
+        # URIs from an untrimmed log line: ANSI escapes/CRLF can make .NET Uri parsing
+        # fail with 'Invalid URI: The hostname could not be parsed'.
+        $publicUri = $null
+        $publicUrl = $null
+        for ($i = 0; $i -lt 90; $i++) {
+          Start-Sleep -Seconds 2
+          $combined = ''
+          foreach ($f in @($cfOut, $cfErr)) {
+            if (Test-Path $f) { try { $combined += "`n" + (Get-Content $f -Raw -ErrorAction SilentlyContinue) } catch { } }
+          }
+          $match = [regex]::Match($combined, '(?i)https://(?<host>[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.trycloudflare\.com)')
+          if ($match.Success) {
+            $tunnelHost = ([string]$match.Groups['host'].Value).Trim().TrimEnd('.').ToLowerInvariant()
+            $candidateUri = $null
+            if ([System.Uri]::TryCreate(('https://' + $tunnelHost + '/'), [System.UriKind]::Absolute, [ref]$candidateUri) -and
+                $candidateUri.Scheme -eq 'https' -and $candidateUri.Host -eq $tunnelHost -and
+                $candidateUri.Host.EndsWith('.trycloudflare.com')) {
+              $publicUri = $candidateUri
+              $publicUrl = $candidateUri.GetLeftPart([System.UriPartial]::Authority)
+              break
+            }
+            Write-Host ("Ignoring malformed Quick Tunnel hostname: [{0}]" -f $tunnelHost)
+          }
+          if ($cfProc.HasExited) { break }
+        }
+        if (-not $publicUri -or -not $publicUrl) {
+          if (Test-Path $cfErr) { Get-Content $cfErr -Tail 100 }
+          throw 'Cloudflare Quick Tunnel did not provide a valid HTTPS *.trycloudflare.com hostname.'
+        }
+        Write-Host "PUBLIC_API_URL=$publicUrl"
+        Write-Host ("PUBLIC_API_URI_VALID=true HOST={0}" -f $publicUri.DnsSafeHost)
+        Write-Host 'Waiting a maximum of 180 seconds for an authenticated Unreal Python bridge heartbeat...'
+        $bridgeReady = $false
+        $bridgeTimer = [System.Diagnostics.Stopwatch]::StartNew()
+        $lastBridgeReport = -15
+        $lastBridgeProbeError = ''
+        while ($bridgeTimer.Elapsed.TotalSeconds -lt 180) {
+          if ($ueProc.HasExited) {
+            Write-Warning 'Unreal Editor exited before the Python bridge connected.'
+            break
+          }
+          try {
+            $health = Invoke-RestMethod -Uri 'http://127.0.0.1:8765/health' -TimeoutSec 2
+            if ($health.bridge_connected) {
+              $bridgeReady = $true
+              break
+            }
+            $lastBridgeProbeError = 'API is responding, but no authenticated bridge heartbeat has arrived.'
+          } catch {
+            $lastBridgeProbeError = $_.Exception.Message
+          }
+          if ([int][Math]::Floor($bridgeTimer.Elapsed.TotalSeconds) -ge ($lastBridgeReport + 15)) {
+            $lastBridgeReport = [int][Math]::Floor($bridgeTimer.Elapsed.TotalSeconds)
+            Write-Host ("BRIDGE_WAIT elapsed={0}s editor_exited={1} status={2}" -f $lastBridgeReport, $ueProc.HasExited, $lastBridgeProbeError)
+          }
+          Start-Sleep -Milliseconds 1000
+        }
+        $bridgeTimer.Stop()
+        if ($bridgeReady) {
+          Write-Host 'BRIDGE_READY=true'
+        } else {
+          Write-Host '--- Bridge diagnostics ---'
+          foreach ($diagnosticFile in @(
+            "$root\Logs\unreal_bridge.log",
+            "$root\Logs\api.log",
+            $ueOut,
+            $ueErr
+          )) {
+            if ($diagnosticFile -and (Test-Path -LiteralPath $diagnosticFile)) {
+              Write-Host "--- $diagnosticFile (last 80 lines) ---"
+              Get-Content -LiteralPath $diagnosticFile -Tail 80 -ErrorAction SilentlyContinue
+            }
+          }
+          $projectLog = Get-ChildItem -LiteralPath "$root\UEControl\Saved\Logs" -Filter '*.log' -File -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+          if ($projectLog) {
+            Write-Host "--- $($projectLog.FullName) (last 100 lines) ---"
+            Get-Content -LiteralPath $projectLog.FullName -Tail 100 -ErrorAction SilentlyContinue
+          }
+          if ($ueProc.HasExited) {
+            throw "BRIDGE_READY=false: Unreal Editor exited with code $($ueProc.ExitCode). Diagnostic logs are printed above."
+          }
+          throw "BRIDGE_READY=false after $([int]$bridgeTimer.Elapsed.TotalSeconds) seconds. The startup script did not establish an authenticated bridge connection. Diagnostic logs are printed above."
+        }
+
+        # Confirm Epic's native MCP listener is alive before publishing the endpoint.
+        # Unreal documents GET /mcp returning HTTP 405 as a valid liveness response.
+        $nativeMcpReady = $false
+        for ($i = 0; $i -lt 45; $i++) {
+          try {
+            $probe = Invoke-WebRequest -Uri 'http://127.0.0.1:8000/mcp' -Method Get -TimeoutSec 4 -UseBasicParsing
+            if ([int]$probe.StatusCode -eq 405) { $nativeMcpReady = $true; break }
+            Write-Host ("Native MCP GET probe returned HTTP {0}" -f [int]$probe.StatusCode)
+          } catch {
+            $status = $null
+            try { $status = [int]$_.Exception.Response.StatusCode } catch { }
+            if ($status -eq 405) { $nativeMcpReady = $true; break }
+            if ($status) { Write-Host ("Native MCP GET probe returned HTTP {0}" -f $status) }
+          }
+          if ($ueProc.HasExited) { break }
+          Start-Sleep -Seconds 2
+        }
+        if ($nativeMcpReady) {
+          Write-Host 'NATIVE_MCP_LISTENER_READY=true (GET /mcp returned expected HTTP 405).'
+        } else {
+          throw 'NATIVE_MCP_LISTENER_READY=false. Do not add the MCP URL in ChatGPT yet; inspect UEControl\Saved\Logs\UnrealEditor.log and unreal-stdout.log for LogModelContextProtocol errors.'
+        }
+
+        # End-to-end public MCP test. A local GET/405 only proves the Unreal listener
+        # exists; it does NOT prove ChatGPT can reach the public Cloudflare endpoint.
+        # First wait for Cloudflare edge propagation and test the public health route.
+        $healthUriBuilder = [System.UriBuilder]::new($publicUri)
+        $healthUriBuilder.Path = '/health'
+        $healthUriBuilder.Query = ''
+        $healthUriBuilder.Fragment = ''
+        $publicHealthUri = $healthUriBuilder.Uri
+        if (-not $publicHealthUri.IsAbsoluteUri -or $publicHealthUri.Host -ne $publicUri.Host) {
+          throw 'PUBLIC_HEALTH_URI_INVALID: failed to construct a valid public health URI from the Quick Tunnel hostname.'
+        }
+        $publicHealthReady = $false
+        $publicHealthError = ''
+        for ($i = 0; $i -lt 20; $i++) {
+          try {
+            $publicHealth = Invoke-RestMethod -Uri $publicHealthUri -TimeoutSec 12
+            if ($publicHealth.ok) { $publicHealthReady = $true; break }
+            $publicHealthError = 'Public /health returned ok=false.'
+          } catch {
+            $publicHealthError = $_.Exception.Message
+          }
+          if ($cfProc.HasExited) { throw 'Cloudflare tunnel exited during public health test; inspect cloudflared-stderr.log.' }
+          Start-Sleep -Seconds 3
+        }
+        if (-not $publicHealthReady) {
+          if (Test-Path $cfErr) { Write-Host '--- cloudflared stderr (tail) ---'; Get-Content $cfErr -Tail 60 }
+          throw "PUBLIC_TUNNEL_HEALTH_FAILED: $publicHealthError. The URL must not be added to ChatGPT until this passes."
+        }
+        Write-Host 'PUBLIC_TUNNEL_HEALTH_OK=true'
+
+        # Verify both the current stateless MCP protocol and legacy 2025 handshake compatibility through the public HTTPS URL.
+        # Public Starlette mount is /mcp/; upstream Unreal listener remains /mcp. No OAuth or bearer token is used.
+        # Build the MCP URL from the already validated System.Uri object. This
+        # prevents PowerShell/.NET from parsing raw cloudflared console text as a URI.
+        $mcpUriBuilder = [System.UriBuilder]::new($publicUri)
+        $mcpUriBuilder.Path = '/mcp'
+        $mcpUriBuilder.Query = ''
+        $mcpUriBuilder.Fragment = ''
+        $mcpEndpointUri = $mcpUriBuilder.Uri
+        if (-not $mcpEndpointUri.IsAbsoluteUri -or $mcpEndpointUri.Scheme -ne 'https' -or
+            $mcpEndpointUri.Host -ne $publicUri.Host -or $mcpEndpointUri.AbsolutePath -ne '/mcp') {
+          throw 'PUBLIC_MCP_URI_INVALID: failed to construct a valid HTTPS /mcp URI.'
+        }
+        $mcpEndpoint = $mcpEndpointUri.AbsoluteUri
+        Write-Host ("PUBLIC_MCP_URI_VALID=true URI={0}" -f $mcpEndpoint)
+
+        # Streamable HTTP GET is optional. This server intentionally does not
+        # offer server-initiated streams, so GET returns 405 quickly. POST is
+        # the actual initialize/tools/call transport used by MCP clients.
+        try {
+          $getProbe = Invoke-WebRequest -Uri $mcpEndpointUri -Method Get -TimeoutSec 15 -UseBasicParsing
+          throw ("GET probe unexpectedly returned HTTP {0}; expected 405." -f [int]$getProbe.StatusCode)
+        } catch {
+          $getStatus = $null
+          try { $getStatus = [int]$_.Exception.Response.StatusCode } catch { }
+          if ($getStatus -ne 405) { throw ("PUBLIC_MCP_GET_CHECK_FAILED: expected 405, got [{0}]. {1}" -f $getStatus, $_.Exception.Message) }
+          Write-Host 'PUBLIC_MCP_GET_METHOD_NOT_SUPPORTED_OK=true STATUS=405'
+        }
+        $mcpAccept = 'application/json, text/event-stream'
+        $initializePayload = @{
+          jsonrpc = '2.0'
+          id = 'ue58-public-connectivity-initialize'
+          method = 'initialize'
+          params = @{
+            protocolVersion = '2025-11-25'
+            capabilities = @{}
+            clientInfo = @{ name = 'ue58-workflow-connectivity-check'; version = '1.0.0' }
+          }
+        } | ConvertTo-Json -Depth 12 -Compress
+        try {
+          $initializeResponse = Invoke-WebRequest -Uri $mcpEndpointUri -Method Post -Headers @{ Accept = $mcpAccept } -ContentType 'application/json' -Body $initializePayload -TimeoutSec 30 -UseBasicParsing
+          if ([int]$initializeResponse.StatusCode -ne 200) { throw "MCP initialize returned HTTP $([int]$initializeResponse.StatusCode)." }
+          $initializeJson = $initializeResponse.Content | ConvertFrom-Json -ErrorAction Stop
+          if ($initializeJson.error) { throw ("MCP initialize JSON-RPC error: " + ($initializeJson.error | ConvertTo-Json -Compress -Depth 8)) }
+          if (-not $initializeJson.result -or -not $initializeJson.result.protocolVersion) { throw 'MCP initialize response has no result.protocolVersion.' }
+          $negotiatedProtocol = [string]$initializeJson.result.protocolVersion
+          $mcpSessionId = [string]$initializeResponse.Headers['Mcp-Session-Id']
+          Write-Host ("PUBLIC_MCP_INITIALIZE_OK=true PROTOCOL={0} SESSION_HEADER={1}" -f $negotiatedProtocol, [bool]$mcpSessionId)
+
+          # Confirm tools/list works over the same public route and session.
+          $listHeaders = @{ Accept = $mcpAccept; 'MCP-Protocol-Version' = $negotiatedProtocol }
+          if ($mcpSessionId) { $listHeaders['Mcp-Session-Id'] = $mcpSessionId }
+          $listPayload = @{ jsonrpc = '2.0'; id = 'ue58-public-connectivity-tools'; method = 'tools/list'; params = @{} } | ConvertTo-Json -Depth 8 -Compress
+          $toolsResponse = Invoke-WebRequest -Uri $mcpEndpointUri -Method Post -Headers $listHeaders -ContentType 'application/json' -Body $listPayload -TimeoutSec 30 -UseBasicParsing
+          if ([int]$toolsResponse.StatusCode -ne 200) { throw "MCP tools/list returned HTTP $([int]$toolsResponse.StatusCode)." }
+          $toolsJson = $toolsResponse.Content | ConvertFrom-Json -ErrorAction Stop
+          if ($toolsJson.error) { throw ("MCP tools/list JSON-RPC error: " + ($toolsJson.error | ConvertTo-Json -Compress -Depth 8)) }
+          $toolCount = @($toolsJson.result.tools).Count
+          if ($toolCount -lt 1) { throw 'MCP tools/list returned no tools.' }
+                  Write-Host ("PUBLIC_MCP_LEGACY_TOOLS_LIST_OK=true TOOL_COUNT={0}" -f $toolCount)
+
+                  # Current MCP generation: stateless protocol, server/discover, and
+                  # required per-request metadata headers. The API adapter translates
+                  # these requests to the legacy protocol exposed by Unreal 5.8.
+                  $modernMeta = @{
+                    'io.modelcontextprotocol/protocolVersion' = '2026-07-28'
+                    'io.modelcontextprotocol/clientInfo' = @{ name = 'ue58-workflow-modern-connectivity-check'; version = '1.0.0' }
+                    'io.modelcontextprotocol/clientCapabilities' = @{}
+                  }
+                  $modernBaseHeaders = @{
+                    Accept = $mcpAccept
+                    'MCP-Protocol-Version' = '2026-07-28'
+                  }
+                  $discoverPayload = @{
+                    jsonrpc = '2.0'; id = 'ue58-modern-discover'; method = 'server/discover';
+                    params = @{ _meta = $modernMeta }
+                  } | ConvertTo-Json -Depth 12 -Compress
+                  $discoverHeaders = $modernBaseHeaders.Clone()
+                  $discoverHeaders['Mcp-Method'] = 'server/discover'
+                  $discoverResponse = Invoke-WebRequest -Uri $mcpEndpointUri -Method Post -Headers $discoverHeaders -ContentType 'application/json' -Body $discoverPayload -TimeoutSec 30 -UseBasicParsing
+                  if ([int]$discoverResponse.StatusCode -ne 200) { throw "Modern MCP server/discover returned HTTP $([int]$discoverResponse.StatusCode)." }
+                  $discoverJson = $discoverResponse.Content | ConvertFrom-Json -ErrorAction Stop
+                  if ($discoverJson.error) { throw ("Modern MCP discover JSON-RPC error: " + ($discoverJson.error | ConvertTo-Json -Compress -Depth 8)) }
+                  if ($discoverJson.result.resultType -ne 'complete' -or @($discoverJson.result.supportedVersions) -notcontains '2026-07-28' -or -not $discoverJson.result.capabilities.tools) {
+                    throw 'Modern MCP server/discover response is missing the required protocol version or tools capability.'
+                  }
+                  Write-Host 'PUBLIC_MCP_MODERN_DISCOVER_OK=true PROTOCOL=2026-07-28'
+
+                  $modernListPayload = @{
+                    jsonrpc = '2.0'; id = 'ue58-modern-tools-list'; method = 'tools/list';
+                    params = @{ _meta = $modernMeta }
+                  } | ConvertTo-Json -Depth 12 -Compress
+                  $modernListHeaders = $modernBaseHeaders.Clone()
+                  $modernListHeaders['Mcp-Method'] = 'tools/list'
+                  $modernToolsResponse = Invoke-WebRequest -Uri $mcpEndpointUri -Method Post -Headers $modernListHeaders -ContentType 'application/json' -Body $modernListPayload -TimeoutSec 45 -UseBasicParsing
+                  if ([int]$modernToolsResponse.StatusCode -ne 200) { throw "Modern MCP tools/list returned HTTP $([int]$modernToolsResponse.StatusCode)." }
+                  $modernToolsJson = $modernToolsResponse.Content | ConvertFrom-Json -ErrorAction Stop
+                  if ($modernToolsJson.error) { throw ("Modern MCP tools/list JSON-RPC error: " + ($modernToolsJson.error | ConvertTo-Json -Compress -Depth 8)) }
+                  $modernToolCount = @($modernToolsJson.result.tools).Count
+                  if ($modernToolCount -lt 1) { throw 'Modern MCP tools/list returned no tools.' }
+                  Write-Host ("PUBLIC_MCP_MODERN_TOOLS_LIST_OK=true TOOL_COUNT={0}" -f $modernToolCount)
+
+                  # Exercise a harmless read-only modern tools/call, not just discovery.
+                  $modernCallPayload = @{
+                    jsonrpc = '2.0'; id = 'ue58-modern-safe-tool-call'; method = 'tools/call';
+                    params = @{ name = 'unreal_monitor_get_state'; arguments = @{ limit = 1 }; _meta = $modernMeta }
+                  } | ConvertTo-Json -Depth 12 -Compress
+                  $modernCallHeaders = $modernBaseHeaders.Clone()
+                  $modernCallHeaders['Mcp-Method'] = 'tools/call'
+                  $modernCallHeaders['Mcp-Name'] = 'unreal_monitor_get_state'
+                  $modernCallResponse = Invoke-WebRequest -Uri $mcpEndpointUri -Method Post -Headers $modernCallHeaders -ContentType 'application/json' -Body $modernCallPayload -TimeoutSec 30 -UseBasicParsing
+                  if ([int]$modernCallResponse.StatusCode -ne 200) { throw "Modern MCP tools/call returned HTTP $([int]$modernCallResponse.StatusCode)." }
+                  $modernCallJson = $modernCallResponse.Content | ConvertFrom-Json -ErrorAction Stop
+                  if ($modernCallJson.error -or -not $modernCallJson.result.content) { throw 'Modern MCP safe tools/call did not return a valid tool result.' }
+                  Write-Host 'PUBLIC_MCP_MODERN_TOOLS_CALL_OK=true'
+                } catch {
+          $mcpFailure = $_.Exception.Message
+          try {
+            $response = $_.Exception.Response
+            if ($response -and $response.GetResponseStream()) {
+              $reader = New-Object System.IO.StreamReader($response.GetResponseStream())
+              $responseBody = $reader.ReadToEnd()
+              $reader.Dispose()
+              if ($responseBody) { $mcpFailure += " | response: " + $responseBody.Substring(0, [Math]::Min(1500, $responseBody.Length)) }
+            }
+          } catch { }
+          if (Test-Path $cfErr) { Write-Host '--- cloudflared stderr (tail) ---'; Get-Content $cfErr -Tail 40 }
+          foreach ($diagnosticFile in @($apiErr, $apiOut, "$root\Logs\api.log", "$root\Logs\unreal-stdout.log", "$root\Logs\unreal-stderr.log")) {
+            if ($diagnosticFile -and (Test-Path -LiteralPath $diagnosticFile)) {
+              Write-Host "--- $diagnosticFile (last 100 lines) ---"
+              Get-Content -LiteralPath $diagnosticFile -Tail 100 -ErrorAction SilentlyContinue
+            }
+          }
+          $diagnosticProjectLog = Get-ChildItem -LiteralPath "$root\UEControl\Saved\Logs" -Filter '*.log' -File -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+          if ($diagnosticProjectLog) {
+            Write-Host "--- $($diagnosticProjectLog.FullName) (last 100 lines) ---"
+            Get-Content -LiteralPath $diagnosticProjectLog.FullName -Tail 100 -ErrorAction SilentlyContinue
+          }
+          throw "PUBLIC_MCP_HANDSHAKE_FAILED: $mcpFailure. Proxy/API and Unreal diagnostics were printed above."
+        }
+        Write-Host 'PUBLIC_MCP_ENDPOINT_READY=true PROTOCOL=2026-07-28 LEGACY_COMPATIBILITY=true'
+
+        $internalHeaders = @{ Authorization = "Bearer $env:BRIDGE_TOKEN" }
+        # Reserve CPU capacity for the runner/API and start the first monitor snapshot.
+        # The affinity limit is reversible from the Monitor > System panel.
+        try {
+          $cpuBody = @{ percent = 75 } | ConvertTo-Json -Compress
+          $cpuBalance = Invoke-RestMethod -Uri 'http://127.0.0.1:8765/internal/system/optimize-cpu' -Method Post -Headers $internalHeaders -ContentType 'application/json' -Body $cpuBody -TimeoutSec 15
+          Write-Host ("UNREAL_CPU_HEADROOM=true CORES={0}/{1}" -f $cpuBalance.affinity.Count, $cpuBalance.logical_cpus)
+        } catch {
+          Write-Warning ("Could not apply reversible Unreal CPU headroom: " + $_.Exception.Message)
+        }
+        try {
+          $captureKick = Invoke-RestMethod -Uri 'http://127.0.0.1:8765/internal/monitor/initial-capture' -Method Post -Headers $internalHeaders -ContentType 'application/json' -Body '{}' -TimeoutSec 10
+          Write-Host ("MONITOR_INITIAL_CAPTURE={0}" -f $captureKick.status)
+        } catch {
+          Write-Warning ("Initial monitor capture will retry when the monitor page opens: " + $_.Exception.Message)
+        }
+        $urlBody = @{ public_url = $publicUrl } | ConvertTo-Json -Compress
+        $urlRegistration = Invoke-RestMethod -Uri 'http://127.0.0.1:8765/internal/set-public-url' -Method Post -Headers $internalHeaders -ContentType 'application/json' -Body $urlBody -TimeoutSec 10
+        if (-not $urlRegistration.ok) { throw 'Could not register the public monitor URL with the API.' }
+        $monitorUrl = "$publicUrl/monitor"
+        Write-Host "MONITOR_URL=$monitorUrl"
+        Write-Host 'MONITOR_USERNAME=viewer'
+        Write-Host 'MONITOR_PASSWORD is stored only in the repository Actions secret MONITOR_PASSWORD.'
+        $summaryText = @"
+        ## Unreal Live Monitor
+        - [Open read-only monitor]($monitorUrl)
+        - **MCP endpoint for ChatGPT (No authentication):** $mcpEndpoint
+        - Use the exact MCP endpoint above; do not paste the monitor URL or the bare PUBLIC_API_URL.
+        - The Quick Tunnel URL is temporary and works only while this Actions workflow and cloudflared process remain running.
+        - Monitor username: viewer
+        - Monitor password: repository secret MONITOR_PASSWORD
+        - GitHub Release upload: available inside the authenticated monitor; default tag: ue5.8.
+        "@
+        $summaryText | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+
+        Write-Host 'REST endpoints: GET /health; authenticated read-only monitor at GET /monitor; authenticated file, Drive, GitHub Release, project and unified logs endpoints.'
+        Write-Host "MCP_ENDPOINT=$mcpEndpoint"
+        Write-Host "MCP_CONNECTOR_AUTH=No authentication"
+        Write-Host 'Copy the exact MCP_ENDPOINT value into ChatGPT (use the HTTPS URL ending exactly in /mcp, without a trailing slash). The domain root is also accepted as a compatibility alias.'
+        Write-Host 'Single MCP endpoint only: /mcp -> native Unreal AllToolsets plus monitor, binary-upload and guarded GitHub Release tools. No second MCP URL.'
+        Write-Host 'Bridge startup: Python StartupScripts plus -ExecCmds py fallback; duplicate initialization is guarded. No -ExecutePythonScript is used.'
+        Write-Host 'Binary transfer: unreal_upload_binary_file accepts files up to 8 MiB per MCP call; place larger files under D:\UE58\Uploads through the authenticated API before publishing them.'
+        Write-Host 'Monitor uses 5-second JSON polling and 640x360 JPEG snapshots after MCP tool calls; no VNC, desktop stream, WebSocket, or SSE.'
+        Write-Host 'MCP tool list includes Unreal AllToolsets, live arbitrary Editor Python, console commands, headless UnrealEditor-Cmd Python commandlets (-nullrhi), scene/project/plugin management, save/checkpoint/restore, packaging, Windows metrics, file transfer, GitHub Release and external MCP gateway tools.'
+        Write-Host 'MCP transport: Streamable HTTP over HTTPS; POST carries JSON-RPC. GET returns 405 because server-initiated event streams are not offered; upstream single-message SSE POST replies are normalized to JSON-RPC JSON.'
+        Write-Host 'Monitor includes Logs, full-fidelity Unreal GLB scene viewer (real meshes and supported materials), orbit/pan/pinch/zoom, project switching, plugin ZIP installation/toggles, save/checkpoint/restore, Win64 Shipping packaging, system metrics and remote MCP gateway.'
+        Write-Warning 'SECURITY: the monitor and REST endpoints are password-protected, but /mcp is intentionally unauthenticated for ChatGPT. Anyone who obtains the MCP URL may issue Unreal commands. Do not share the MCP URL; stop the workflow when finished.'
+
+        $lastHeartbeat = Get-Date
+        $activeProjectFile = "$root\UEControl\UEControl.uproject"
+        $editorCommandFile = "$root\control\editor-command.json"
+        while ($true) {
+          Start-Sleep -Seconds 5
+          if ($apiProc.HasExited) { throw 'API server stopped; inspect D:\UE58\Logs\api-stderr.log.' }
+          if ($cfProc.HasExited) { throw 'Cloudflare tunnel stopped; inspect D:\UE58\Logs\cloudflared-stderr.log.' }
+
+          # Run one queued headless Unreal Python commandlet. The API writes this
+          # request only after validating the project/script paths and, when needed,
+          # saving the live Editor session through its authenticated Python bridge.
+          $headlessCommandFile = "$root\control\headless-command.json"
+          if (Test-Path -LiteralPath $headlessCommandFile) {
+            $headlessCmd = $null
+            $headlessStatusPath = $null
+            try {
+              $headlessCmd = Get-Content -LiteralPath $headlessCommandFile -Raw | ConvertFrom-Json
+              $rootPrefix = [System.IO.Path]::GetFullPath($root) + [System.IO.Path]::DirectorySeparatorChar
+              $headlessRoot = [System.IO.Path]::GetFullPath("$root\HeadlessJobs") + [System.IO.Path]::DirectorySeparatorChar
+              $targetProject = [System.IO.Path]::GetFullPath([string]$headlessCmd.project_file)
+              $scriptPath = [System.IO.Path]::GetFullPath([string]$headlessCmd.script_file)
+              $headlessStatusPath = [System.IO.Path]::GetFullPath([string]$headlessCmd.status_file)
+              $stdoutPath = [System.IO.Path]::GetFullPath([string]$headlessCmd.stdout_log)
+              $stderrPath = [System.IO.Path]::GetFullPath([string]$headlessCmd.stderr_log)
+              if (-not $targetProject.StartsWith($rootPrefix, [System.StringComparison]::OrdinalIgnoreCase) -or -not $targetProject.EndsWith('.uproject', [System.StringComparison]::OrdinalIgnoreCase) -or -not (Test-Path -LiteralPath $targetProject)) { throw 'Headless project path is invalid or outside D:\UE58.' }
+              foreach ($path in @($scriptPath,$headlessStatusPath,$stdoutPath,$stderrPath)) {
+                if (-not $path.StartsWith($headlessRoot, [System.StringComparison]::OrdinalIgnoreCase)) { throw 'Headless job files must stay inside D:\UE58\HeadlessJobs.' }
+              }
+              if (-not (Test-Path -LiteralPath $scriptPath)) { throw 'Headless Python script was not found.' }
+              $jobDir = Split-Path -Parent $scriptPath
+              $cancelFlag = Join-Path $jobDir 'cancel-requested.flag'
+              $cmdExe = Join-Path (Split-Path -Parent $editor) 'UnrealEditor-Cmd.exe'
+              if (-not (Test-Path -LiteralPath $cmdExe)) { throw "UnrealEditor-Cmd.exe not found beside $editor." }
+              $timeoutSeconds = [Math]::Max(30, [Math]::Min(7200, [int]$headlessCmd.timeout_seconds))
+              $stoppedEditor = $false
+              $resumeProject = [System.IO.Path]::GetFullPath([string]$headlessCmd.resume_project_file)
+              if ($headlessCmd.stop_editor -eq $true) {
+                if ($ueProc -and -not $ueProc.HasExited) {
+                  Write-Host 'HEADLESS: stopping the live Editor after the API saved dirty packages.'
+                  Stop-Process -Id $ueProc.Id -Force -ErrorAction SilentlyContinue
+                  $ueProc.WaitForExit(20000) | Out-Null
+                  $stoppedEditor = $true
+                  $ueProc = $null
+                }
+              }
+              $status = [ordered]@{
+                ok = $true; job_id = [string]$headlessCmd.job_id; status = 'running'
+                project_file = $targetProject; script_file = $scriptPath
+                stdout_log = $stdoutPath; stderr_log = $stderrPath
+                created_at = $headlessCmd.created_at; started_at = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+                finished_at = $null; exit_code = $null; pid = $null
+                headless = $true; renderer = 'nullrhi'; editor_stopped = $stoppedEditor
+                editor_restarted = $false; editor_restart_warning = ''
+                timeout_seconds = $timeoutSeconds; error = ''
+              }
+              $status | ConvertTo-Json -Depth 8 | ForEach-Object { [System.IO.File]::WriteAllText($headlessStatusPath + '.tmp', $_, [System.Text.UTF8Encoding]::new($false)) }
+              Move-Item -LiteralPath ($headlessStatusPath + '.tmp') -Destination $headlessStatusPath -Force
+              $headlessArgs = @($targetProject, '-run=pythonscript', ('-script="' + $scriptPath + '"'), '-unattended', '-nop4', '-nosplash', '-nosound', '-nullrhi', '-stdout', '-FullStdOutLogOutput', '-UTF8Output')
+              Write-Host ("HEADLESS_START job={0} project={1} exe={2}" -f $headlessCmd.job_id, $targetProject, $cmdExe)
+              $headlessProc = Start-Process -FilePath $cmdExe -ArgumentList $headlessArgs -WorkingDirectory (Split-Path -Parent $targetProject) -PassThru -WindowStyle Hidden -RedirectStandardOutput $stdoutPath -RedirectStandardError $stderrPath
+              $status.pid = $headlessProc.Id
+              $null = $headlessProc.WaitForExit(1)
+              $deadline = (Get-Date).AddSeconds($timeoutSeconds)
+              $cancelled = $false
+              $timedOut = $false
+              while (-not $headlessProc.HasExited) {
+                if (Test-Path -LiteralPath $cancelFlag) {
+                  $cancelled = $true
+                  Stop-Process -Id $headlessProc.Id -Force -ErrorAction SilentlyContinue
+                  $headlessProc.WaitForExit(10000) | Out-Null
+                  break
+                }
+                if ((Get-Date) -ge $deadline) {
+                  $timedOut = $true
+                  Stop-Process -Id $headlessProc.Id -Force -ErrorAction SilentlyContinue
+                  $headlessProc.WaitForExit(10000) | Out-Null
+                  break
+                }
+                $null = $headlessProc.WaitForExit(1000)
+              }
+              $exitCode = $null
+              try { if ($headlessProc.HasExited) { $exitCode = [int]$headlessProc.ExitCode } } catch { }
+              if ($cancelled) { $status.status = 'cancelled'; $status.error = 'Cancellation requested; commandlet process was stopped.' }
+              elseif ($timedOut) { $status.status = 'timed_out'; $status.error = "Headless script exceeded $timeoutSeconds seconds and was terminated." }
+              elseif ($exitCode -eq 0) { $status.status = 'completed' }
+              else { $status.status = 'failed'; $status.error = "UnrealEditor-Cmd.exe exited with code $exitCode." }
+              $status.exit_code = $exitCode
+              $status.finished_at = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+              if ($stoppedEditor -and $headlessCmd.resume_editor -eq $true) {
+                try {
+                  if (-not (Test-Path -LiteralPath $resumeProject)) { throw "Saved Editor project for resume not found: $resumeProject" }
+                  $stamp = Get-Date -Format 'yyyyMMdd_HHmmss'
+                  $ueOut = "$root\Logs\unreal-resume-after-headless-$stamp-stdout.log"
+                  $ueErr = "$root\Logs\unreal-resume-after-headless-$stamp-stderr.log"
+                  $ueArgs = @($resumeProject, '-log', '-stdout', '-FullStdOutLogOutput', '-AllowSoftwareRendering', '-d3d11', '-ModelContextProtocolStartServer', '-ModelContextProtocolPort=8000', '-ExecCmds="py D:/UE58/UEControl/Content/Python/init_unreal.py"')
+                  $ueProc = Start-Process -FilePath $editor -ArgumentList $ueArgs -WorkingDirectory (Split-Path -Parent $resumeProject) -PassThru -RedirectStandardOutput $ueOut -RedirectStandardError $ueErr
+                  $activeProjectFile = $resumeProject
+                  $resumeBridgeReady = $false
+                  for ($i = 0; $i -lt 90; $i++) {
+                    Start-Sleep -Seconds 2
+                    try { $health = Invoke-RestMethod -Uri 'http://127.0.0.1:8765/health' -TimeoutSec 4; if ($health.bridge_connected) { $resumeBridgeReady = $true; break } } catch { }
+                    if ($ueProc.HasExited) { break }
+                  }
+                  if (-not $resumeBridgeReady) { throw "Editor restarted but bridge did not reconnect. Inspect $ueOut and $ueErr." }
+                  $resumeMcpReady = $false
+                  for ($i = 0; $i -lt 45; $i++) {
+                    try { $probe = Invoke-WebRequest -Uri 'http://127.0.0.1:8000/mcp' -Method Get -TimeoutSec 4 -UseBasicParsing; if ([int]$probe.StatusCode -eq 405) { $resumeMcpReady = $true; break } } catch { try { if ([int]$_.Exception.Response.StatusCode -eq 405) { $resumeMcpReady = $true; break } } catch { } }
+                    Start-Sleep -Seconds 2
+                    if ($ueProc.HasExited) { break }
+                  }
+                  if (-not $resumeMcpReady) { throw 'Editor restarted and Bridge connected, but native MCP did not return the expected HTTP 405.' }
+                  $status.editor_restarted = $true
+                } catch {
+                  $status.editor_restart_warning = $_.Exception.Message
+                  Write-Warning ("HEADLESS_EDITOR_RESUME_WARNING: " + $status.editor_restart_warning)
+                }
+              }
+              $status | ConvertTo-Json -Depth 8 | ForEach-Object { [System.IO.File]::WriteAllText($headlessStatusPath + '.tmp', $_, [System.Text.UTF8Encoding]::new($false)) }
+              Move-Item -LiteralPath ($headlessStatusPath + '.tmp') -Destination $headlessStatusPath -Force
+              Write-Host ("HEADLESS_FINISHED job={0} status={1} exit_code={2} editor_restarted={3}" -f $headlessCmd.job_id, $status.status, $status.exit_code, $status.editor_restarted)
+            } catch {
+              Write-Error ("Headless commandlet supervisor failed: " + $_)
+              if ($headlessStatusPath -and (Test-Path -LiteralPath $headlessStatusPath)) {
+                try {
+                  $failedStatus = Get-Content -LiteralPath $headlessStatusPath -Raw | ConvertFrom-Json
+                  $failedStatus.status = 'failed'
+                  $failedStatus.error = $_.Exception.Message
+                  $failedStatus.finished_at = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+                  $failedStatus | ConvertTo-Json -Depth 8 | ForEach-Object { [System.IO.File]::WriteAllText($headlessStatusPath + '.tmp', $_, [System.Text.UTF8Encoding]::new($false)) }
+                  Move-Item -LiteralPath ($headlessStatusPath + '.tmp') -Destination $headlessStatusPath -Force
+                } catch { }
+              }
+            } finally {
+              Remove-Item -LiteralPath $headlessCommandFile -Force -ErrorAction SilentlyContinue
+            }
+          }
+
+          # A project switch, plugin change or checkpoint restore is handled here.
+          if (Test-Path -LiteralPath $editorCommandFile) {
+            try {
+              $cmd = Get-Content -LiteralPath $editorCommandFile -Raw | ConvertFrom-Json
+              $targetProject = [System.IO.Path]::GetFullPath([string]$cmd.project_file)
+              $rootPrefix = [System.IO.Path]::GetFullPath($root) + [System.IO.Path]::DirectorySeparatorChar
+              if (-not $targetProject.StartsWith($rootPrefix, [System.StringComparison]::OrdinalIgnoreCase) -or -not (Test-Path -LiteralPath $targetProject)) { throw 'Restart request project is outside D:\UE58 or missing.' }
+              Write-Host ("Editor restart command received: {0} -> {1}" -f $cmd.action, $targetProject)
+              if ($ueProc -and -not $ueProc.HasExited) { Stop-Process -Id $ueProc.Id -Force -ErrorAction SilentlyContinue; $ueProc.WaitForExit(15000) | Out-Null }
+              $projectDir = Split-Path -Parent $targetProject
+              if ($cmd.action -eq 'restore_checkpoint') {
+                $zipPath = [System.IO.Path]::GetFullPath([string]$cmd.checkpoint)
+                $backupPrefix = [System.IO.Path]::GetFullPath("$root\Backups") + [System.IO.Path]::DirectorySeparatorChar
+                if (-not $zipPath.StartsWith($backupPrefix, [System.StringComparison]::OrdinalIgnoreCase) -or -not (Test-Path -LiteralPath $zipPath)) { throw 'Checkpoint restore path is invalid.' }
+                Expand-Archive -LiteralPath $zipPath -DestinationPath $projectDir -Force
+                Write-Host "CHECKPOINT_RESTORED=$zipPath"
+              }
+              Remove-Item -LiteralPath $editorCommandFile -Force -ErrorAction SilentlyContinue
+              $stamp = Get-Date -Format 'yyyyMMdd_HHmmss'
+              $ueOut = "$root\Logs\unreal-$stamp-stdout.log"
+              $ueErr = "$root\Logs\unreal-$stamp-stderr.log"
+              $ueArgs = @($targetProject, '-log', '-stdout', '-FullStdOutLogOutput', '-AllowSoftwareRendering', '-d3d11', '-ModelContextProtocolStartServer', '-ModelContextProtocolPort=8000', '-ExecCmds="py D:/UE58/UEControl/Content/Python/init_unreal.py"')
+              $ueProc = Start-Process -FilePath $editor -ArgumentList $ueArgs -WorkingDirectory $projectDir -PassThru -RedirectStandardOutput $ueOut -RedirectStandardError $ueErr
+              $activeProjectFile = $targetProject
+              Write-Host "UNREAL_RESTARTED_PID=$($ueProc.Id) PROJECT=$activeProjectFile"
+              $restartedBridge = $false
+              for ($i = 0; $i -lt 90; $i++) {
+                Start-Sleep -Seconds 2
+                try { $h = Invoke-RestMethod -Uri 'http://127.0.0.1:8765/health' -TimeoutSec 4; if ($h.bridge_connected) { $restartedBridge = $true; break } } catch { }
+                if ($ueProc.HasExited) { break }
+              }
+              if (-not $restartedBridge) { throw "Bridge did not reconnect after project restart. Inspect $ueOut and $ueErr." }
+              $restartedMcp = $false
+              for ($i = 0; $i -lt 45; $i++) {
+                try { $probe = Invoke-WebRequest -Uri 'http://127.0.0.1:8000/mcp' -Method Get -TimeoutSec 4 -UseBasicParsing; if ([int]$probe.StatusCode -eq 405) { $restartedMcp = $true; break } } catch { try { if ([int]$_.Exception.Response.StatusCode -eq 405) { $restartedMcp = $true; break } } catch { } }
+                Start-Sleep -Seconds 2
+              }
+              if (-not $restartedMcp) { throw 'Native MCP did not return HTTP 405 after restart.' }
+              Write-Host 'PROJECT_RESTART_BRIDGE_READY=true NATIVE_MCP_LISTENER_READY=true'
+            } catch {
+              Write-Error ("Editor restart handler failed: " + $_)
+              if (Test-Path -LiteralPath $editorCommandFile) { Remove-Item -LiteralPath $editorCommandFile -Force -ErrorAction SilentlyContinue }
+              throw
+            }
+          }
+
+          if ($ueProc -and $ueProc.HasExited) { throw "Unreal Editor stopped with exit code $($ueProc.ExitCode); inspect $ueOut, $ueErr and the active project's Saved\Logs folder." }
+          if (((Get-Date) - $lastHeartbeat).TotalMinutes -ge 30) {
+            try {
+              $h = Invoke-RestMethod -Uri 'http://127.0.0.1:8765/health' -TimeoutSec 4
+              Write-Host ("Heartbeat {0}: API_OK={1} BRIDGE_CONNECTED={2}" -f (Get-Date), $h.ok, $h.bridge_connected)
+            } catch { Write-Warning ("Heartbeat {0}: local health check failed." -f (Get-Date)) }
+            $lastHeartbeat = Get-Date
+          }
+        }
