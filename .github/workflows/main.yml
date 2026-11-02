@@ -525,6 +525,22 @@ jobs:
                             event["result_preview"] = str(response_preview)[:4000]
                         break
             request_monitor_capture()
+            try:
+                event_tool = ""
+                event_ok = False
+                with MONITOR_LOCK:
+                    for _event in MONITOR_EVENTS:
+                        if _event.get("id") == event_id:
+                            event_tool = str(_event.get("tool", ""))
+                            event_ok = _event.get("status") == "completed"
+                            break
+                if event_ok:
+                    _read_only_prefixes = ("get", "list", "query", "read", "inspect", "monitor", "scene", "status", "find", "search", "describe")
+                    _tool_leaf = event_tool.lower().split(".")[-1].replace("-", "_")
+                    if not _tool_leaf.startswith(_read_only_prefixes):
+                        _schedule_scene_autocapture(event_tool)
+            except Exception as _auto_schedule_error:
+                log("Could not schedule automatic scene snapshot: " + repr(_auto_schedule_error))
 
         def monitor_response_preview(raw_bytes):
             if not raw_bytes:
@@ -1186,14 +1202,14 @@ jobs:
                 <button id="uploadBtn">Save latest screenshot to Release</button></div><div id="uploadStatus" class="small muted" style="margin-top:8px"></div></section></div>
                 <section><div class="row" style="justify-content:space-between"><h2>Tool Activity</h2><span class="muted small">refresh every 5 sec</span></div><div id="events"><div class="muted">Waiting for MCP tool calls…</div></div></section>
                 <section id="scenePanel" style="grid-column:1/-1"><div class="row" style="justify-content:space-between"><h2>Actual 3D Scene Viewer</h2><span class="pill" id="sceneStatus">Waiting for scene data</span></div>
-                <div class="small muted">Offline snapshot viewer: the first page load scans the active Unreal level and automatically exports its actual mesh geometry. Use the recapture button only when you want a new read-only snapshot. The browser keeps a local copy for orbit, pan, zoom and object identification; no edits are sent back to Unreal. Refreshing actor metadata alone does not recapture existing geometry.</div>
+                <div class="small muted">Offline snapshot viewer: the first page load scans the active Unreal level, exports its actual mesh geometry and automatically saves a standalone view-only HTML file. After each successful scene-changing tool operation, the final geometry and HTML are rebuilt automatically. The browser copy is read-only; no edits are sent back to Unreal.</div>
                 <div class="scene-model-status" id="sceneModelStatus">No offline snapshot yet · press Capture offline scene snapshot</div>
                 <div class="scene-progress" id="sceneProgress" hidden aria-live="polite">
                   <div class="scene-progress-top"><span id="sceneProgressPhase">Preparing Unreal export…</span><strong id="sceneProgressPercent">0%</strong></div>
                   <div class="scene-progress-track" role="progressbar" aria-label="Unreal scene export progress" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" id="sceneProgressBar"><div class="scene-progress-fill" id="sceneProgressFill"></div></div>
                   <div class="scene-progress-detail" id="sceneProgressDetail">0% complete · 100% remaining</div>
                 </div>
-                <div class="scene-toolbar" aria-label="3D camera controls"><button id="sceneFitAll" class="primary" type="button">Frame actual model</button><button id="sceneZoomIn" type="button">Zoom +</button><button id="sceneZoomOut" type="button">Zoom −</button><button id="sceneViewIso" type="button">Isometric</button><button id="sceneViewTop" type="button">Top</button><button id="sceneViewFront" type="button">Front</button><button id="sceneViewSide" type="button">Side</button><button id="sceneViewBack" type="button">Back</button><button id="sceneRefresh" type="button">Scan Unreal objects</button><button id="sceneModelRefresh" class="primary" type="button">Recapture 3D scene snapshot</button><button id="sceneHtmlDownload" type="button">Download view-only HTML</button></div>
+                <div class="scene-toolbar" aria-label="3D camera controls"><button id="sceneFitAll" class="primary" type="button">Frame actual model</button><button id="sceneZoomIn" type="button">Zoom +</button><button id="sceneZoomOut" type="button">Zoom −</button><button id="sceneViewIso" type="button">Isometric</button><button id="sceneViewTop" type="button">Top</button><button id="sceneViewFront" type="button">Front</button><button id="sceneViewSide" type="button">Side</button><button id="sceneViewBack" type="button">Back</button><button id="sceneRefresh" type="button">Scan Unreal objects</button><button id="sceneModelRefresh" class="primary" type="button">Recapture 3D scene snapshot</button><button id="sceneHtmlDownload" type="button">Open ready view-only HTML</button></div>
                 <div class="scene-layout"><div id="scene3d"><div id="sceneFallback">Waiting for the automatic Unreal mesh export to finish…</div>
                 <aside id="sceneExplorer" class="scene-explorer" aria-label="Unreal object and camera explorer">
                   <div class="scene-explorer-head"><div><b>WORLD OUTLINER</b><div class="actor-meta" id="sceneExplorerCount">Loading actors…</div></div><button id="sceneExplorerToggle" type="button" aria-expanded="true">Hide</button></div>
@@ -1288,6 +1304,7 @@ jobs:
                 let actors = [], cameraHasBeenFramed = false, lastSceneTimestamp = null, lastSceneSignature = '';
                 let activeSceneJob = '', scenePollBusy = false, sceneJobPollTimer = null, modelExportBusy = false, modelExportPending = false, modelPollTimer = null;
                 let autoCaptureAfterMetadataScan=true, offlineSnapshotReady=false, offlineSnapshotKnown=false;
+                let autoHtmlDownloadedVersion=-1;
                 let loadedModelVersion = -1, forceFrameAfterExport = false;
                 let target;
                 let selectableMeshes = [], selectedObject = null, selectedActor = null, selectedBox = null;
@@ -1817,6 +1834,12 @@ jobs:
                     modelExportBusy=false;
                     if(state.status==='ready' && Number(state.version)!==loadedModelVersion){
                       offlineSnapshotKnown=true; offlineSnapshotReady=true; autoCaptureAfterMetadataScan=false;
+                      if(state.html_ready && Number(state.version)!==autoHtmlDownloadedVersion){
+                        autoHtmlDownloadedVersion=Number(state.version);
+                        const htmlLink=document.createElement('a');htmlLink.href='/api/scene/viewer.html?v='+encodeURIComponent(state.version);
+                        htmlLink.download='unreal-scene-viewer.html';document.body.appendChild(htmlLink);htmlLink.click();htmlLink.remove();
+                        document.getElementById('sceneModelStatus').textContent='HTML viewer is ready · downloading automatically…';
+                      }
                       renderSceneProgress(state);
                       glbMeshNames=Array.isArray(state.mesh_node_names)?state.mesh_node_names:[];
                       document.getElementById('sceneModelStatus').dataset.bytes=String(state.size||0);
@@ -1826,7 +1849,12 @@ jobs:
                       if(modelExportPending){ modelExportPending=false; requestSceneModelExport(false); }
                     }else if(state.status==='ready'){
                       offlineSnapshotKnown=true; offlineSnapshotReady=true; autoCaptureAfterMetadataScan=false;
-                      updateSceneProgress(100,'Snapshot ready','All exported geometry is loaded in the browser');
+                      if(state.html_ready && Number(state.version)!==autoHtmlDownloadedVersion){
+                        autoHtmlDownloadedVersion=Number(state.version);
+                        const htmlLink=document.createElement('a');htmlLink.href='/api/scene/viewer.html?v='+encodeURIComponent(state.version);
+                        htmlLink.download='unreal-scene-viewer.html';document.body.appendChild(htmlLink);htmlLink.click();htmlLink.remove();
+                      }
+                      updateSceneProgress(100,'Snapshot and HTML ready','3D model exported · standalone HTML saved automatically');
                       document.getElementById('sceneModelStatus').textContent='Offline snapshot is ready · '+(Number(state.mesh_count||0))+' meshes · '+(Number(state.size||0)/1048576).toFixed(1)+' MB';
                       if(modelExportPending){ modelExportPending=false; requestSceneModelExport(false); }
                     }else if(state.status==='failed'){
@@ -1952,7 +1980,7 @@ jobs:
                   document.getElementById('sceneViewBack').onclick=()=>setView('back');
                   document.getElementById('sceneRefresh').onclick=()=>refreshSceneSnapshot(true);
                   document.getElementById('sceneModelRefresh').onclick=()=>requestSceneModelExport(true);
-                  document.getElementById('sceneHtmlDownload').onclick=async()=>{const button=document.getElementById('sceneHtmlDownload');const original=button.textContent;button.disabled=true;button.textContent='Preparing HTML…';try{const response=await fetch('/api/scene/export.html',{cache:'no-store'});if(!response.ok){let message='HTML export failed';try{const payload=await response.json();message=payload.error||message;}catch(_){}throw new Error(message);}const blob=await response.blob();const url=URL.createObjectURL(blob);const link=document.createElement('a');link.href=url;link.download='unreal-scene-viewer.html';document.body.appendChild(link);link.click();link.remove();setTimeout(()=>URL.revokeObjectURL(url),30000);button.textContent='HTML downloaded';}catch(error){alert('Could not create view-only HTML: '+error.message);button.textContent='HTML export failed';}finally{button.disabled=false;setTimeout(()=>{button.textContent=original;},2500);}};
+                  document.getElementById('sceneHtmlDownload').onclick=async()=>{const button=document.getElementById('sceneHtmlDownload');const original=button.textContent;button.disabled=true;button.textContent='Opening ready HTML…';try{const response=await fetch('/api/scene/viewer.html',{cache:'no-store'});if(!response.ok){let message='HTML export failed';try{const payload=await response.json();message=payload.error||message;}catch(_){}throw new Error(message);}const blob=await response.blob();const url=URL.createObjectURL(blob);const link=document.createElement('a');link.href=url;link.download='unreal-scene-viewer.html';document.body.appendChild(link);link.click();link.remove();setTimeout(()=>URL.revokeObjectURL(url),30000);button.textContent='HTML downloaded';}catch(error){alert('Could not create view-only HTML: '+error.message);button.textContent='HTML export failed';}finally{button.disabled=false;setTimeout(()=>{button.textContent=original;},2500);}};
                   document.getElementById('sceneFilter').addEventListener('change',renderList);
                   document.getElementById('sceneSearch').addEventListener('input',renderList);
                   document.getElementById('actorList').addEventListener('click',event=>{
@@ -2112,9 +2140,15 @@ jobs:
         SCENE_MODEL_LOCK = threading.RLock()
         SCENE_MODEL_STATE = {"status": "idle", "job_id": "", "path": "", "job_dir": "", "model_files": [], "version": 0,
                              "updated": 0.0, "size": 0, "mesh_node_names": [], "mesh_count": 0, "error": "",
-                             "progress": 0, "phase": "Idle", "completed": 0, "total": 0, "detail": ""}
+                             "progress": 0, "phase": "Idle", "completed": 0, "total": 0, "detail": "",
+                             "html_ready": False, "html_path": "", "html_error": ""}
         SCENE_MODEL_DIR = (ROOT / "Screenshots").resolve()
         SCENE_MODEL_DIR.mkdir(parents=True, exist_ok=True)
+        SCENE_HTML_PATH = (SCENE_MODEL_DIR / "unreal-scene-viewer.html").resolve()
+        SCENE_AUTO_LOCK = threading.RLock()
+        SCENE_AUTO_TIMER = None
+        SCENE_AUTO_PENDING = False
+        SCENE_AUTO_LAST_TOOL = ""
         SCENE_JOBS = {}
         SCENE_JOB_LOCK = threading.RLock()
         SCENE_ACTIVE_JOB = ""
@@ -2988,6 +3022,18 @@ jobs:
                 log("Offline scene snapshot exported: job=%s size=%s bytes meshes=%s nodes=%s mode=%s" % (
                     job_id, size, report.get("mesh_count", 0), report.get("mesh_nodes", 0),
                     report.get("export_mode", "whole_level")))
+                try:
+                    html_path = _write_scene_html_after_export()
+                    with SCENE_MODEL_LOCK:
+                        if SCENE_MODEL_STATE.get("job_id") == job_id:
+                            SCENE_MODEL_STATE.update({"html_ready": True, "html_path": str(html_path),
+                                                      "html_updated": time.time(), "phase": "3D snapshot and view-only HTML ready"})
+                    log("Automatic view-only HTML created: " + str(html_path))
+                except Exception as html_error:
+                    with SCENE_MODEL_LOCK:
+                        if SCENE_MODEL_STATE.get("job_id") == job_id:
+                            SCENE_MODEL_STATE.update({"html_ready": False, "html_error": str(html_error)[:1000]})
+                    log("Automatic view-only HTML creation failed: " + repr(html_error))
             except Exception as exc:
                 temp_path.unlink(missing_ok=True)
                 with SCENE_MODEL_LOCK:
@@ -3007,6 +3053,7 @@ jobs:
                     return jsonify(ok=True, status=SCENE_MODEL_STATE["status"], job_id=SCENE_MODEL_STATE.get("job_id", "")), 202
                 job_id = uuid.uuid4().hex
                 SCENE_MODEL_STATE.update({"status": "queued", "job_id": job_id, "error": "",
+                                          "html_ready": False, "html_error": "",
                                           "progress": 0, "phase": "Queued for Unreal export",
                                           "completed": 0, "total": 0, "detail": "Waiting for export worker",
                                           "started_at": time.time()})
@@ -3042,6 +3089,9 @@ jobs:
                                     for item in (state.get("model_files", []) or [])]
             state.pop("job_dir", None)
             state["offline_snapshot"] = True
+            state["html_ready"] = bool(state.get("html_ready") and SCENE_HTML_PATH.is_file())
+            state["html_url"] = "/api/scene/viewer.html" if state["html_ready"] else ""
+            state.pop("html_path", None)
             state["ok"] = state.get("status") != "failed"
             return jsonify(state)
         
@@ -3169,6 +3219,91 @@ jobs:
             except Exception as exc:
                 log("Read-only HTML scene export failed: " + repr(exc))
                 return jsonify(ok=False, error=str(exc)[:1200]), 500
+
+
+        def _write_scene_html_after_export():
+            """Render the same view-only HTML response and atomically persist it beside scene assets."""
+            with app.test_request_context("/api/scene/export.html", method="GET"):
+                original = getattr(api_scene_export_html, "__wrapped__", api_scene_export_html)
+                response = original()
+                if getattr(response, "status_code", 200) != 200:
+                    try:
+                        detail = response.get_data(as_text=True)
+                    except Exception:
+                        detail = "HTML response failed"
+                    raise RuntimeError("HTML generation returned HTTP %s: %s" % (response.status_code, detail[:600]))
+                payload = response.get_data()
+            if not payload or b"Unreal Scene" not in payload or b"scene-data" not in payload:
+                raise RuntimeError("Generated HTML is empty or missing embedded scene data")
+            temporary = SCENE_HTML_PATH.with_suffix(".html.tmp")
+            temporary.write_bytes(payload)
+            os.replace(str(temporary), str(SCENE_HTML_PATH))
+            return SCENE_HTML_PATH
+
+
+        def _run_scene_autocapture(tool_name=""):
+            """Refresh actor metadata and export a new GLB+HTML after a successful scene-changing MCP tool."""
+            if not bridge_connected():
+                log("Automatic scene refresh skipped: Unreal Bridge is offline")
+                return
+            with SCENE_MODEL_LOCK:
+                export_is_active = SCENE_MODEL_STATE.get("status") in ("queued", "running")
+            if export_is_active:
+                # Keep the final scene change: retry after the in-flight export completes.
+                retry = threading.Timer(5.0, _run_scene_autocapture, args=(tool_name,))
+                retry.daemon = True
+                retry.start()
+                log("Automatic scene refresh deferred: waiting for the current geometry export")
+                return
+            scan_id = uuid.uuid4().hex
+            try:
+                payload = _scene_snapshot_from_unreal(timeout=10000, job_id=scan_id)
+                payload["updated"] = time.time()
+                payload["updated_at"] = payload["updated"]
+                with SCENE_LOCK:
+                    SCENE_CACHE.update(payload)
+                    SCENE_CACHE["error"] = ""
+                with SCENE_MODEL_LOCK:
+                    if SCENE_MODEL_STATE.get("status") in ("queued", "running"):
+                        return
+                    job_id = uuid.uuid4().hex
+                    SCENE_MODEL_STATE.update({"status": "queued", "job_id": job_id, "error": "",
+                                              "html_ready": False, "html_error": "", "progress": 0,
+                                              "phase": "Automatic export after Unreal change",
+                                              "completed": 0, "total": 0,
+                                              "detail": "Updated after tool: " + str(tool_name)[:120],
+                                              "started_at": time.time()})
+                threading.Thread(target=_scene_model_export_worker, args=(job_id,),
+                                 name="UE-AutoScene-" + job_id[:8], daemon=True).start()
+                log("Automatic scene export queued after tool: " + str(tool_name))
+            except Exception as exc:
+                log("Automatic scene refresh failed after %s: %s" % (tool_name, repr(exc)))
+
+
+        def _schedule_scene_autocapture(tool_name=""):
+            """Debounce tool activity so a multi-step operation creates one final snapshot."""
+            global SCENE_AUTO_TIMER, SCENE_AUTO_LAST_TOOL
+            with SCENE_AUTO_LOCK:
+                SCENE_AUTO_LAST_TOOL = str(tool_name or "Unreal tool")
+                if SCENE_AUTO_TIMER is not None:
+                    try:
+                        SCENE_AUTO_TIMER.cancel()
+                    except Exception:
+                        pass
+                SCENE_AUTO_TIMER = threading.Timer(3.0, _run_scene_autocapture, args=(SCENE_AUTO_LAST_TOOL,))
+                SCENE_AUTO_TIMER.daemon = True
+                SCENE_AUTO_TIMER.start()
+
+
+        @app.get("/api/scene/viewer.html")
+        @monitor_auth
+        def api_scene_viewer_html():
+            if not SCENE_HTML_PATH.is_file():
+                return jsonify(ok=False, error="The automatic HTML viewer is not ready; wait for the scene export to finish."), 409
+            response = send_file(str(SCENE_HTML_PATH), mimetype="text/html", as_attachment=False,
+                                 download_name="unreal-scene-viewer.html", max_age=0)
+            response.headers["Cache-Control"] = "no-store, max-age=0"
+            return response
         
         
         @app.get("/api/projects")
