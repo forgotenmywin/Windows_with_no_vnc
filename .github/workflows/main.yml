@@ -5513,7 +5513,15 @@ jobs:
         $python = (Get-Command python).Source
         & $python -m py_compile 'D:\UE58\api_server.py' 'D:\UE58\UEControl\Content\Python\init_unreal.py'
         if ($LASTEXITCODE -ne 0) { throw 'Generated Python scripts failed syntax validation.' }
+        $apiText = Get-Content -LiteralPath 'D:\UE58\api_server.py' -Raw -Encoding utf8
+        if ($apiText -notmatch '(?m)^\s{8}mcp_timeout\s*=\s*httpx\.Timeout\(connect=10\.0, read=90\.0, write=30\.0, pool=10\.0\)\s*$') {
+          throw 'MCP_TIMEOUT_ASSIGNMENT_INVALID: mcp_timeout must be a standalone executable Python line, not part of a comment.'
+        }
+        if ($apiText -notmatch 'async def public_app' -or $apiText -notmatch 'canonical_request_path') {
+          throw 'PUBLIC_MCP_ROUTER_INVALID: /mcp public ASGI dispatcher was not generated.'
+        }
         Write-Host 'PYTHON_SYNTAX_VALIDATION=true'
+        Write-Host 'MCP_PROXY_STATIC_VALIDATION=true'
     - name: Launch API, Unreal and Cloudflare tunnel
       shell: pwsh
       env:
@@ -5928,8 +5936,10 @@ jobs:
         $summaryText = @"
         ## Unreal Live Monitor
         - [Open read-only monitor]($monitorUrl)
-        - **MCP endpoint for ChatGPT (No authentication):** $mcpEndpoint
-        - Use the exact MCP endpoint above; do not paste the monitor URL or the bare PUBLIC_API_URL.
+        - **MCP endpoint for ChatGPT:** $mcpEndpoint
+        - **ChatGPT Connection:** Custom URL (not a Secure MCP Tunnel ID)
+        - **ChatGPT Authentication:** No authentication
+        - Paste the exact HTTPS MCP endpoint above, including `/mcp`; do not paste the monitor URL or bare PUBLIC_API_URL.
         - The Quick Tunnel URL is temporary and works only while this Actions workflow and cloudflared process remain running.
         - Monitor username: viewer
         - Monitor password: repository secret MONITOR_PASSWORD
@@ -5940,6 +5950,7 @@ jobs:
         Write-Host 'REST endpoints: GET /health; authenticated read-only monitor at GET /monitor; authenticated file, Drive, GitHub Release, project and unified logs endpoints.'
         Write-Host "MCP_ENDPOINT=$mcpEndpoint"
         Write-Host "MCP_ENDPOINT_COPY=$($mcpEndpoint.TrimEnd('/'))"
+        Write-Host 'MCP_CONNECTOR_CONNECTION=Custom URL (not Secure MCP Tunnel ID)'
         Write-Host "MCP_CONNECTOR_AUTH=No authentication"
         Write-Host 'IMPORTANT: Paste MCP_ENDPOINT_COPY exactly in ChatGPT Connection: HTTPS host plus /mcp, with NO trailing slash. Never reuse a URL from an older workflow run.'
         Write-Host 'Single MCP endpoint only: /mcp -> native Unreal AllToolsets plus monitor, binary-upload and guarded GitHub Release tools. No second MCP URL.'
