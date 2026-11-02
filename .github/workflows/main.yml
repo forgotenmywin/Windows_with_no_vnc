@@ -416,6 +416,12 @@ jobs:
         MCP_LEGACY_SESSION_LOCK = asyncio.Lock()
         MCP_MODERN_PROTOCOL = "2026-07-28"
         MCP_LEGACY_PROTOCOL = "2025-11-25"
+        # Native Unreal tool schemas can take a long time to enumerate on first access.
+        # Warm them locally before exposing the public tunnel, then serve tools/list from
+        # this immutable cache so Cloudflare/client request deadlines cannot interrupt it.
+        MCP_NATIVE_TOOLS_CACHE = None
+        MCP_NATIVE_TOOLS_CACHE_AT = 0.0
+        MCP_NATIVE_TOOLS_CACHE_LOCK = threading.RLock()
         RELEASE_UPLOAD_LOCK = threading.Lock()
         RELEASE_LAST_UPLOAD_TIME = 0.0
         FILE_MANAGER_STATE = {"public_base_url": ""}
@@ -4710,6 +4716,85 @@ jobs:
                 raw, parsed, was_sse = await read_mcp_http_reply(response, request_obj)
                 return response.status_code, dict(response.headers), list(response.headers.raw), raw, parsed, was_sse
 
+        async def _fetch_native_tools_cache(timeout_seconds=180):
+            """Fetch Unreal's native tool catalog over localhost, independent of Cloudflare."""
+            global MCP_NATIVE_TOOLS_CACHE, MCP_NATIVE_TOOLS_CACHE_AT
+            target = "http://127.0.0.1:8000/mcp"
+            timeout = httpx.Timeout(connect=10.0, read=float(timeout_seconds), write=30.0, pool=10.0)
+            async with httpx.AsyncClient(timeout=timeout, trust_env=False) as client:
+                last_error = None
+                for attempt in range(1, 3):
+                    init_id = "ue58-native-tools-cache-init-" + uuid.uuid4().hex[:12]
+                    init_payload = {
+                        "jsonrpc": "2.0", "id": init_id, "method": "initialize",
+                        "params": {
+                            "protocolVersion": MCP_LEGACY_PROTOCOL,
+                            "capabilities": {},
+                            "clientInfo": {"name": "UE58-Local-ToolCatalog-Warmup", "version": "1.0.0"}
+                        }
+                    }
+                    init_headers = {
+                        "Accept": "application/json, text/event-stream",
+                        "Content-Type": "application/json"
+                    }
+                    status, response_headers, _, raw, init_result, _ = await mcp_post_and_read(
+                        client, target, init_headers, init_payload, json_body=init_payload)
+                    if status != 200 or not isinstance(init_result, dict) or init_result.get("error") or not isinstance(init_result.get("result"), dict):
+                        last_error = "initialize HTTP %s: %s" % (status, raw.decode("utf-8", errors="replace")[:1000])
+                        log("MCP local tool-catalog warmup attempt %s initialize failed: %s" % (attempt, last_error))
+                        continue
+
+                    session_id = response_headers.get("mcp-session-id", "")
+                    notify_headers = {
+                        "Accept": "application/json, text/event-stream",
+                        "Content-Type": "application/json",
+                        "MCP-Protocol-Version": MCP_LEGACY_PROTOCOL
+                    }
+                    if session_id:
+                        notify_headers["Mcp-Session-Id"] = session_id
+                    notify = await client.post(
+                        target, headers=notify_headers,
+                        json={"jsonrpc": "2.0", "method": "notifications/initialized"})
+                    if notify.status_code not in (200, 202, 204):
+                        last_error = "notifications/initialized HTTP %s: %s" % (notify.status_code, notify.text[:700])
+                        log("MCP local tool-catalog warmup attempt %s notification failed: %s" % (attempt, last_error))
+                        continue
+
+                    list_id = "ue58-native-tools-cache-list-" + uuid.uuid4().hex[:12]
+                    list_payload = {"jsonrpc": "2.0", "id": list_id, "method": "tools/list", "params": {}}
+                    list_headers = {
+                        "Accept": "application/json, text/event-stream",
+                        "Content-Type": "application/json",
+                        "MCP-Protocol-Version": MCP_LEGACY_PROTOCOL
+                    }
+                    if session_id:
+                        list_headers["Mcp-Session-Id"] = session_id
+                    log("MCP local tool-catalog warmup: requesting native tools/list (attempt %s, session=%s)" % (attempt, bool(session_id)))
+                    status, list_response_headers, _, list_raw, parsed, was_sse = await mcp_post_and_read(
+                        client, target, list_headers, list_payload, json_body=list_payload)
+                    if status == 404 and attempt == 1:
+                        last_error = "tools/list returned HTTP 404 for the fresh session; retrying with a new session"
+                        log("MCP local tool-catalog warmup: " + last_error)
+                        continue
+                    if status != 200:
+                        last_error = "tools/list HTTP %s: %s" % (status, list_raw.decode("utf-8", errors="replace")[:1200])
+                        log("MCP local tool-catalog warmup failed: " + last_error)
+                        continue
+                    if not isinstance(parsed, dict) or parsed.get("error") or not isinstance(parsed.get("result"), dict) or not isinstance(parsed["result"].get("tools"), list):
+                        last_error = "tools/list returned an invalid JSON-RPC payload: " + str(parsed)[:1200]
+                        log("MCP local tool-catalog warmup failed: " + last_error)
+                        continue
+
+                    native_tools = parsed["result"]["tools"]
+                    with MCP_NATIVE_TOOLS_CACHE_LOCK:
+                        MCP_NATIVE_TOOLS_CACHE = parsed
+                        MCP_NATIVE_TOOLS_CACHE_AT = time.time()
+                    log("MCP_NATIVE_TOOLS_CACHE_READY=true native_tool_count=%s bytes=%s sse=%s" % (
+                        len(native_tools), len(list_raw), was_sse))
+                    return parsed
+
+            raise RuntimeError("Could not prefetch Unreal tools/list locally: " + str(last_error or "unknown error"))
+
         async def send_mcp_json(send, obj, headers=None, status=200):
             payload = json.dumps(obj, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
             with MONITOR_LOCK:
@@ -5102,6 +5187,29 @@ jobs:
                 if key.lower() in (b"mcp-session-id", b"mcp-protocol-version")
             ]
 
+            # Return the pre-warmed native Unreal tool catalog immediately. The first
+            # native tools/list can be expensive; it is fetched on localhost before the
+            # public MCP handshake, never while a Cloudflare request is waiting.
+            if method == "tools/list":
+                with MCP_NATIVE_TOOLS_CACHE_LOCK:
+                    cached_tools_response = MCP_NATIVE_TOOLS_CACHE
+                if isinstance(cached_tools_response, dict):
+                    cached_response = json.loads(json.dumps(cached_tools_response, ensure_ascii=False))
+                    cached_response["id"] = request_obj.get("id") if isinstance(request_obj, dict) else None
+                    result_obj = cached_response.get("result")
+                    if isinstance(result_obj, dict) and isinstance(result_obj.get("tools"), list):
+                        existing_names = {item.get("name") for item in result_obj["tools"] if isinstance(item, dict)}
+                        for item in file_manager_mcp_tools():
+                            if item.get("name") not in existing_names:
+                                result_obj["tools"].append(item)
+                        if modern_mode:
+                            _normalize_modern_mcp_result(cached_response, "tools/list")
+                        log("MCP tools/list served from local cache; total_tool_count=%s" % len(result_obj["tools"]))
+                        await send_mcp_json(send, cached_response, headers=local_response_headers)
+                        return
+                else:
+                    log("MCP tools/list cache is empty; falling back to native upstream request")
+
             # File Manager URL/status are served locally; no viewport monitoring is performed.
             if method == "tools/call" and isinstance(params, dict) and params.get("name") in ("file_manager_get_url", "file_manager_get_status"):
                 tool_name = params.get("name")
@@ -5235,7 +5343,7 @@ jobs:
                 # Bound upstream waits. The native Unreal MCP endpoint returns one
                 # finite response for POST; unlimited streaming waits can leave a
                 # Cloudflare request hanging until the client cancels it.
-                mcp_timeout = httpx.Timeout(connect=10.0, read=90.0, write=30.0, pool=10.0)
+                mcp_timeout = httpx.Timeout(connect=10.0, read=180.0, write=60.0, pool=15.0)
                 async with httpx.AsyncClient(timeout=mcp_timeout, trust_env=False) as client:
                     upstream_body = bytes(body)
                     # tools/list: stop at the matching SSE event rather than waiting for EOF.
@@ -5361,6 +5469,21 @@ jobs:
                             "headers": [(b"content-type", b"application/json; charset=utf-8"), (b"content-length", str(len(err)).encode())]})
                 await send({"type": "http.response.body", "body": err})
 
+        @app.post("/internal/mcp/warmup")
+        @bridge_auth
+        def internal_mcp_tools_warmup():
+            """Pre-enumerate native Unreal MCP tools locally before public handshake tests."""
+            started = time.time()
+            try:
+                parsed = asyncio.run(_fetch_native_tools_cache(timeout_seconds=210))
+                native_count = len(parsed.get("result", {}).get("tools", []))
+                total_count = native_count + len(file_manager_mcp_tools())
+                return jsonify(ok=True, native_tool_count=native_count, total_tool_count=total_count,
+                               elapsed_seconds=round(time.time() - started, 2), cached=True)
+            except Exception as exc:
+                log("MCP local warmup endpoint failed: %s: %s" % (type(exc).__name__, str(exc)[:1500]))
+                return jsonify(ok=False, error=str(exc), elapsed_seconds=round(time.time() - started, 2)), 502
+
         # One public MCP endpoint: /mcp (with / as a compatibility alias) proxies Unreal's native AllToolsets server
         # and adds File Manager tools plus guarded Release upload tools to tools/list.
         # REST fallback endpoints remain available under the same tunnel host and use Basic auth.
@@ -5407,7 +5530,7 @@ jobs:
         & $python -m py_compile 'D:\UE58\api_server.py' 'D:\UE58\UEControl\Content\Python\init_unreal.py'
         if ($LASTEXITCODE -ne 0) { throw 'Generated Python scripts failed syntax validation.' }
         $apiText = Get-Content -LiteralPath 'D:\UE58\api_server.py' -Raw -Encoding utf8
-        if ($apiText -notmatch '(?m)^\s{8}mcp_timeout\s*=\s*httpx\.Timeout\(connect=10\.0, read=90\.0, write=30\.0, pool=10\.0\)\s*$') {
+        if ($apiText -notmatch '(?m)^\s{8}mcp_timeout\s*=\s*httpx\.Timeout\(connect=10\.0, read=180\.0, write=60\.0, pool=15\.0\)\s*$') {
           throw 'MCP_TIMEOUT_ASSIGNMENT_INVALID: mcp_timeout must be a standalone executable Python line, not part of a comment.'
         }
         if ($apiText -notmatch 'async def public_app' -or $apiText -notmatch 'canonical_request_path') {
@@ -5792,6 +5915,27 @@ jobs:
           throw 'NATIVE_MCP_LISTENER_READY=false. Do not add the MCP URL in ChatGPT yet; inspect UEControl\Saved\Logs\UnrealEditor.log and unreal-stdout.log for LogModelContextProtocol errors.'
         }
 
+        # Warm the full native AllToolsets catalog over localhost. The first tools/list
+        # can take longer than Cloudflare's edge request window; prefetching here keeps
+        # the public tools/list response fast and deterministic.
+        Write-Host 'MCP_NATIVE_TOOLS_WARMUP_START=true (local Unreal -> local API; up to 210 seconds)'
+        $warmupHeaders = @{ Authorization = "Bearer $env:BRIDGE_TOKEN" }
+        try {
+          $warmup = Invoke-RestMethod -Uri 'http://127.0.0.1:8765/internal/mcp/warmup' -Method Post -Headers $warmupHeaders -ContentType 'application/json' -Body '{}' -TimeoutSec 230
+          if (-not $warmup.ok -or -not $warmup.cached -or [int]$warmup.native_tool_count -lt 1) {
+            throw ("Local native MCP warmup returned an invalid result: " + ($warmup | ConvertTo-Json -Compress -Depth 8))
+          }
+          Write-Host ("MCP_NATIVE_TOOLS_WARMUP_OK=true NATIVE_TOOLS={0} TOTAL_TOOLS={1} ELAPSED_SECONDS={2}" -f $warmup.native_tool_count, $warmup.total_tool_count, $warmup.elapsed_seconds)
+        } catch {
+          foreach ($diagnosticFile in @("$root\Logs\api.log", $apiErr, $apiOut, $ueOut, $ueErr)) {
+            if ($diagnosticFile -and (Test-Path -LiteralPath $diagnosticFile)) {
+              Write-Host "--- $diagnosticFile (last 100 lines) ---"
+              Get-Content -LiteralPath $diagnosticFile -Tail 100 -ErrorAction SilentlyContinue
+            }
+          }
+          throw ("MCP_NATIVE_TOOLS_WARMUP_FAILED: " + $_.Exception.Message)
+        }
+
         # End-to-end public MCP test. A local GET/405 only proves the Unreal listener
         # exists; it does NOT prove ChatGPT can reach the public Cloudflare endpoint.
         # First wait for Cloudflare edge propagation and test the public health route.
@@ -5877,7 +6021,7 @@ jobs:
           $listHeaders = @{ Accept = $mcpAccept; 'MCP-Protocol-Version' = $negotiatedProtocol }
           if ($mcpSessionId) { $listHeaders['Mcp-Session-Id'] = $mcpSessionId }
           $listPayload = @{ jsonrpc = '2.0'; id = 'ue58-public-connectivity-tools'; method = 'tools/list'; params = @{} } | ConvertTo-Json -Depth 8 -Compress
-          $toolsResponse = Invoke-WebRequest -Uri $mcpEndpointUri -Method Post -Headers $listHeaders -ContentType 'application/json' -Body $listPayload -TimeoutSec 30 -UseBasicParsing
+          $toolsResponse = Invoke-WebRequest -Uri $mcpEndpointUri -Method Post -Headers $listHeaders -ContentType 'application/json' -Body $listPayload -TimeoutSec 60 -UseBasicParsing
           if ([int]$toolsResponse.StatusCode -ne 200) { throw "MCP tools/list returned HTTP $([int]$toolsResponse.StatusCode)." }
           $toolsJson = $toolsResponse.Content | ConvertFrom-Json -ErrorAction Stop
           if ($toolsJson.error) { throw ("MCP tools/list JSON-RPC error: " + ($toolsJson.error | ConvertTo-Json -Compress -Depth 8)) }
