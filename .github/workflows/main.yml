@@ -1984,1099 +1984,1099 @@ jobs:
                   document.getElementById('sceneFallback').textContent='3D viewer failed to load: '+error.message+' (check access to jsdelivr.net)';
                 }
                 </script></body></html>'''
-                    response = app.response_class(page, mimetype="text/html")
-                    response.headers["Cache-Control"] = "no-store"
-                    return response
+            response = app.response_class(page, mimetype="text/html")
+            response.headers["Cache-Control"] = "no-store"
+            return response
         
-                @app.get("/api/monitor/state")
-                @monitor_auth
-                def monitor_state():
-                    with MONITOR_LOCK:
-                        needs_first_image = (not MONITOR_STATE.get("image_path")
-                                             and not MONITOR_STATE.get("capture_running")
-                                             and not MONITOR_STATE.get("capture_error"))
-                    if needs_first_image and bridge_connected():
-                        request_monitor_capture()
-                        _start_monitor_capture(force=False)
-                    response = jsonify(monitor_state_payload())
-                    response.headers["Cache-Control"] = "no-store"
-                    return response
+        @app.get("/api/monitor/state")
+        @monitor_auth
+        def monitor_state():
+            with MONITOR_LOCK:
+                needs_first_image = (not MONITOR_STATE.get("image_path")
+                                     and not MONITOR_STATE.get("capture_running")
+                                     and not MONITOR_STATE.get("capture_error"))
+            if needs_first_image and bridge_connected():
+                request_monitor_capture()
+                _start_monitor_capture(force=False)
+            response = jsonify(monitor_state_payload())
+            response.headers["Cache-Control"] = "no-store"
+            return response
         
-                @app.get("/api/monitor/latest.jpg")
-                @monitor_auth
-                def monitor_latest_image():
-                    with MONITOR_LOCK:
-                        value = MONITOR_STATE.get("image_path")
-                    target = Path(value) if value else None
-                    if not target or not target.is_file():
-                        return jsonify(ok=False, error="monitor_image_not_ready"), 404
-                    response = send_file(target, mimetype="image/jpeg", conditional=False, max_age=0)
-                    response.headers["Cache-Control"] = "no-store, max-age=0"
-                    return response
+        @app.get("/api/monitor/latest.jpg")
+        @monitor_auth
+        def monitor_latest_image():
+            with MONITOR_LOCK:
+                value = MONITOR_STATE.get("image_path")
+            target = Path(value) if value else None
+            if not target or not target.is_file():
+                return jsonify(ok=False, error="monitor_image_not_ready"), 404
+            response = send_file(target, mimetype="image/jpeg", conditional=False, max_age=0)
+            response.headers["Cache-Control"] = "no-store, max-age=0"
+            return response
         
-                def _start_monitor_capture(force=False):
-                    """Start at most one low-frequency viewport capture worker."""
-                    with MONITOR_LOCK:
-                        if MONITOR_STATE["capture_running"]:
-                            if force:
-                                MONITOR_STATE["capture_again"] = True
-                            return {"ok": True, "status": "already_running"}, 202
-                        if force:
-                            MONITOR_STATE["capture_requested"] = True
-                        if not MONITOR_STATE["capture_requested"]:
-                            return {"ok": True, "status": "not_requested"}, 200
-                        now = time.time()
-                        cooldown_left = 30 - (now - MONITOR_STATE["last_capture_request"])
-                        if cooldown_left > 0 and not force:
-                            return {"ok": True, "status": "throttled",
-                                    "retry_after_seconds": int(cooldown_left) + 1}, 202
-                        MONITOR_STATE["capture_requested"] = False
-                        MONITOR_STATE["capture_running"] = True
-                        MONITOR_STATE["last_capture_request"] = now
-                    threading.Thread(target=monitor_capture_worker, name="UE-Monitor-Capture", daemon=True).start()
-                    return {"ok": True, "status": "capture_started"}, 202
-        
-        
-                @app.post("/internal/monitor/initial-capture")
-                @bridge_auth
-                def internal_monitor_initial_capture():
-                    if not bridge_connected():
-                        return jsonify(ok=False, error="Unreal Bridge is not connected"), 503
-                    request_monitor_capture()
-                    result, status = _start_monitor_capture(force=False)
-                    log("Initial monitor capture requested by workflow startup: %s" % result.get("status"))
-                    return jsonify(result), status
+        def _start_monitor_capture(force=False):
+            """Start at most one low-frequency viewport capture worker."""
+            with MONITOR_LOCK:
+                if MONITOR_STATE["capture_running"]:
+                    if force:
+                        MONITOR_STATE["capture_again"] = True
+                    return {"ok": True, "status": "already_running"}, 202
+                if force:
+                    MONITOR_STATE["capture_requested"] = True
+                if not MONITOR_STATE["capture_requested"]:
+                    return {"ok": True, "status": "not_requested"}, 200
+                now = time.time()
+                cooldown_left = 30 - (now - MONITOR_STATE["last_capture_request"])
+                if cooldown_left > 0 and not force:
+                    return {"ok": True, "status": "throttled",
+                            "retry_after_seconds": int(cooldown_left) + 1}, 202
+                MONITOR_STATE["capture_requested"] = False
+                MONITOR_STATE["capture_running"] = True
+                MONITOR_STATE["last_capture_request"] = now
+            threading.Thread(target=monitor_capture_worker, name="UE-Monitor-Capture", daemon=True).start()
+            return {"ok": True, "status": "capture_started"}, 202
         
         
-                @app.post("/api/monitor/capture")
-                @monitor_auth
-                def monitor_capture_request():
-                    body = request.get_json(silent=True) or {}
-                    result, status = _start_monitor_capture(force=body.get("force") is True)
-                    return jsonify(result), status
-        
-                @app.post("/api/monitor/release-upload")
-                @monitor_auth
-                def monitor_release_upload():
-                    body = request.get_json(silent=True) or {}
-                    tag = str(body.get("tag") or "ue5.8").strip()
-                    filename = str(body.get("filename") or "").strip()
-                    with MONITOR_LOCK:
-                        screenshot = MONITOR_STATE.get("image_path")
-                    source_value = screenshot if body.get("latest_screenshot", True) else body.get("source", "")
-                    try:
-                        source = safe_path(source_value or "")
-                        allowed_roots = [UPLOAD_ROOT, (ROOT / "Screenshots").resolve()]
-                        if not any(root == source or root in source.parents for root in allowed_roots):
-                            return jsonify(ok=False, error="source_must_be_inside_Uploads_or_Screenshots"), 400
-                        if not source.is_file():
-                            return jsonify(ok=False, error="source_file_not_found", source=str(source)), 404
-                        if source.stat().st_size > 100 * 1024 * 1024:
-                            return jsonify(ok=False, error="Release uploads are limited to 100 MiB per file"), 413
-                        if not filename and source.suffix.lower() in (".jpg", ".jpeg"):
-                            filename = "UnrealViewport_" + time.strftime("%Y%m%d_%H%M%S") + ".jpg"
-                        result = github_release_upload(source, tag, filename)
-                        log("Monitor uploaded file to GitHub Release tag=%s file=%s" % (tag, filename or source.name))
-                        return jsonify(result)
-                    except Exception as exc:
-                        log("Monitor GitHub Release upload failed: " + repr(exc))
-                        return jsonify(ok=False, error=str(exc)), 502
-        
-                @app.post("/internal/set-public-url")
-                @bridge_auth
-                def internal_set_public_url():
-                    body = request.get_json(silent=True) or {}
-                    url = str(body.get("public_url") or "").rstrip("/")
-                    if not re.fullmatch(r"https://[a-zA-Z0-9-]+\.trycloudflare\.com", url):
-                        return jsonify(ok=False, error="invalid_quick_tunnel_url"), 400
-                    with MONITOR_LOCK:
-                        MONITOR_STATE["public_base_url"] = url
-                    log("Public Quick Tunnel URL registered for monitor and MCP link tool")
-                    return jsonify(ok=True, monitor_url=url + "/monitor", mcp_url=url + "/mcp")
-        
-                # ---- Extended read-only scene monitor, project/plugin manager, checkpoints, packaging and MCP gateway ----
-                import ipaddress, socket, subprocess, zipfile
-        
-                CURRENT_PROJECT_FILE = (ROOT / "UEControl" / "UEControl.uproject").resolve()
-                CONTROL_DIR = ROOT / "control"
-                BACKUP_DIR = ROOT / "Backups"
-                BUILD_DIR = ROOT / "Builds"
-                CONFIG_DIR = ROOT / "Config"
-                for _folder in (CONTROL_DIR, BACKUP_DIR, BUILD_DIR, CONFIG_DIR):
-                    _folder.mkdir(parents=True, exist_ok=True)
-                EDITOR_COMMAND_FILE = CONTROL_DIR / "editor-command.json"
-                MCP_REGISTRY_FILE = CONFIG_DIR / "mcp_servers.json"
-                SCENE_CACHE = {"updated": 0.0, "updated_at": 0.0, "level": "", "count": 0, "actors": [], "error": ""}
-                SCENE_LOCK = threading.RLock()
-                # Full-fidelity read-only scene export. The GLB is produced by Unreal's official GLTFExporter plugin.
-                SCENE_MODEL_LOCK = threading.RLock()
-                SCENE_MODEL_STATE = {"status": "idle", "job_id": "", "path": "", "job_dir": "", "model_files": [], "version": 0,
-                                     "updated": 0.0, "size": 0, "mesh_node_names": [], "mesh_count": 0, "error": "",
-                                     "progress": 0, "phase": "Idle", "completed": 0, "total": 0, "detail": ""}
-                SCENE_MODEL_DIR = (ROOT / "Screenshots").resolve()
-                SCENE_MODEL_DIR.mkdir(parents=True, exist_ok=True)
-                SCENE_JOBS = {}
-                SCENE_JOB_LOCK = threading.RLock()
-                SCENE_ACTIVE_JOB = ""
-                PLUGIN_INDEX_CACHE = {"roots": (), "paths": None, "built_at": 0.0}
-                PLUGIN_INDEX_LOCK = threading.RLock()
-                PACKAGE_JOBS = {}
-                PACKAGE_LOCK = threading.RLock()
-        
-                # Headless Unreal commandlet jobs are supervised by the long-running PowerShell
-                # process. That supervisor owns the GUI Editor lifecycle so an intentional
-                # Editor shutdown never looks like a crashed GitHub Actions runner.
-                HEADLESS_ROOT = (ROOT / "HeadlessJobs").resolve()
-                HEADLESS_ROOT.mkdir(parents=True, exist_ok=True)
-                HEADLESS_COMMAND_FILE = CONTROL_DIR / "headless-command.json"
-                HEADLESS_LOCK = threading.RLock()
-                HEADLESS_MAX_SCRIPT_CHARS = 200000
-                HEADLESS_MAX_TIMEOUT_SECONDS = 10000
+        @app.post("/internal/monitor/initial-capture")
+        @bridge_auth
+        def internal_monitor_initial_capture():
+            if not bridge_connected():
+                return jsonify(ok=False, error="Unreal Bridge is not connected"), 503
+            request_monitor_capture()
+            result, status = _start_monitor_capture(force=False)
+            log("Initial monitor capture requested by workflow startup: %s" % result.get("status"))
+            return jsonify(result), status
         
         
-                def _inside_root(path):
-                    path = Path(path).resolve()
-                    return path == ROOT or ROOT in path.parents
+        @app.post("/api/monitor/capture")
+        @monitor_auth
+        def monitor_capture_request():
+            body = request.get_json(silent=True) or {}
+            result, status = _start_monitor_capture(force=body.get("force") is True)
+            return jsonify(result), status
+        
+        @app.post("/api/monitor/release-upload")
+        @monitor_auth
+        def monitor_release_upload():
+            body = request.get_json(silent=True) or {}
+            tag = str(body.get("tag") or "ue5.8").strip()
+            filename = str(body.get("filename") or "").strip()
+            with MONITOR_LOCK:
+                screenshot = MONITOR_STATE.get("image_path")
+            source_value = screenshot if body.get("latest_screenshot", True) else body.get("source", "")
+            try:
+                source = safe_path(source_value or "")
+                allowed_roots = [UPLOAD_ROOT, (ROOT / "Screenshots").resolve()]
+                if not any(root == source or root in source.parents for root in allowed_roots):
+                    return jsonify(ok=False, error="source_must_be_inside_Uploads_or_Screenshots"), 400
+                if not source.is_file():
+                    return jsonify(ok=False, error="source_file_not_found", source=str(source)), 404
+                if source.stat().st_size > 100 * 1024 * 1024:
+                    return jsonify(ok=False, error="Release uploads are limited to 100 MiB per file"), 413
+                if not filename and source.suffix.lower() in (".jpg", ".jpeg"):
+                    filename = "UnrealViewport_" + time.strftime("%Y%m%d_%H%M%S") + ".jpg"
+                result = github_release_upload(source, tag, filename)
+                log("Monitor uploaded file to GitHub Release tag=%s file=%s" % (tag, filename or source.name))
+                return jsonify(result)
+            except Exception as exc:
+                log("Monitor GitHub Release upload failed: " + repr(exc))
+                return jsonify(ok=False, error=str(exc)), 502
+        
+        @app.post("/internal/set-public-url")
+        @bridge_auth
+        def internal_set_public_url():
+            body = request.get_json(silent=True) or {}
+            url = str(body.get("public_url") or "").rstrip("/")
+            if not re.fullmatch(r"https://[a-zA-Z0-9-]+\.trycloudflare\.com", url):
+                return jsonify(ok=False, error="invalid_quick_tunnel_url"), 400
+            with MONITOR_LOCK:
+                MONITOR_STATE["public_base_url"] = url
+            log("Public Quick Tunnel URL registered for monitor and MCP link tool")
+            return jsonify(ok=True, monitor_url=url + "/monitor", mcp_url=url + "/mcp")
+        
+        # ---- Extended read-only scene monitor, project/plugin manager, checkpoints, packaging and MCP gateway ----
+        import ipaddress, socket, subprocess, zipfile
+        
+        CURRENT_PROJECT_FILE = (ROOT / "UEControl" / "UEControl.uproject").resolve()
+        CONTROL_DIR = ROOT / "control"
+        BACKUP_DIR = ROOT / "Backups"
+        BUILD_DIR = ROOT / "Builds"
+        CONFIG_DIR = ROOT / "Config"
+        for _folder in (CONTROL_DIR, BACKUP_DIR, BUILD_DIR, CONFIG_DIR):
+            _folder.mkdir(parents=True, exist_ok=True)
+        EDITOR_COMMAND_FILE = CONTROL_DIR / "editor-command.json"
+        MCP_REGISTRY_FILE = CONFIG_DIR / "mcp_servers.json"
+        SCENE_CACHE = {"updated": 0.0, "updated_at": 0.0, "level": "", "count": 0, "actors": [], "error": ""}
+        SCENE_LOCK = threading.RLock()
+        # Full-fidelity read-only scene export. The GLB is produced by Unreal's official GLTFExporter plugin.
+        SCENE_MODEL_LOCK = threading.RLock()
+        SCENE_MODEL_STATE = {"status": "idle", "job_id": "", "path": "", "job_dir": "", "model_files": [], "version": 0,
+                             "updated": 0.0, "size": 0, "mesh_node_names": [], "mesh_count": 0, "error": "",
+                             "progress": 0, "phase": "Idle", "completed": 0, "total": 0, "detail": ""}
+        SCENE_MODEL_DIR = (ROOT / "Screenshots").resolve()
+        SCENE_MODEL_DIR.mkdir(parents=True, exist_ok=True)
+        SCENE_JOBS = {}
+        SCENE_JOB_LOCK = threading.RLock()
+        SCENE_ACTIVE_JOB = ""
+        PLUGIN_INDEX_CACHE = {"roots": (), "paths": None, "built_at": 0.0}
+        PLUGIN_INDEX_LOCK = threading.RLock()
+        PACKAGE_JOBS = {}
+        PACKAGE_LOCK = threading.RLock()
+        
+        # Headless Unreal commandlet jobs are supervised by the long-running PowerShell
+        # process. That supervisor owns the GUI Editor lifecycle so an intentional
+        # Editor shutdown never looks like a crashed GitHub Actions runner.
+        HEADLESS_ROOT = (ROOT / "HeadlessJobs").resolve()
+        HEADLESS_ROOT.mkdir(parents=True, exist_ok=True)
+        HEADLESS_COMMAND_FILE = CONTROL_DIR / "headless-command.json"
+        HEADLESS_LOCK = threading.RLock()
+        HEADLESS_MAX_SCRIPT_CHARS = 200000
+        HEADLESS_MAX_TIMEOUT_SECONDS = 10000
         
         
-                def _current_project():
-                    global CURRENT_PROJECT_FILE
-                    if CURRENT_PROJECT_FILE.is_file() and _inside_root(CURRENT_PROJECT_FILE):
-                        return CURRENT_PROJECT_FILE
-                    return (ROOT / "UEControl" / "UEControl.uproject").resolve()
+        def _inside_root(path):
+            path = Path(path).resolve()
+            return path == ROOT or ROOT in path.parents
         
         
-                def _project_files():
-                    found = {}
-                    excluded = {"Extracted", "parts", "Uploads", "Screenshots", "Logs", "Builds", "Backups", "control", "Config"}
-                    for base in (ROOT / "Projects", ROOT / "UEControl", ROOT):
-                        if base.exists():
-                            for walk_root, dirs, files in os.walk(base):
-                                dirs[:] = [name for name in dirs if name not in excluded and not name.startswith(".")]
-                                for filename in files:
-                                    if filename.lower().endswith(".uproject"):
-                                        item = Path(walk_root) / filename
-                                        if _inside_root(item):
-                                            found[str(item.resolve())] = item.resolve()
-                    current = _current_project()
-                    if current.is_file():
-                        found[str(current)] = current
-                    return sorted(found.values(), key=lambda p: p.name.lower())
+        def _current_project():
+            global CURRENT_PROJECT_FILE
+            if CURRENT_PROJECT_FILE.is_file() and _inside_root(CURRENT_PROJECT_FILE):
+                return CURRENT_PROJECT_FILE
+            return (ROOT / "UEControl" / "UEControl.uproject").resolve()
         
         
-                def _project_payload():
-                    current = str(_current_project())
-                    rows = []
-                    for item in _project_files():
-                        try:
-                            rows.append({"name": item.stem, "project_file": str(item), "directory": str(item.parent),
-                                         "is_current": str(item) == current})
-                        except OSError:
-                            continue
-                    return rows
+        def _project_files():
+            found = {}
+            excluded = {"Extracted", "parts", "Uploads", "Screenshots", "Logs", "Builds", "Backups", "control", "Config"}
+            for base in (ROOT / "Projects", ROOT / "UEControl", ROOT):
+                if base.exists():
+                    for walk_root, dirs, files in os.walk(base):
+                        dirs[:] = [name for name in dirs if name not in excluded and not name.startswith(".")]
+                        for filename in files:
+                            if filename.lower().endswith(".uproject"):
+                                item = Path(walk_root) / filename
+                                if _inside_root(item):
+                                    found[str(item.resolve())] = item.resolve()
+            current = _current_project()
+            if current.is_file():
+                found[str(current)] = current
+            return sorted(found.values(), key=lambda p: p.name.lower())
         
         
-                def _backup_file(source, label="config"):
-                    source = Path(source).resolve()
-                    if not source.is_file() or not _inside_root(source):
-                        return None
-                    stamp = time.strftime("%Y%m%d_%H%M%S") + "_" + uuid.uuid4().hex[:6]
-                    dest_dir = BACKUP_DIR / label
-                    dest_dir.mkdir(parents=True, exist_ok=True)
-                    dest = dest_dir / (source.name + "." + stamp + ".bak")
-                    shutil.copy2(source, dest)
-                    return str(dest)
+        def _project_payload():
+            current = str(_current_project())
+            rows = []
+            for item in _project_files():
+                try:
+                    rows.append({"name": item.stem, "project_file": str(item), "directory": str(item.parent),
+                                 "is_current": str(item) == current})
+                except OSError:
+                    continue
+            return rows
         
         
-                def _write_editor_command(action, project_file, checkpoint=""):
-                    target = Path(project_file).resolve()
-                    if target.suffix.lower() != ".uproject" or not _inside_root(target) or not target.is_file():
-                        raise ValueError("project_file must be an existing .uproject inside D:\\UE58")
-                    payload = {"action": str(action), "project_file": str(target), "checkpoint": str(checkpoint or ""),
-                               "requested_at": time.time(), "nonce": uuid.uuid4().hex}
-                    tmp = EDITOR_COMMAND_FILE.with_suffix(".tmp")
-                    tmp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
-                    os.replace(tmp, EDITOR_COMMAND_FILE)
-                    log("EDITOR COMMAND queued: %s project=%s" % (action, target))
-                    return payload
+        def _backup_file(source, label="config"):
+            source = Path(source).resolve()
+            if not source.is_file() or not _inside_root(source):
+                return None
+            stamp = time.strftime("%Y%m%d_%H%M%S") + "_" + uuid.uuid4().hex[:6]
+            dest_dir = BACKUP_DIR / label
+            dest_dir.mkdir(parents=True, exist_ok=True)
+            dest = dest_dir / (source.name + "." + stamp + ".bak")
+            shutil.copy2(source, dest)
+            return str(dest)
         
         
-                def _ensure_bridge_in_project(project_file):
-                    project_file = Path(project_file).resolve()
-                    source = ROOT / "UEControl" / "Content" / "Python" / "init_unreal.py"
-                    if not source.is_file():
-                        raise FileNotFoundError("Bridge startup template missing: " + str(source))
-                    target_dir = project_file.parent / "Content" / "Python"
-                    target_dir.mkdir(parents=True, exist_ok=True)
-                    target = target_dir / "init_unreal.py"
-                    if target.exists() and target.resolve() == source.resolve():
-                        return
-                    if target.exists():
-                        _backup_file(target, "startup_scripts")
-                    shutil.copy2(source, target)
+        def _write_editor_command(action, project_file, checkpoint=""):
+            target = Path(project_file).resolve()
+            if target.suffix.lower() != ".uproject" or not _inside_root(target) or not target.is_file():
+                raise ValueError("project_file must be an existing .uproject inside D:\\UE58")
+            payload = {"action": str(action), "project_file": str(target), "checkpoint": str(checkpoint or ""),
+                       "requested_at": time.time(), "nonce": uuid.uuid4().hex}
+            tmp = EDITOR_COMMAND_FILE.with_suffix(".tmp")
+            tmp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+            os.replace(tmp, EDITOR_COMMAND_FILE)
+            log("EDITOR COMMAND queued: %s project=%s" % (action, target))
+            return payload
         
         
-                def prepare_project(project_file, ensure_remote_plugins=True):
-                    project_file = Path(project_file).resolve()
-                    if project_file.suffix.lower() != ".uproject" or not project_file.is_file() or not _inside_root(project_file):
-                        raise ValueError("Choose an existing .uproject inside D:\\UE58")
-                    data = json.loads(project_file.read_text(encoding="utf-8-sig"))
-                    if not isinstance(data, dict):
-                        raise ValueError("Invalid .uproject JSON")
-                    if ensure_remote_plugins:
-                        backup = _backup_file(project_file, "uproject")
-                        plugins = data.get("Plugins")
-                        if not isinstance(plugins, list):
-                            plugins = []
-                        mapping = {str(p.get("Name")): p for p in plugins if isinstance(p, dict) and p.get("Name")}
-                        for plugin_name in ("PythonScriptPlugin", "EditorScriptingUtilities", "ModelContextProtocol", "AllToolsets", "GLTFExporter"):
-                            item = mapping.get(plugin_name)
-                            if item is None:
-                                item = {"Name": plugin_name, "Enabled": True}
-                                plugins.append(item)
-                            else:
-                                item["Enabled"] = True
-                        data["Plugins"] = plugins
-                        tmp = project_file.with_suffix(".uproject.tmp")
-                        tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-                        os.replace(tmp, project_file)
+        def _ensure_bridge_in_project(project_file):
+            project_file = Path(project_file).resolve()
+            source = ROOT / "UEControl" / "Content" / "Python" / "init_unreal.py"
+            if not source.is_file():
+                raise FileNotFoundError("Bridge startup template missing: " + str(source))
+            target_dir = project_file.parent / "Content" / "Python"
+            target_dir.mkdir(parents=True, exist_ok=True)
+            target = target_dir / "init_unreal.py"
+            if target.exists() and target.resolve() == source.resolve():
+                return
+            if target.exists():
+                _backup_file(target, "startup_scripts")
+            shutil.copy2(source, target)
+        
+        
+        def prepare_project(project_file, ensure_remote_plugins=True):
+            project_file = Path(project_file).resolve()
+            if project_file.suffix.lower() != ".uproject" or not project_file.is_file() or not _inside_root(project_file):
+                raise ValueError("Choose an existing .uproject inside D:\\UE58")
+            data = json.loads(project_file.read_text(encoding="utf-8-sig"))
+            if not isinstance(data, dict):
+                raise ValueError("Invalid .uproject JSON")
+            if ensure_remote_plugins:
+                backup = _backup_file(project_file, "uproject")
+                plugins = data.get("Plugins")
+                if not isinstance(plugins, list):
+                    plugins = []
+                mapping = {str(p.get("Name")): p for p in plugins if isinstance(p, dict) and p.get("Name")}
+                for plugin_name in ("PythonScriptPlugin", "EditorScriptingUtilities", "ModelContextProtocol", "AllToolsets", "GLTFExporter"):
+                    item = mapping.get(plugin_name)
+                    if item is None:
+                        item = {"Name": plugin_name, "Enabled": True}
+                        plugins.append(item)
                     else:
-                        backup = None
-                    _ensure_bridge_in_project(project_file)
-                    return {"project_file": str(project_file), "backup": backup}
+                        item["Enabled"] = True
+                data["Plugins"] = plugins
+                tmp = project_file.with_suffix(".uproject.tmp")
+                tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+                os.replace(tmp, project_file)
+            else:
+                backup = None
+            _ensure_bridge_in_project(project_file)
+            return {"project_file": str(project_file), "backup": backup}
         
         
-                def _available_plugin_descriptor_paths(project_file=None):
-                    project_file = Path(project_file or _current_project()).resolve()
-                    engine_plugins = next((p for p in (ROOT / "Extracted").glob("*/Engine/Plugins") if p.is_dir()), None)
-                    roots = []
-                    if engine_plugins:
-                        roots.append(engine_plugins.resolve())
-                    project_plugins = (project_file.parent / "Plugins").resolve()
-                    if project_plugins.is_dir():
-                        roots.append(project_plugins)
-                    roots_key = tuple(str(p) for p in roots)
-                    with PLUGIN_INDEX_LOCK:
-                        cached = PLUGIN_INDEX_CACHE.get("paths")
-                        if cached is not None and PLUGIN_INDEX_CACHE.get("roots") == roots_key:
-                            return dict(cached)
-                    result = {}
-                    # Unreal plugin descriptors normally live near the plugin root (category/plugin/plugin.uplugin).
-                    # Do not recursively traverse huge Content, Source, Binaries and ThirdParty trees.
-                    excluded_dirs = {"binaries", "content", "intermediate", "saved", "deriveddatacache",
-                                     "thirdparty", "resources", "documentation", "docs", ".git"}
-                    for base in roots:
-                        if not base.is_dir():
-                            continue
-                        for walk_root, dirs, files in os.walk(base):
-                            relative = Path(walk_root).relative_to(base)
-                            depth = len(relative.parts)
-                            if depth >= 5:
-                                dirs[:] = []
-                            else:
-                                dirs[:] = [name for name in dirs
-                                           if not name.startswith(".") and not name.startswith("_installing_")
-                                           and name.lower() not in excluded_dirs]
-                            for filename in files:
-                                if filename.lower().endswith(".uplugin"):
-                                    descriptor = Path(walk_root) / filename
-                                    result.setdefault(descriptor.stem, descriptor.resolve())
-                                    if len(result) >= 5000:
-                                        break
+        def _available_plugin_descriptor_paths(project_file=None):
+            project_file = Path(project_file or _current_project()).resolve()
+            engine_plugins = next((p for p in (ROOT / "Extracted").glob("*/Engine/Plugins") if p.is_dir()), None)
+            roots = []
+            if engine_plugins:
+                roots.append(engine_plugins.resolve())
+            project_plugins = (project_file.parent / "Plugins").resolve()
+            if project_plugins.is_dir():
+                roots.append(project_plugins)
+            roots_key = tuple(str(p) for p in roots)
+            with PLUGIN_INDEX_LOCK:
+                cached = PLUGIN_INDEX_CACHE.get("paths")
+                if cached is not None and PLUGIN_INDEX_CACHE.get("roots") == roots_key:
+                    return dict(cached)
+            result = {}
+            # Unreal plugin descriptors normally live near the plugin root (category/plugin/plugin.uplugin).
+            # Do not recursively traverse huge Content, Source, Binaries and ThirdParty trees.
+            excluded_dirs = {"binaries", "content", "intermediate", "saved", "deriveddatacache",
+                             "thirdparty", "resources", "documentation", "docs", ".git"}
+            for base in roots:
+                if not base.is_dir():
+                    continue
+                for walk_root, dirs, files in os.walk(base):
+                    relative = Path(walk_root).relative_to(base)
+                    depth = len(relative.parts)
+                    if depth >= 5:
+                        dirs[:] = []
+                    else:
+                        dirs[:] = [name for name in dirs
+                                   if not name.startswith(".") and not name.startswith("_installing_")
+                                   and name.lower() not in excluded_dirs]
+                    for filename in files:
+                        if filename.lower().endswith(".uplugin"):
+                            descriptor = Path(walk_root) / filename
+                            result.setdefault(descriptor.stem, descriptor.resolve())
                             if len(result) >= 5000:
                                 break
-                    with PLUGIN_INDEX_LOCK:
-                        PLUGIN_INDEX_CACHE.update({"roots": roots_key, "paths": dict(result), "built_at": time.time()})
-                    return result
+                    if len(result) >= 5000:
+                        break
+            with PLUGIN_INDEX_LOCK:
+                PLUGIN_INDEX_CACHE.update({"roots": roots_key, "paths": dict(result), "built_at": time.time()})
+            return result
         
         
-                def _available_plugin_descriptors(project_file=None):
-                    """Return descriptor paths by plugin name; JSON metadata is loaded only for visible pages."""
-                    return _available_plugin_descriptor_paths(project_file)
+        def _available_plugin_descriptors(project_file=None):
+            """Return descriptor paths by plugin name; JSON metadata is loaded only for visible pages."""
+            return _available_plugin_descriptor_paths(project_file)
         
         
-                def _project_plugin_state(project_file=None, query="", offset=0, limit=75):
-                    project_file = Path(project_file or _current_project()).resolve()
-                    data = json.loads(project_file.read_text(encoding="utf-8-sig"))
-                    enabled = {str(item.get("Name")): bool(item.get("Enabled", False))
-                               for item in data.get("Plugins", []) if isinstance(item, dict) and item.get("Name")}
-                    available = _available_plugin_descriptor_paths(project_file)
-                    needle = str(query or "").strip().lower()
-                    names = sorted((name for name in available if not needle or needle in name.lower()), key=str.lower)
-                    total = len(names)
+        def _project_plugin_state(project_file=None, query="", offset=0, limit=75):
+            project_file = Path(project_file or _current_project()).resolve()
+            data = json.loads(project_file.read_text(encoding="utf-8-sig"))
+            enabled = {str(item.get("Name")): bool(item.get("Enabled", False))
+                       for item in data.get("Plugins", []) if isinstance(item, dict) and item.get("Name")}
+            available = _available_plugin_descriptor_paths(project_file)
+            needle = str(query or "").strip().lower()
+            names = sorted((name for name in available if not needle or needle in name.lower()), key=str.lower)
+            total = len(names)
+            try:
+                offset = max(0, int(offset))
+                limit = max(10, min(200, int(limit)))
+            except (TypeError, ValueError):
+                offset, limit = 0, 75
+            selected = names[offset:offset + limit]
+            rows = []
+            for name in selected:
+                descriptor = available[name]
+                description, category = "", ""
+                try:
+                    meta = json.loads(descriptor.read_text(encoding="utf-8-sig"))
+                    description = str(meta.get("Description", ""))[:220]
+                    category = str(meta.get("Category", ""))[:80]
+                except Exception:
+                    description = "Plugin descriptor could not be parsed"
+                rows.append({"name": name, "path": str(descriptor), "description": description,
+                             "category": category, "enabled": enabled.get(name, False),
+                             "required": name in ("PythonScriptPlugin", "EditorScriptingUtilities", "ModelContextProtocol", "AllToolsets", "GLTFExporter")})
+            return {"project_file": str(project_file), "plugins": rows,
+                    "enabled_count": sum(enabled.values()), "available_count": len(available),
+                    "filtered_count": total, "offset": offset, "limit": limit,
+                    "has_more": offset + len(rows) < total, "query": needle}
+        
+        
+        def _scene_snapshot_from_unreal(timeout=10000, job_id=""):
+            # Only reads world actors: transform, bounds, type and visibility. It never edits the level.
+            progress_path = (SCENE_MODEL_DIR / ("scene_scan_" + str(job_id) + ".json")).resolve()
+            code = r'''import json, os, time, unreal
+        progress_path = __PROGRESS_PATH__
+        def _write_progress(percent, phase, completed=0, total=0, detail=""):
+            payload = {"progress": max(0, min(100, int(percent))), "phase": str(phase),
+                       "completed": int(completed or 0), "total": int(total or 0),
+                       "detail": str(detail)[:240], "updated_at": time.time()}
+            try:
+                temporary = progress_path + ".tmp"
+                with open(temporary, "w", encoding="utf-8") as stream:
+                    json.dump(payload, stream, ensure_ascii=False)
+                os.replace(temporary, progress_path)
+            except Exception as progress_error:
+                print("[UE58 SCAN] progress update failed: " + str(progress_error))
+        _write_progress(3, "Connecting to Unreal Editor", detail="Reading active level metadata")
+        world = unreal.get_editor_subsystem(unreal.UnrealEditorSubsystem).get_editor_world()
+        actors = unreal.EditorLevelLibrary.get_all_level_actors()
+        rows = []
+        _write_progress(8, "Enumerating level Actors", 0, len(actors), str(len(actors)) + " Actors found")
+        def _v(v): return {"x": float(v.x), "y": float(v.y), "z": float(v.z)}
+        for actor_index, actor in enumerate(actors):
+            try:
+                cls = actor.get_class().get_name()
+                label = actor.get_actor_label()
+                loc = actor.get_actor_location()
+                rot = actor.get_actor_rotation()
+                scale = actor.get_actor_scale3d()
+                try:
+                    origin, extent = actor.get_actor_bounds(False)
+                    ext = _v(extent)
+                except Exception:
+                    origin, ext = loc, {"x": 30.0, "y": 30.0, "z": 30.0}
+                low = cls.lower()
+                component_rows = []
+                # Include component and asset names: one Actor may contain several
+                # renderable meshes, and the outliner must identify those accurately.
+                for component_class, asset_property in ((unreal.StaticMeshComponent, "static_mesh"),
+                                                        (unreal.SkeletalMeshComponent, "skeletal_mesh")):
                     try:
-                        offset = max(0, int(offset))
-                        limit = max(10, min(200, int(limit)))
-                    except (TypeError, ValueError):
-                        offset, limit = 0, 75
-                    selected = names[offset:offset + limit]
-                    rows = []
-                    for name in selected:
-                        descriptor = available[name]
-                        description, category = "", ""
-                        try:
-                            meta = json.loads(descriptor.read_text(encoding="utf-8-sig"))
-                            description = str(meta.get("Description", ""))[:220]
-                            category = str(meta.get("Category", ""))[:80]
-                        except Exception:
-                            description = "Plugin descriptor could not be parsed"
-                        rows.append({"name": name, "path": str(descriptor), "description": description,
-                                     "category": category, "enabled": enabled.get(name, False),
-                                     "required": name in ("PythonScriptPlugin", "EditorScriptingUtilities", "ModelContextProtocol", "AllToolsets", "GLTFExporter")})
-                    return {"project_file": str(project_file), "plugins": rows,
-                            "enabled_count": sum(enabled.values()), "available_count": len(available),
-                            "filtered_count": total, "offset": offset, "limit": limit,
-                            "has_more": offset + len(rows) < total, "query": needle}
-        
-        
-                def _scene_snapshot_from_unreal(timeout=10000, job_id=""):
-                    # Only reads world actors: transform, bounds, type and visibility. It never edits the level.
-                    progress_path = (SCENE_MODEL_DIR / ("scene_scan_" + str(job_id) + ".json")).resolve()
-                    code = r'''import json, os, time, unreal
-                progress_path = __PROGRESS_PATH__
-                def _write_progress(percent, phase, completed=0, total=0, detail=""):
-                    payload = {"progress": max(0, min(100, int(percent))), "phase": str(phase),
-                               "completed": int(completed or 0), "total": int(total or 0),
-                               "detail": str(detail)[:240], "updated_at": time.time()}
-                    try:
-                        temporary = progress_path + ".tmp"
-                        with open(temporary, "w", encoding="utf-8") as stream:
-                            json.dump(payload, stream, ensure_ascii=False)
-                        os.replace(temporary, progress_path)
-                    except Exception as progress_error:
-                        print("[UE58 SCAN] progress update failed: " + str(progress_error))
-                _write_progress(3, "Connecting to Unreal Editor", detail="Reading active level metadata")
-                world = unreal.get_editor_subsystem(unreal.UnrealEditorSubsystem).get_editor_world()
-                actors = unreal.EditorLevelLibrary.get_all_level_actors()
-                rows = []
-                _write_progress(8, "Enumerating level Actors", 0, len(actors), str(len(actors)) + " Actors found")
-                def _v(v): return {"x": float(v.x), "y": float(v.y), "z": float(v.z)}
-                for actor_index, actor in enumerate(actors):
-                    try:
-                        cls = actor.get_class().get_name()
-                        label = actor.get_actor_label()
-                        loc = actor.get_actor_location()
-                        rot = actor.get_actor_rotation()
-                        scale = actor.get_actor_scale3d()
-                        try:
-                            origin, extent = actor.get_actor_bounds(False)
-                            ext = _v(extent)
-                        except Exception:
-                            origin, ext = loc, {"x": 30.0, "y": 30.0, "z": 30.0}
-                        low = cls.lower()
-                        component_rows = []
-                        # Include component and asset names: one Actor may contain several
-                        # renderable meshes, and the outliner must identify those accurately.
-                        for component_class, asset_property in ((unreal.StaticMeshComponent, "static_mesh"),
-                                                                (unreal.SkeletalMeshComponent, "skeletal_mesh")):
+                        for component in actor.get_components_by_class(component_class):
                             try:
-                                for component in actor.get_components_by_class(component_class):
-                                    try:
-                                        asset = component.get_editor_property(asset_property)
-                                        if asset is None:
-                                            continue
-                                        component_rows.append({
-                                            "name": str(component.get_name()),
-                                            "class": str(component.get_class().get_name()),
-                                            "asset_name": str(asset.get_name()),
-                                            "asset_path": str(asset.get_path_name())
-                                        })
-                                    except Exception:
-                                        continue
+                                asset = component.get_editor_property(asset_property)
+                                if asset is None:
+                                    continue
+                                component_rows.append({
+                                    "name": str(component.get_name()),
+                                    "class": str(component.get_class().get_name()),
+                                    "asset_name": str(asset.get_name()),
+                                    "asset_path": str(asset.get_path_name())
+                                })
+                            except Exception:
+                                continue
+                    except Exception:
+                        pass
+                camera_info = None
+                try:
+                    camera_class = getattr(unreal, "CameraComponent", None)
+                    if camera_class:
+                        camera_components = actor.get_components_by_class(camera_class)
+                        if camera_components:
+                            camera_component = camera_components[0]
+                            camera_location = camera_component.get_world_location()
+                            camera_rotation = camera_component.get_world_rotation()
+                            try:
+                                camera_fov = float(camera_component.get_editor_property("field_of_view"))
+                            except Exception:
+                                camera_fov = 90.0
+                            camera_info = {
+                                "location": _v(camera_location),
+                                "rotation": {"pitch": float(camera_rotation.pitch), "yaw": float(camera_rotation.yaw), "roll": float(camera_rotation.roll)},
+                                "fov": camera_fov
+                            }
+                except Exception:
+                    camera_info = None
+                if "light" in low: category = "Lights"
+                elif "camera" in low or camera_info: category = "Cameras"
+                elif "skeletalmesh" in low or "character" in low or "pawn" in low: category = "Characters"
+                elif "volume" in low: category = "Volumes"
+                elif "staticmesh" in low or "mesh" in low or component_rows: category = "Meshes"
+                else: category = "Actors"
+                rows.append({"name": str(label or actor.get_name()), "object_name": str(actor.get_name()),
+                    "object_path": str(actor.get_path_name()), "class": str(cls), "category": category,
+                    "location": _v(loc), "rotation": {"pitch": float(rot.pitch), "yaw": float(rot.yaw), "roll": float(rot.roll)},
+                    "scale": _v(scale), "bounds_origin": _v(origin), "bounds_extent": ext,
+                    "components": component_rows, "camera": camera_info,
+                    "hidden": bool(actor.is_hidden_ed()) if hasattr(actor, "is_hidden_ed") else False})
+            except Exception as exc:
+                rows.append({"name": "Actor read error", "class": "Unknown", "category": "Errors", "error": str(exc)[:180]})
+            _write_progress(8 + int(88 * (actor_index + 1) / max(1, len(actors))),
+                            "Reading Actor metadata", actor_index + 1, len(actors),
+                            "Read " + str(actor_index + 1) + " of " + str(len(actors)) + " Actors")
+        level = str(world.get_name()) if world else "Unknown"
+        _write_progress(98, "Finalizing actor list", len(rows), len(actors), str(len(rows)) + " Actors read")
+        print("__UE_SCENE_JSON__" + json.dumps({"level": level, "count": len(rows), "actors": rows}, ensure_ascii=False))'''
+            code = code.replace("__PROGRESS_PATH__", repr(str(progress_path).replace("\\", "/")))
+            result, status = queue_unreal(code, timeout)
+            if status == 202 and result.get("job_id"):
+                result, status = wait_unreal_job(result["job_id"], timeout=10000)
+            if status != 200 or not result.get("ok"):
+                raise RuntimeError(result.get("error") or result.get("message") or "Unreal scene query failed: " + str(result))
+            output = str(result.get("output", ""))
+            marker = "__UE_SCENE_JSON__"
+            line = next((ln for ln in output.splitlines() if marker in ln), "")
+            if not line:
+                raise RuntimeError("Scene snapshot returned no JSON marker: " + output[:500])
+            payload = json.loads(line.split(marker, 1)[1])
+            captured_at = time.time()
+            payload["updated_at"] = captured_at
+            payload["updated"] = captured_at
+            with SCENE_LOCK:
+                SCENE_CACHE.update(payload)
+                SCENE_CACHE["error"] = ""
+            return payload
+        
+        
+        def _scene_scan_worker(job_id):
+            global SCENE_ACTIVE_JOB
+            with SCENE_JOB_LOCK:
+                SCENE_JOBS[job_id].update({"status": "running", "started_at": time.time(),
+                                           "progress": 1, "phase": "Starting actor metadata scan",
+                                           "completed": 0, "total": 0, "detail": "Waiting for Unreal Bridge"})
+            try:
+                if not bridge_connected():
+                    raise RuntimeError("Unreal Bridge is offline")
+                payload = _scene_snapshot_from_unreal(timeout=10000, job_id=job_id)
+                with SCENE_JOB_LOCK:
+                    SCENE_JOBS[job_id].update({"status": "completed", "result": payload,
+                                               "completed_at": time.time(), "count": payload.get("count", 0),
+                                               "progress": 100, "phase": "Actor metadata scan complete",
+                                               "completed": payload.get("count", 0), "total": payload.get("count", 0),
+                                               "detail": str(payload.get("count", 0)) + " Actors read"})
+                log("Scene scan completed: job=%s actors=%s level=%s" % (job_id, payload.get("count", 0), payload.get("level", "")))
+            except Exception as exc:
+                with SCENE_LOCK:
+                    SCENE_CACHE["error"] = str(exc)[:800]
+                with SCENE_JOB_LOCK:
+                    SCENE_JOBS[job_id].update({"status": "failed", "error": str(exc)[:1200],
+                                               "phase": "Actor metadata scan failed", "detail": str(exc)[:240],
+                                               "completed_at": time.time()})
+                log("Scene scan failed: job=%s error=%s" % (job_id, repr(exc)))
+            finally:
+                with SCENE_JOB_LOCK:
+                    if SCENE_ACTIVE_JOB == job_id:
+                        SCENE_ACTIVE_JOB = ""
+        
+        
+        def _start_scene_scan(force=False):
+            global SCENE_ACTIVE_JOB
+            with SCENE_LOCK:
+                cached = dict(SCENE_CACHE)
+            if not force and cached.get("updated") and (time.time() - cached["updated"] < 10):
+                return {"ok": True, "status": "cached", "scene": cached}
+            with SCENE_JOB_LOCK:
+                if SCENE_ACTIVE_JOB and SCENE_ACTIVE_JOB in SCENE_JOBS:
+                    active = SCENE_JOBS[SCENE_ACTIVE_JOB]
+                    if active.get("status") in ("queued", "running"):
+                        return {"ok": True, "status": active.get("status"), "job_id": SCENE_ACTIVE_JOB}
+                job_id = uuid.uuid4().hex
+                SCENE_JOBS[job_id] = {"job_id": job_id, "status": "queued", "created_at": time.time(),
+                                      "progress": 0, "phase": "Queued for actor metadata scan",
+                                      "completed": 0, "total": 0, "detail": "Waiting for scan worker"}
+                SCENE_ACTIVE_JOB = job_id
+                # Keep only the latest 20 scene jobs in memory.
+                for old_id, row in list(SCENE_JOBS.items()):
+                    if old_id != job_id and row.get("status") in ("completed", "failed") and len(SCENE_JOBS) > 20:
+                        SCENE_JOBS.pop(old_id, None)
+                threading.Thread(target=_scene_scan_worker, args=(job_id,), name="UE-SceneScan-" + job_id[:8], daemon=True).start()
+                log("Scene scan queued: job=%s" % job_id)
+                return {"ok": True, "status": "queued", "job_id": job_id}
+        
+        
+        def _scene_job_payload(job_id=""):
+            with SCENE_JOB_LOCK:
+                chosen = str(job_id or SCENE_ACTIVE_JOB)
+                row = dict(SCENE_JOBS.get(chosen, {})) if chosen else {}
+            with SCENE_LOCK:
+                cached = dict(SCENE_CACHE)
+            if not row:
+                return {"ok": bool(cached.get("updated")), "status": "idle", "scene": cached,
+                        "bridge_connected": bridge_connected()}
+            row.pop("result", None)
+            if row.get("status") in ("queued", "running") and chosen:
+                progress_file = (SCENE_MODEL_DIR / ("scene_scan_" + chosen + ".json")).resolve()
+                try:
+                    if progress_file.parent == SCENE_MODEL_DIR and progress_file.is_file():
+                        progress_data = json.loads(progress_file.read_text(encoding="utf-8"))
+                        if isinstance(progress_data, dict):
+                            for key in ("progress", "phase", "completed", "total", "detail", "updated_at"):
+                                if key in progress_data:
+                                    row[key] = progress_data[key]
+                except Exception as progress_read_error:
+                    row["progress_read_warning"] = str(progress_read_error)[:140]
+            if SCENE_JOBS.get(chosen, {}).get("status") == "completed":
+                row["progress"] = 100
+                row["scene"] = cached
+            return {"ok": row.get("status") != "failed", "job": row,
+                    "scene": cached if cached.get("updated") else None,
+                    "bridge_connected": bridge_connected()}
+        
+        
+        @app.get("/api/scene/snapshot")
+        @monitor_auth
+        def api_scene_snapshot():
+            refresh = request.args.get("refresh", "1") != "0"
+            force = request.args.get("force", "0") == "1"
+            with SCENE_LOCK:
+                cached = dict(SCENE_CACHE)
+            stale = not cached.get("updated") or (time.time() - cached.get("updated", 0) > 10)
+            job = _start_scene_scan(force=force) if refresh and bridge_connected() and (force or stale) else {"ok": True, "status": "cached"}
+            payload = _scene_job_payload(job.get("job_id", ""))
+            payload["request"] = job
+            payload["bridge_connected"] = bridge_connected()
+            payload["ok"] = bool(cached.get("updated") or job.get("ok"))
+            return jsonify(payload)
+        
+        
+        @app.get("/api/scene/status")
+        @monitor_auth
+        def api_scene_status():
+            return jsonify(_scene_job_payload(request.args.get("job_id", "")))
+        
+        
+        def _scene_model_export_worker(job_id):
+            """Export actual renderable mesh geometry from the active Unreal level without modifying it."""
+            job_dir = (SCENE_MODEL_DIR / ("offline_scene_" + job_id)).resolve()
+            job_dir.mkdir(parents=True, exist_ok=True)
+            temp_path = (job_dir / "scene_model.glb").resolve()
+            progress_path = (job_dir / "progress.json").resolve()
+            def _server_progress(percent, phase, completed=0, total=0, detail=""):
+                payload = {"progress": max(0, min(100, int(percent))), "phase": str(phase),
+                           "completed": int(completed or 0), "total": int(total or 0),
+                           "detail": str(detail)[:300], "updated_at": time.time()}
+                try:
+                    tmp_progress = progress_path.with_suffix(".tmp")
+                    tmp_progress.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+                    os.replace(tmp_progress, progress_path)
+                except Exception as progress_error:
+                    log("Could not write scene export progress: " + repr(progress_error))
+                with SCENE_MODEL_LOCK:
+                    if SCENE_MODEL_STATE.get("job_id") == job_id:
+                        SCENE_MODEL_STATE.update(payload)
+            _server_progress(2, "Starting Unreal scene export", detail="Preparing progress tracking")
+            with SCENE_MODEL_LOCK:
+                if SCENE_MODEL_STATE.get("job_id") == job_id:
+                    SCENE_MODEL_STATE.update({"status": "running", "started_at": time.time()})
+            try:
+                if not bridge_connected():
+                    raise RuntimeError("Unreal Python Bridge is offline")
+                unreal_path = str(temp_path).replace("\\", "/")
+                code = r"""
+        import json, os, time, unreal, traceback
+        output_path = __OUTPUT_PATH__
+        progress_path = __PROGRESS_PATH__
+        report = {"ok": False, "path": output_path, "error": ""}
+        def _write_progress(percent, phase, completed=0, total=0, detail=""):
+            payload = {"progress": max(0, min(100, int(percent))), "phase": str(phase),
+                       "completed": int(completed or 0), "total": int(total or 0),
+                       "detail": str(detail)[:300], "updated_at": time.time()}
+            try:
+                temporary = progress_path + ".tmp"
+                with open(temporary, "w", encoding="utf-8") as progress_stream:
+                    json.dump(payload, progress_stream, ensure_ascii=False)
+                os.replace(temporary, progress_path)
+            except Exception as progress_error:
+                print("[UE58 GLB] progress update failed: " + str(progress_error))
+        _write_progress(4, "Connecting to Unreal Editor", detail="Checking the active level and GLTFExporter")
+        try:
+            world = unreal.get_editor_subsystem(unreal.UnrealEditorSubsystem).get_editor_world()
+            if world is None:
+                raise RuntimeError("Unreal Editor has no active editor world")
+            if not hasattr(unreal, "GLTFExporter") or not hasattr(unreal, "GLTFExportOptions"):
+                raise RuntimeError("GLTFExporter is not loaded. Enable the GLTFExporter plugin and restart this project.")
+            os.makedirs(os.path.dirname(output_path), exist_ok=True)
+            if os.path.isfile(output_path):
+                os.remove(output_path)
+            options = unreal.GLTFExportOptions()
+            # Geometry-first snapshot: disable material texture baking and skip lights/cameras.
+            # Mesh geometry and component transforms remain intact, but export is much lighter.
+            try:
+                options.set_editor_property("bake_material_inputs", unreal.GLTFMaterialBakeMode.DISABLED)
+            except Exception as material_bake_error:
+                print("GLTF material baking could not be disabled: " + str(material_bake_error))
+            for property_name, property_value in (("export_lights", False), ("export_cameras", False),
+                                                   ("export_vertex_colors", True), ("export_morph_targets", False),
+                                                   ("export_vertex_skin_weights", True), ("make_skinned_meshes_root", True)):
+                try:
+                    options.set_editor_property(property_name, property_value)
+                except Exception:
+                    pass
+            # Explicitly collect renderable actor components from the active editor level.
+            # Passing a populated SelectedActors set avoids ambiguity between the editor world
+            # and the level actor list in some UE 5.8 Python builds.
+            try:
+                actor_subsystem = unreal.get_editor_subsystem(unreal.EditorActorSubsystem)
+                level_actors = list(actor_subsystem.get_all_level_actors() or [])
+            except Exception as actor_subsystem_error:
+                print("EditorActorSubsystem unavailable; using EditorLevelLibrary: " + str(actor_subsystem_error))
+                level_actors = list(unreal.EditorLevelLibrary.get_all_level_actors() or [])
+            _write_progress(10, "Scanning active Unreal level", total=len(level_actors), detail=str(len(level_actors)) + " Actors found")
+        
+            mesh_actor_list = []
+            static_component_count = 0
+            skeletal_component_count = 0
+            skipped_hidden_component_count = 0
+            for actor_scan_index, actor in enumerate(level_actors):
+                if actor is None:
+                    _write_progress(10 + int(12 * (actor_scan_index + 1) / max(1, len(level_actors))),
+                                    "Scanning mesh components", actor_scan_index + 1, len(level_actors), "Reading Actor components")
+                    continue
+                actor_has_mesh = False
+                try:
+                    static_components = actor.get_components_by_class(unreal.StaticMeshComponent)
+                except Exception:
+                    static_components = []
+                for component in static_components or []:
+                    if component is None:
+                        continue
+                    try:
+                        mesh_asset = component.get_editor_property("static_mesh")
+                    except Exception:
+                        mesh_asset = None
+                    if mesh_asset is None:
+                        continue
+                    try:
+                        component_visible = bool(component.get_editor_property("visible"))
+                    except Exception:
+                        component_visible = True
+                    if not component_visible:
+                        skipped_hidden_component_count += 1
+                        continue
+                    static_component_count += 1
+                    actor_has_mesh = True
+        
+                try:
+                    skeletal_components = actor.get_components_by_class(unreal.SkeletalMeshComponent)
+                except Exception:
+                    skeletal_components = []
+                for component in skeletal_components or []:
+                    if component is None:
+                        continue
+                    try:
+                        mesh_asset = component.get_editor_property("skeletal_mesh")
+                    except Exception:
+                        mesh_asset = None
+                    if mesh_asset is None:
+                        continue
+                    try:
+                        component_visible = bool(component.get_editor_property("visible"))
+                    except Exception:
+                        component_visible = True
+                    if not component_visible:
+                        skipped_hidden_component_count += 1
+                        continue
+                    skeletal_component_count += 1
+                    actor_has_mesh = True
+        
+                if actor_has_mesh:
+                    mesh_actor_list.append(actor)
+                if (actor_scan_index + 1) == len(level_actors) or (actor_scan_index + 1) % max(1, len(level_actors) // 25) == 0:
+                    _write_progress(10 + int(12 * (actor_scan_index + 1) / max(1, len(level_actors))),
+                                    "Scanning mesh components", actor_scan_index + 1, len(level_actors),
+                                    str(len(mesh_actor_list)) + " mesh Actors identified")
+        
+            if not mesh_actor_list:
+                raise RuntimeError(
+                    "No visible mesh components were found in the active level. "
+                    "Actor count=%d, static mesh components=%d, skeletal mesh components=%d."
+                    % (len(level_actors), static_component_count, skeletal_component_count)
+                )
+        
+            try:
+                export_actor_set = set(mesh_actor_list)
+            except Exception as selection_error:
+                raise RuntimeError("Could not build Unreal SelectedActors set: " + str(selection_error))
+        
+            def _read_glb_json(file_name):
+                import struct
+                if not os.path.isfile(file_name) or os.path.getsize(file_name) < 32:
+                    raise RuntimeError("GLTFExporter did not create a valid GLB: " + str(file_name))
+                with open(file_name, "rb") as stream:
+                    header = stream.read(12)
+                    if len(header) != 12:
+                        raise RuntimeError("Exported GLB header is incomplete")
+                    magic, glb_version, total_length = struct.unpack("<4sII", header)
+                    file_size = os.path.getsize(file_name)
+                    if magic != b"glTF" or glb_version != 2 or total_length > file_size:
+                        raise RuntimeError("Exported file is not a valid glTF 2.0 binary container")
+                    document = None
+                    offset = 12
+                    while offset + 8 <= total_length:
+                        chunk_header = stream.read(8)
+                        if len(chunk_header) != 8:
+                            break
+                        chunk_length, chunk_type = struct.unpack("<II", chunk_header)
+                        chunk_data = stream.read(chunk_length)
+                        if len(chunk_data) != chunk_length:
+                            raise RuntimeError("GLB contains a truncated data chunk")
+                        if chunk_type == 0x4E4F534A:
+                            document = json.loads(chunk_data.decode("utf-8").rstrip(" \t\r\n\x00"))
+                        offset += 8 + chunk_length
+                if not isinstance(document, dict):
+                    raise RuntimeError("GLB has no JSON scene description")
+                return document
+        
+            def _run_gltf_export(target_path, selected_set, export_object=None):
+                export_target = export_object if export_object is not None else world
+                raw = unreal.GLTFExporter.export_to_gltf(export_target, target_path, options, selected_set)
+                messages = None
+                if isinstance(raw, tuple):
+                    if raw and isinstance(raw[0], bool) and not raw[0]:
+                        raise RuntimeError("Unreal GLTFExporter returned failure: " + str(raw))
+                    messages = raw[-1] if len(raw) > 1 else None
+                elif isinstance(raw, bool):
+                    if not raw:
+                        raise RuntimeError("Unreal GLTFExporter returned false")
+                else:
+                    messages = raw
+                errors = getattr(messages, "errors", None) if messages is not None else None
+                if errors:
+                    raise RuntimeError("Unreal GLTFExporter errors: " + "; ".join(str(item) for item in errors)[:1600])
+                return _read_glb_json(target_path)
+        
+            report.update({
+                "scene_actor_count": len(level_actors),
+                "selected_mesh_actor_count": len(mesh_actor_list),
+                "static_mesh_components": static_component_count,
+                "skeletal_mesh_components": skeletal_component_count,
+                "skipped_hidden_components": skipped_hidden_component_count,
+            })
+            print("[UE58 GLB] level_actors=%d mesh_actors=%d static_components=%d skeletal_components=%d" % (
+                len(level_actors), len(mesh_actor_list), static_component_count, skeletal_component_count
+            ))
+        
+            # Export each actual mesh asset directly. This avoids silent-empty-world behavior
+            # sometimes seen when UWorld export is passed a SelectedActors set in UE 5.8.
+            # GLTFExporter supports UStaticMesh and USkeletalMesh objects as direct inputs.
+            per_actor_files = []
+            mesh_node_rows = []
+            export_errors = []
+            total_components = max(1, static_component_count + skeletal_component_count)
+            processed_components = 0
+            _write_progress(26, "Exporting actual mesh assets", 0, total_components,
+                            "Direct UStaticMesh/USkeletalMesh export; material baking disabled")
+        
+            for actor_index, actor in enumerate(mesh_actor_list):
+                try:
+                    actor_label = str(actor.get_actor_label() or actor.get_name())
+                except Exception:
+                    actor_label = str(actor.get_name())
+                component_groups = []
+                try:
+                    component_groups.append(("StaticMesh", list(actor.get_components_by_class(unreal.StaticMeshComponent) or []), "static_mesh"))
+                except Exception as component_error:
+                    export_errors.append(str(actor_label) + " static components: " + str(component_error)[:240])
+                try:
+                    component_groups.append(("SkeletalMesh", list(actor.get_components_by_class(unreal.SkeletalMeshComponent) or []), "skeletal_mesh"))
+                except Exception as component_error:
+                    export_errors.append(str(actor_label) + " skeletal components: " + str(component_error)[:240])
+        
+                for component_kind, components, asset_property in component_groups:
+                    for component in components:
+                        if component is None:
+                            continue
+                        try:
+                            visible = bool(component.get_editor_property("visible"))
+                        except Exception:
+                            visible = True
+                        if not visible:
+                            continue
+                        try:
+                            mesh_asset = component.get_editor_property(asset_property)
+                        except Exception as asset_error:
+                            mesh_asset = None
+                            export_errors.append(str(actor_label) + "/" + str(component.get_name()) +
+                                                 " asset lookup: " + str(asset_error)[:220])
+                        if mesh_asset is None:
+                            continue
+        
+                        actor_file = os.path.join(os.path.dirname(output_path),
+                                                  "mesh_component_%04d.glb" % processed_components)
+                        try:
+                            if os.path.isfile(actor_file):
+                                os.remove(actor_file)
+                            asset_doc = _run_gltf_export(actor_file, set(), mesh_asset)
+                            asset_meshes = len(asset_doc.get("meshes", []))
+                            asset_nodes = [node for node in asset_doc.get("nodes", []) if "mesh" in node]
+                            if asset_meshes < 1 or not asset_nodes:
+                                raise RuntimeError("asset export completed without renderable mesh nodes")
+                            world_transform = component.get_world_transform()
+                            translation = world_transform.translation
+                            rotation = world_transform.rotation
+                            scale3d = world_transform.scale3d
+                            transform_payload = {
+                                "location": {"x": float(translation.x), "y": float(translation.y), "z": float(translation.z)},
+                                "rotation": {"x": float(rotation.x), "y": float(rotation.y),
+                                             "z": float(rotation.z), "w": float(rotation.w)},
+                                "scale": {"x": float(scale3d.x), "y": float(scale3d.y), "z": float(scale3d.z)}
+                            }
+                            component_name = str(component.get_name())
+                            per_actor_files.append({
+                                "file": os.path.basename(actor_file),
+                                "actor_label": actor_label[:180],
+                                "object_name": str(actor.get_name())[:180],
+                                "component_name": component_name[:180],
+                                "asset_path": str(mesh_asset.get_path_name())[:300],
+                                "component_kind": component_kind,
+                                "transform": transform_payload,
+                                "mesh_count": asset_meshes,
+                                "node_names": [str(node.get("name") or ("Mesh node " + str(i + 1)))[:180]
+                                               for i, node in enumerate(asset_nodes[:100])]
+                            })
+                            mesh_node_rows.extend([{"name": actor_label + " / " + component_name + " / " +
+                                                    str(node.get("name") or ("Mesh " + str(i + 1)))[:120]}
+                                                   for i, node in enumerate(asset_nodes[:100])])
+                        except Exception as asset_export_error:
+                            export_errors.append(str(actor_label) + "/" + str(component.get_name()) +
+                                                 " [" + component_kind + "]: " + str(asset_export_error)[:360])
+                            try:
+                                if os.path.isfile(actor_file):
+                                    os.remove(actor_file)
                             except Exception:
                                 pass
-                        camera_info = None
-                        try:
-                            camera_class = getattr(unreal, "CameraComponent", None)
-                            if camera_class:
-                                camera_components = actor.get_components_by_class(camera_class)
-                                if camera_components:
-                                    camera_component = camera_components[0]
-                                    camera_location = camera_component.get_world_location()
-                                    camera_rotation = camera_component.get_world_rotation()
-                                    try:
-                                        camera_fov = float(camera_component.get_editor_property("field_of_view"))
-                                    except Exception:
-                                        camera_fov = 90.0
-                                    camera_info = {
-                                        "location": _v(camera_location),
-                                        "rotation": {"pitch": float(camera_rotation.pitch), "yaw": float(camera_rotation.yaw), "roll": float(camera_rotation.roll)},
-                                        "fov": camera_fov
-                                    }
-                        except Exception:
-                            camera_info = None
-                        if "light" in low: category = "Lights"
-                        elif "camera" in low or camera_info: category = "Cameras"
-                        elif "skeletalmesh" in low or "character" in low or "pawn" in low: category = "Characters"
-                        elif "volume" in low: category = "Volumes"
-                        elif "staticmesh" in low or "mesh" in low or component_rows: category = "Meshes"
-                        else: category = "Actors"
-                        rows.append({"name": str(label or actor.get_name()), "object_name": str(actor.get_name()),
-                            "object_path": str(actor.get_path_name()), "class": str(cls), "category": category,
-                            "location": _v(loc), "rotation": {"pitch": float(rot.pitch), "yaw": float(rot.yaw), "roll": float(rot.roll)},
-                            "scale": _v(scale), "bounds_origin": _v(origin), "bounds_extent": ext,
-                            "components": component_rows, "camera": camera_info,
-                            "hidden": bool(actor.is_hidden_ed()) if hasattr(actor, "is_hidden_ed") else False})
-                    except Exception as exc:
-                        rows.append({"name": "Actor read error", "class": "Unknown", "category": "Errors", "error": str(exc)[:180]})
-                    _write_progress(8 + int(88 * (actor_index + 1) / max(1, len(actors))),
-                                    "Reading Actor metadata", actor_index + 1, len(actors),
-                                    "Read " + str(actor_index + 1) + " of " + str(len(actors)) + " Actors")
-                level = str(world.get_name()) if world else "Unknown"
-                _write_progress(98, "Finalizing actor list", len(rows), len(actors), str(len(rows)) + " Actors read")
-                print("__UE_SCENE_JSON__" + json.dumps({"level": level, "count": len(rows), "actors": rows}, ensure_ascii=False))'''
-                    code = code.replace("__PROGRESS_PATH__", repr(str(progress_path).replace("\\", "/")))
-                    result, status = queue_unreal(code, timeout)
-                    if status == 202 and result.get("job_id"):
-                        result, status = wait_unreal_job(result["job_id"], timeout=10000)
-                    if status != 200 or not result.get("ok"):
-                        raise RuntimeError(result.get("error") or result.get("message") or "Unreal scene query failed: " + str(result))
-                    output = str(result.get("output", ""))
-                    marker = "__UE_SCENE_JSON__"
-                    line = next((ln for ln in output.splitlines() if marker in ln), "")
-                    if not line:
-                        raise RuntimeError("Scene snapshot returned no JSON marker: " + output[:500])
-                    payload = json.loads(line.split(marker, 1)[1])
-                    captured_at = time.time()
-                    payload["updated_at"] = captured_at
-                    payload["updated"] = captured_at
-                    with SCENE_LOCK:
-                        SCENE_CACHE.update(payload)
-                        SCENE_CACHE["error"] = ""
-                    return payload
+                        processed_components += 1
+                        _write_progress(26 + int(64 * processed_components / total_components),
+                                        "Exporting actual mesh assets", processed_components, total_components,
+                                        "Exported " + str(len(per_actor_files)) + " component GLB files; " +
+                                        str(processed_components) + " of " + str(total_components) + " components processed")
         
-        
-                def _scene_scan_worker(job_id):
-                    global SCENE_ACTIVE_JOB
-                    with SCENE_JOB_LOCK:
-                        SCENE_JOBS[job_id].update({"status": "running", "started_at": time.time(),
-                                                   "progress": 1, "phase": "Starting actor metadata scan",
-                                                   "completed": 0, "total": 0, "detail": "Waiting for Unreal Bridge"})
-                    try:
-                        if not bridge_connected():
-                            raise RuntimeError("Unreal Bridge is offline")
-                        payload = _scene_snapshot_from_unreal(timeout=10000, job_id=job_id)
-                        with SCENE_JOB_LOCK:
-                            SCENE_JOBS[job_id].update({"status": "completed", "result": payload,
-                                                       "completed_at": time.time(), "count": payload.get("count", 0),
-                                                       "progress": 100, "phase": "Actor metadata scan complete",
-                                                       "completed": payload.get("count", 0), "total": payload.get("count", 0),
-                                                       "detail": str(payload.get("count", 0)) + " Actors read"})
-                        log("Scene scan completed: job=%s actors=%s level=%s" % (job_id, payload.get("count", 0), payload.get("level", "")))
-                    except Exception as exc:
-                        with SCENE_LOCK:
-                            SCENE_CACHE["error"] = str(exc)[:800]
-                        with SCENE_JOB_LOCK:
-                            SCENE_JOBS[job_id].update({"status": "failed", "error": str(exc)[:1200],
-                                                       "phase": "Actor metadata scan failed", "detail": str(exc)[:240],
-                                                       "completed_at": time.time()})
-                        log("Scene scan failed: job=%s error=%s" % (job_id, repr(exc)))
-                    finally:
-                        with SCENE_JOB_LOCK:
-                            if SCENE_ACTIVE_JOB == job_id:
-                                SCENE_ACTIVE_JOB = ""
-        
-        
-                def _start_scene_scan(force=False):
-                    global SCENE_ACTIVE_JOB
-                    with SCENE_LOCK:
-                        cached = dict(SCENE_CACHE)
-                    if not force and cached.get("updated") and (time.time() - cached["updated"] < 10):
-                        return {"ok": True, "status": "cached", "scene": cached}
-                    with SCENE_JOB_LOCK:
-                        if SCENE_ACTIVE_JOB and SCENE_ACTIVE_JOB in SCENE_JOBS:
-                            active = SCENE_JOBS[SCENE_ACTIVE_JOB]
-                            if active.get("status") in ("queued", "running"):
-                                return {"ok": True, "status": active.get("status"), "job_id": SCENE_ACTIVE_JOB}
-                        job_id = uuid.uuid4().hex
-                        SCENE_JOBS[job_id] = {"job_id": job_id, "status": "queued", "created_at": time.time(),
-                                              "progress": 0, "phase": "Queued for actor metadata scan",
-                                              "completed": 0, "total": 0, "detail": "Waiting for scan worker"}
-                        SCENE_ACTIVE_JOB = job_id
-                        # Keep only the latest 20 scene jobs in memory.
-                        for old_id, row in list(SCENE_JOBS.items()):
-                            if old_id != job_id and row.get("status") in ("completed", "failed") and len(SCENE_JOBS) > 20:
-                                SCENE_JOBS.pop(old_id, None)
-                        threading.Thread(target=_scene_scan_worker, args=(job_id,), name="UE-SceneScan-" + job_id[:8], daemon=True).start()
-                        log("Scene scan queued: job=%s" % job_id)
-                        return {"ok": True, "status": "queued", "job_id": job_id}
-        
-        
-                def _scene_job_payload(job_id=""):
-                    with SCENE_JOB_LOCK:
-                        chosen = str(job_id or SCENE_ACTIVE_JOB)
-                        row = dict(SCENE_JOBS.get(chosen, {})) if chosen else {}
-                    with SCENE_LOCK:
-                        cached = dict(SCENE_CACHE)
-                    if not row:
-                        return {"ok": bool(cached.get("updated")), "status": "idle", "scene": cached,
-                                "bridge_connected": bridge_connected()}
-                    row.pop("result", None)
-                    if row.get("status") in ("queued", "running") and chosen:
-                        progress_file = (SCENE_MODEL_DIR / ("scene_scan_" + chosen + ".json")).resolve()
-                        try:
-                            if progress_file.parent == SCENE_MODEL_DIR and progress_file.is_file():
-                                progress_data = json.loads(progress_file.read_text(encoding="utf-8"))
-                                if isinstance(progress_data, dict):
-                                    for key in ("progress", "phase", "completed", "total", "detail", "updated_at"):
-                                        if key in progress_data:
-                                            row[key] = progress_data[key]
-                        except Exception as progress_read_error:
-                            row["progress_read_warning"] = str(progress_read_error)[:140]
-                    if SCENE_JOBS.get(chosen, {}).get("status") == "completed":
-                        row["progress"] = 100
-                        row["scene"] = cached
-                    return {"ok": row.get("status") != "failed", "job": row,
-                            "scene": cached if cached.get("updated") else None,
-                            "bridge_connected": bridge_connected()}
-        
-        
-                @app.get("/api/scene/snapshot")
-                @monitor_auth
-                def api_scene_snapshot():
-                    refresh = request.args.get("refresh", "1") != "0"
-                    force = request.args.get("force", "0") == "1"
-                    with SCENE_LOCK:
-                        cached = dict(SCENE_CACHE)
-                    stale = not cached.get("updated") or (time.time() - cached.get("updated", 0) > 10)
-                    job = _start_scene_scan(force=force) if refresh and bridge_connected() and (force or stale) else {"ok": True, "status": "cached"}
-                    payload = _scene_job_payload(job.get("job_id", ""))
-                    payload["request"] = job
-                    payload["bridge_connected"] = bridge_connected()
-                    payload["ok"] = bool(cached.get("updated") or job.get("ok"))
-                    return jsonify(payload)
-        
-        
-                @app.get("/api/scene/status")
-                @monitor_auth
-                def api_scene_status():
-                    return jsonify(_scene_job_payload(request.args.get("job_id", "")))
-        
-        
-                def _scene_model_export_worker(job_id):
-                    """Export actual renderable mesh geometry from the active Unreal level without modifying it."""
-                    job_dir = (SCENE_MODEL_DIR / ("offline_scene_" + job_id)).resolve()
-                    job_dir.mkdir(parents=True, exist_ok=True)
-                    temp_path = (job_dir / "scene_model.glb").resolve()
-                    progress_path = (job_dir / "progress.json").resolve()
-                    def _server_progress(percent, phase, completed=0, total=0, detail=""):
-                        payload = {"progress": max(0, min(100, int(percent))), "phase": str(phase),
-                                   "completed": int(completed or 0), "total": int(total or 0),
-                                   "detail": str(detail)[:300], "updated_at": time.time()}
-                        try:
-                            tmp_progress = progress_path.with_suffix(".tmp")
-                            tmp_progress.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
-                            os.replace(tmp_progress, progress_path)
-                        except Exception as progress_error:
-                            log("Could not write scene export progress: " + repr(progress_error))
-                        with SCENE_MODEL_LOCK:
-                            if SCENE_MODEL_STATE.get("job_id") == job_id:
-                                SCENE_MODEL_STATE.update(payload)
-                    _server_progress(2, "Starting Unreal scene export", detail="Preparing progress tracking")
-                    with SCENE_MODEL_LOCK:
-                        if SCENE_MODEL_STATE.get("job_id") == job_id:
-                            SCENE_MODEL_STATE.update({"status": "running", "started_at": time.time()})
-                    try:
-                        if not bridge_connected():
-                            raise RuntimeError("Unreal Python Bridge is offline")
-                        unreal_path = str(temp_path).replace("\\", "/")
-                        code = r"""
-                import json, os, time, unreal, traceback
-                output_path = __OUTPUT_PATH__
-                progress_path = __PROGRESS_PATH__
-                report = {"ok": False, "path": output_path, "error": ""}
-                def _write_progress(percent, phase, completed=0, total=0, detail=""):
-                    payload = {"progress": max(0, min(100, int(percent))), "phase": str(phase),
-                               "completed": int(completed or 0), "total": int(total or 0),
-                               "detail": str(detail)[:300], "updated_at": time.time()}
-                    try:
-                        temporary = progress_path + ".tmp"
-                        with open(temporary, "w", encoding="utf-8") as progress_stream:
-                            json.dump(payload, progress_stream, ensure_ascii=False)
-                        os.replace(temporary, progress_path)
-                    except Exception as progress_error:
-                        print("[UE58 GLB] progress update failed: " + str(progress_error))
-                _write_progress(4, "Connecting to Unreal Editor", detail="Checking the active level and GLTFExporter")
+            if per_actor_files:
+                report["export_mode"] = "direct_mesh_asset_per_component"
+                report["mesh_files"] = per_actor_files
+                mesh_count = sum(int(row.get("mesh_count", 0)) for row in per_actor_files)
+                report["asset_export_errors"] = export_errors[:30]
+            else:
+                # Fallback to world export only if all direct mesh-asset exports failed.
+                primary_export_error = "; ".join(export_errors[:8])[:1200]
+                _write_progress(72, "Trying full-level GLB fallback", 0, 1,
+                                "Direct asset export produced no files; trying the active UWorld")
                 try:
-                    world = unreal.get_editor_subsystem(unreal.UnrealEditorSubsystem).get_editor_world()
-                    if world is None:
-                        raise RuntimeError("Unreal Editor has no active editor world")
-                    if not hasattr(unreal, "GLTFExporter") or not hasattr(unreal, "GLTFExportOptions"):
-                        raise RuntimeError("GLTFExporter is not loaded. Enable the GLTFExporter plugin and restart this project.")
-                    os.makedirs(os.path.dirname(output_path), exist_ok=True)
                     if os.path.isfile(output_path):
                         os.remove(output_path)
-                    options = unreal.GLTFExportOptions()
-                    # Geometry-first snapshot: disable material texture baking and skip lights/cameras.
-                    # Mesh geometry and component transforms remain intact, but export is much lighter.
+                    document = _run_gltf_export(output_path, export_actor_set)
+                    mesh_count = len(document.get("meshes", []))
+                    mesh_node_rows = [node for node in document.get("nodes", []) if "mesh" in node]
+                    if mesh_count < 1 or not mesh_node_rows:
+                        raise RuntimeError("Selected-actor world export contained no mesh nodes")
+                    report["export_mode"] = "selected_actor_world_fallback"
+                except Exception as world_error:
+                    report["world_fallback_error"] = str(world_error)[:900]
                     try:
-                        options.set_editor_property("bake_material_inputs", unreal.GLTFMaterialBakeMode.DISABLED)
-                    except Exception as material_bake_error:
-                        print("GLTF material baking could not be disabled: " + str(material_bake_error))
-                    for property_name, property_value in (("export_lights", False), ("export_cameras", False),
-                                                           ("export_vertex_colors", True), ("export_morph_targets", False),
-                                                           ("export_vertex_skin_weights", True), ("make_skinned_meshes_root", True)):
-                        try:
-                            options.set_editor_property(property_name, property_value)
-                        except Exception:
-                            pass
-                    # Explicitly collect renderable actor components from the active editor level.
-                    # Passing a populated SelectedActors set avoids ambiguity between the editor world
-                    # and the level actor list in some UE 5.8 Python builds.
+                        if os.path.isfile(output_path):
+                            os.remove(output_path)
+                    except Exception:
+                        pass
                     try:
-                        actor_subsystem = unreal.get_editor_subsystem(unreal.EditorActorSubsystem)
-                        level_actors = list(actor_subsystem.get_all_level_actors() or [])
-                    except Exception as actor_subsystem_error:
-                        print("EditorActorSubsystem unavailable; using EditorLevelLibrary: " + str(actor_subsystem_error))
-                        level_actors = list(unreal.EditorLevelLibrary.get_all_level_actors() or [])
-                    _write_progress(10, "Scanning active Unreal level", total=len(level_actors), detail=str(len(level_actors)) + " Actors found")
-        
-                    mesh_actor_list = []
-                    static_component_count = 0
-                    skeletal_component_count = 0
-                    skipped_hidden_component_count = 0
-                    for actor_scan_index, actor in enumerate(level_actors):
-                        if actor is None:
-                            _write_progress(10 + int(12 * (actor_scan_index + 1) / max(1, len(level_actors))),
-                                            "Scanning mesh components", actor_scan_index + 1, len(level_actors), "Reading Actor components")
-                            continue
-                        actor_has_mesh = False
-                        try:
-                            static_components = actor.get_components_by_class(unreal.StaticMeshComponent)
-                        except Exception:
-                            static_components = []
-                        for component in static_components or []:
-                            if component is None:
-                                continue
-                            try:
-                                mesh_asset = component.get_editor_property("static_mesh")
-                            except Exception:
-                                mesh_asset = None
-                            if mesh_asset is None:
-                                continue
-                            try:
-                                component_visible = bool(component.get_editor_property("visible"))
-                            except Exception:
-                                component_visible = True
-                            if not component_visible:
-                                skipped_hidden_component_count += 1
-                                continue
-                            static_component_count += 1
-                            actor_has_mesh = True
-        
-                        try:
-                            skeletal_components = actor.get_components_by_class(unreal.SkeletalMeshComponent)
-                        except Exception:
-                            skeletal_components = []
-                        for component in skeletal_components or []:
-                            if component is None:
-                                continue
-                            try:
-                                mesh_asset = component.get_editor_property("skeletal_mesh")
-                            except Exception:
-                                mesh_asset = None
-                            if mesh_asset is None:
-                                continue
-                            try:
-                                component_visible = bool(component.get_editor_property("visible"))
-                            except Exception:
-                                component_visible = True
-                            if not component_visible:
-                                skipped_hidden_component_count += 1
-                                continue
-                            skeletal_component_count += 1
-                            actor_has_mesh = True
-        
-                        if actor_has_mesh:
-                            mesh_actor_list.append(actor)
-                        if (actor_scan_index + 1) == len(level_actors) or (actor_scan_index + 1) % max(1, len(level_actors) // 25) == 0:
-                            _write_progress(10 + int(12 * (actor_scan_index + 1) / max(1, len(level_actors))),
-                                            "Scanning mesh components", actor_scan_index + 1, len(level_actors),
-                                            str(len(mesh_actor_list)) + " mesh Actors identified")
-        
-                    if not mesh_actor_list:
+                        document = _run_gltf_export(output_path, set())
+                        mesh_count = len(document.get("meshes", []))
+                        mesh_node_rows = [node for node in document.get("nodes", []) if "mesh" in node]
+                        if mesh_count < 1 or not mesh_node_rows:
+                            raise RuntimeError("All-actors world export contained no mesh nodes")
+                        report["export_mode"] = "all_actor_world_fallback"
+                    except Exception as all_world_error:
                         raise RuntimeError(
-                            "No visible mesh components were found in the active level. "
-                            "Actor count=%d, static mesh components=%d, skeletal mesh components=%d."
-                            % (len(level_actors), static_component_count, skeletal_component_count)
+                            "No GLB geometry was created. Direct asset errors: %s. Selected-world fallback: %s. All-world fallback: %s"
+                            % (primary_export_error or "none", report.get("world_fallback_error", "none"), str(all_world_error)[:900])
                         )
         
+            if not mesh_node_rows and per_actor_files:
+                mesh_node_rows = [{"name": row.get("actor_label", "Mesh") + " / " + row.get("component_name", "Component")}
+                                  for row in per_actor_files]
+            _write_progress(94, "Finalizing exported geometry", 1, 1, "Validating mesh nodes and GLB file sizes")
+            mesh_node_names = [str(node.get("name") or ("Mesh node " + str(index + 1)))[:180]
+                               for index, node in enumerate(mesh_node_rows[:500])]
+            size_bytes = (sum(os.path.getsize(os.path.join(os.path.dirname(output_path), row["file"]))
+                              for row in per_actor_files) if per_actor_files else os.path.getsize(output_path))
+            report.update({"ok": True, "size": size_bytes,
+                           "mesh_count": mesh_count, "mesh_nodes": len(mesh_node_rows),
+                           "mesh_node_names": mesh_node_names, "error": ""})
+            _write_progress(98, "Unreal export finished", 1, 1, str(mesh_count) + " mesh records created")
+        except Exception as exc:
+            report["error"] = str(exc)[:1800]
+            report["traceback"] = traceback.format_exc()[-2500:]
+            _write_progress(99, "Unreal export failed", detail=str(exc)[:250])
+        print("__UE_SCENE_GLB__" + json.dumps(report, ensure_ascii=False))
+        """
+                # YAML already removes the outer block-scalar indentation. Do not strip
+                # a fixed number of spaces from each line: that corrupts nested Python
+                # blocks (for example, a try body becomes aligned with its try statement).
+                # Dedent only common indentation, then syntax-check the exact code sent to UE.
+                code = textwrap.dedent(code).strip()
+                code = code.replace("__OUTPUT_PATH__", repr(unreal_path))
+                code = code.replace("__PROGRESS_PATH__", repr(str(progress_path).replace("\\", "/")))
+                try:
+                    ast.parse(code, filename="<generated-scene-glb-export>", mode="exec")
+                except SyntaxError as syntax_error:
+                    raise RuntimeError("Generated GLB export script failed local syntax validation: " + str(syntax_error)) from syntax_error
+                result, status = queue_unreal(code, timeout=10000)
+                deadline = time.monotonic() + 10000
+                while status == 202 and time.monotonic() < deadline:
+                    result, status = wait_unreal_job(result.get("job_id", ""), timeout=60)
+                if status == 202:
+                    raise TimeoutError("Unreal GLB export is still running after the 10,000-second execution limit")
+                if status != 200 or not result.get("ok"):
+                    raise RuntimeError(result.get("error") or result.get("message") or str(result))
+                output = str(result.get("output", ""))
+                marker = "__UE_SCENE_GLB__"
+                line = next((item for item in output.splitlines() if marker in item), "")
+                if not line:
+                    raise RuntimeError("Unreal returned no GLB export report: " + output[-1200:])
+                report = json.loads(line.split(marker, 1)[1])
+                if not report.get("ok"):
+                    raise RuntimeError(report.get("error") or "Unreal GLB export failed")
+                model_files = report.get("mesh_files", []) or []
+                if model_files:
+                    for item in model_files:
+                        file_path = (job_dir / str(item.get("file", ""))).resolve()
+                        if file_path.parent != job_dir or not file_path.is_file() or file_path.stat().st_size < 32:
+                            raise RuntimeError("Per-actor GLB file is missing or invalid: " + str(item.get("file")))
+                        with file_path.open("rb") as stream:
+                            if stream.read(4) != b"glTF":
+                                raise RuntimeError("Per-actor export is not a binary GLB: " + str(item.get("file")))
+                    size = sum((job_dir / item["file"]).stat().st_size for item in model_files)
+                    stored_path = ""
+                else:
+                    if not temp_path.is_file() or temp_path.stat().st_size < 32:
+                        raise RuntimeError("The exported GLB file is missing or empty")
+                    with temp_path.open("rb") as stream:
+                        if stream.read(4) != b"glTF":
+                            raise RuntimeError("The exported file is not a valid binary glTF (GLB)")
+                    size = temp_path.stat().st_size
+                    stored_path = str(temp_path)
+                with SCENE_MODEL_LOCK:
+                    previous_dir = SCENE_MODEL_STATE.get("job_dir", "")
+                    SCENE_MODEL_STATE.update({"status": "ready", "job_id": job_id,
+                                              "progress": 98, "phase": "GLB export complete · loading in browser",
+                                              "completed": len(model_files) if model_files else 1,
+                                              "total": len(model_files) if model_files else 1,
+                                              "detail": str(report.get("mesh_count", 0)) + " meshes ready",
+                                              "path": stored_path, "job_dir": str(job_dir),
+                                              "model_files": model_files,
+                                              "version": int(SCENE_MODEL_STATE.get("version", 0)) + 1,
+                                              "updated": time.time(), "size": size,
+                                              "mesh_node_names": report.get("mesh_node_names", []),
+                                              "mesh_count": report.get("mesh_count", 0),
+                                              "selected_mesh_actor_count": report.get("selected_mesh_actor_count", 0),
+                                              "static_mesh_components": report.get("static_mesh_components", 0),
+                                              "skeletal_mesh_components": report.get("skeletal_mesh_components", 0),
+                                              "export_mode": report.get("export_mode", "whole_level"),
+                                              "error": ""})
+                if previous_dir and previous_dir != str(job_dir):
                     try:
-                        export_actor_set = set(mesh_actor_list)
-                    except Exception as selection_error:
-                        raise RuntimeError("Could not build Unreal SelectedActors set: " + str(selection_error))
-        
-                    def _read_glb_json(file_name):
-                        import struct
-                        if not os.path.isfile(file_name) or os.path.getsize(file_name) < 32:
-                            raise RuntimeError("GLTFExporter did not create a valid GLB: " + str(file_name))
-                        with open(file_name, "rb") as stream:
-                            header = stream.read(12)
-                            if len(header) != 12:
-                                raise RuntimeError("Exported GLB header is incomplete")
-                            magic, glb_version, total_length = struct.unpack("<4sII", header)
-                            file_size = os.path.getsize(file_name)
-                            if magic != b"glTF" or glb_version != 2 or total_length > file_size:
-                                raise RuntimeError("Exported file is not a valid glTF 2.0 binary container")
-                            document = None
-                            offset = 12
-                            while offset + 8 <= total_length:
-                                chunk_header = stream.read(8)
-                                if len(chunk_header) != 8:
-                                    break
-                                chunk_length, chunk_type = struct.unpack("<II", chunk_header)
-                                chunk_data = stream.read(chunk_length)
-                                if len(chunk_data) != chunk_length:
-                                    raise RuntimeError("GLB contains a truncated data chunk")
-                                if chunk_type == 0x4E4F534A:
-                                    document = json.loads(chunk_data.decode("utf-8").rstrip(" \t\r\n\x00"))
-                                offset += 8 + chunk_length
-                        if not isinstance(document, dict):
-                            raise RuntimeError("GLB has no JSON scene description")
-                        return document
-        
-                    def _run_gltf_export(target_path, selected_set, export_object=None):
-                        export_target = export_object if export_object is not None else world
-                        raw = unreal.GLTFExporter.export_to_gltf(export_target, target_path, options, selected_set)
-                        messages = None
-                        if isinstance(raw, tuple):
-                            if raw and isinstance(raw[0], bool) and not raw[0]:
-                                raise RuntimeError("Unreal GLTFExporter returned failure: " + str(raw))
-                            messages = raw[-1] if len(raw) > 1 else None
-                        elif isinstance(raw, bool):
-                            if not raw:
-                                raise RuntimeError("Unreal GLTFExporter returned false")
-                        else:
-                            messages = raw
-                        errors = getattr(messages, "errors", None) if messages is not None else None
-                        if errors:
-                            raise RuntimeError("Unreal GLTFExporter errors: " + "; ".join(str(item) for item in errors)[:1600])
-                        return _read_glb_json(target_path)
-        
-                    report.update({
-                        "scene_actor_count": len(level_actors),
-                        "selected_mesh_actor_count": len(mesh_actor_list),
-                        "static_mesh_components": static_component_count,
-                        "skeletal_mesh_components": skeletal_component_count,
-                        "skipped_hidden_components": skipped_hidden_component_count,
-                    })
-                    print("[UE58 GLB] level_actors=%d mesh_actors=%d static_components=%d skeletal_components=%d" % (
-                        len(level_actors), len(mesh_actor_list), static_component_count, skeletal_component_count
-                    ))
-        
-                    # Export each actual mesh asset directly. This avoids silent-empty-world behavior
-                    # sometimes seen when UWorld export is passed a SelectedActors set in UE 5.8.
-                    # GLTFExporter supports UStaticMesh and USkeletalMesh objects as direct inputs.
-                    per_actor_files = []
-                    mesh_node_rows = []
-                    export_errors = []
-                    total_components = max(1, static_component_count + skeletal_component_count)
-                    processed_components = 0
-                    _write_progress(26, "Exporting actual mesh assets", 0, total_components,
-                                    "Direct UStaticMesh/USkeletalMesh export; material baking disabled")
-        
-                    for actor_index, actor in enumerate(mesh_actor_list):
-                        try:
-                            actor_label = str(actor.get_actor_label() or actor.get_name())
-                        except Exception:
-                            actor_label = str(actor.get_name())
-                        component_groups = []
-                        try:
-                            component_groups.append(("StaticMesh", list(actor.get_components_by_class(unreal.StaticMeshComponent) or []), "static_mesh"))
-                        except Exception as component_error:
-                            export_errors.append(str(actor_label) + " static components: " + str(component_error)[:240])
-                        try:
-                            component_groups.append(("SkeletalMesh", list(actor.get_components_by_class(unreal.SkeletalMeshComponent) or []), "skeletal_mesh"))
-                        except Exception as component_error:
-                            export_errors.append(str(actor_label) + " skeletal components: " + str(component_error)[:240])
-        
-                        for component_kind, components, asset_property in component_groups:
-                            for component in components:
-                                if component is None:
-                                    continue
-                                try:
-                                    visible = bool(component.get_editor_property("visible"))
-                                except Exception:
-                                    visible = True
-                                if not visible:
-                                    continue
-                                try:
-                                    mesh_asset = component.get_editor_property(asset_property)
-                                except Exception as asset_error:
-                                    mesh_asset = None
-                                    export_errors.append(str(actor_label) + "/" + str(component.get_name()) +
-                                                         " asset lookup: " + str(asset_error)[:220])
-                                if mesh_asset is None:
-                                    continue
-        
-                                actor_file = os.path.join(os.path.dirname(output_path),
-                                                          "mesh_component_%04d.glb" % processed_components)
-                                try:
-                                    if os.path.isfile(actor_file):
-                                        os.remove(actor_file)
-                                    asset_doc = _run_gltf_export(actor_file, set(), mesh_asset)
-                                    asset_meshes = len(asset_doc.get("meshes", []))
-                                    asset_nodes = [node for node in asset_doc.get("nodes", []) if "mesh" in node]
-                                    if asset_meshes < 1 or not asset_nodes:
-                                        raise RuntimeError("asset export completed without renderable mesh nodes")
-                                    world_transform = component.get_world_transform()
-                                    translation = world_transform.translation
-                                    rotation = world_transform.rotation
-                                    scale3d = world_transform.scale3d
-                                    transform_payload = {
-                                        "location": {"x": float(translation.x), "y": float(translation.y), "z": float(translation.z)},
-                                        "rotation": {"x": float(rotation.x), "y": float(rotation.y),
-                                                     "z": float(rotation.z), "w": float(rotation.w)},
-                                        "scale": {"x": float(scale3d.x), "y": float(scale3d.y), "z": float(scale3d.z)}
-                                    }
-                                    component_name = str(component.get_name())
-                                    per_actor_files.append({
-                                        "file": os.path.basename(actor_file),
-                                        "actor_label": actor_label[:180],
-                                        "object_name": str(actor.get_name())[:180],
-                                        "component_name": component_name[:180],
-                                        "asset_path": str(mesh_asset.get_path_name())[:300],
-                                        "component_kind": component_kind,
-                                        "transform": transform_payload,
-                                        "mesh_count": asset_meshes,
-                                        "node_names": [str(node.get("name") or ("Mesh node " + str(i + 1)))[:180]
-                                                       for i, node in enumerate(asset_nodes[:100])]
-                                    })
-                                    mesh_node_rows.extend([{"name": actor_label + " / " + component_name + " / " +
-                                                            str(node.get("name") or ("Mesh " + str(i + 1)))[:120]}
-                                                           for i, node in enumerate(asset_nodes[:100])])
-                                except Exception as asset_export_error:
-                                    export_errors.append(str(actor_label) + "/" + str(component.get_name()) +
-                                                         " [" + component_kind + "]: " + str(asset_export_error)[:360])
-                                    try:
-                                        if os.path.isfile(actor_file):
-                                            os.remove(actor_file)
-                                    except Exception:
-                                        pass
-                                processed_components += 1
-                                _write_progress(26 + int(64 * processed_components / total_components),
-                                                "Exporting actual mesh assets", processed_components, total_components,
-                                                "Exported " + str(len(per_actor_files)) + " component GLB files; " +
-                                                str(processed_components) + " of " + str(total_components) + " components processed")
-        
-                    if per_actor_files:
-                        report["export_mode"] = "direct_mesh_asset_per_component"
-                        report["mesh_files"] = per_actor_files
-                        mesh_count = sum(int(row.get("mesh_count", 0)) for row in per_actor_files)
-                        report["asset_export_errors"] = export_errors[:30]
-                    else:
-                        # Fallback to world export only if all direct mesh-asset exports failed.
-                        primary_export_error = "; ".join(export_errors[:8])[:1200]
-                        _write_progress(72, "Trying full-level GLB fallback", 0, 1,
-                                        "Direct asset export produced no files; trying the active UWorld")
-                        try:
-                            if os.path.isfile(output_path):
-                                os.remove(output_path)
-                            document = _run_gltf_export(output_path, export_actor_set)
-                            mesh_count = len(document.get("meshes", []))
-                            mesh_node_rows = [node for node in document.get("nodes", []) if "mesh" in node]
-                            if mesh_count < 1 or not mesh_node_rows:
-                                raise RuntimeError("Selected-actor world export contained no mesh nodes")
-                            report["export_mode"] = "selected_actor_world_fallback"
-                        except Exception as world_error:
-                            report["world_fallback_error"] = str(world_error)[:900]
-                            try:
-                                if os.path.isfile(output_path):
-                                    os.remove(output_path)
-                            except Exception:
-                                pass
-                            try:
-                                document = _run_gltf_export(output_path, set())
-                                mesh_count = len(document.get("meshes", []))
-                                mesh_node_rows = [node for node in document.get("nodes", []) if "mesh" in node]
-                                if mesh_count < 1 or not mesh_node_rows:
-                                    raise RuntimeError("All-actors world export contained no mesh nodes")
-                                report["export_mode"] = "all_actor_world_fallback"
-                            except Exception as all_world_error:
-                                raise RuntimeError(
-                                    "No GLB geometry was created. Direct asset errors: %s. Selected-world fallback: %s. All-world fallback: %s"
-                                    % (primary_export_error or "none", report.get("world_fallback_error", "none"), str(all_world_error)[:900])
-                                )
-        
-                    if not mesh_node_rows and per_actor_files:
-                        mesh_node_rows = [{"name": row.get("actor_label", "Mesh") + " / " + row.get("component_name", "Component")}
-                                          for row in per_actor_files]
-                    _write_progress(94, "Finalizing exported geometry", 1, 1, "Validating mesh nodes and GLB file sizes")
-                    mesh_node_names = [str(node.get("name") or ("Mesh node " + str(index + 1)))[:180]
-                                       for index, node in enumerate(mesh_node_rows[:500])]
-                    size_bytes = (sum(os.path.getsize(os.path.join(os.path.dirname(output_path), row["file"]))
-                                      for row in per_actor_files) if per_actor_files else os.path.getsize(output_path))
-                    report.update({"ok": True, "size": size_bytes,
-                                   "mesh_count": mesh_count, "mesh_nodes": len(mesh_node_rows),
-                                   "mesh_node_names": mesh_node_names, "error": ""})
-                    _write_progress(98, "Unreal export finished", 1, 1, str(mesh_count) + " mesh records created")
-                except Exception as exc:
-                    report["error"] = str(exc)[:1800]
-                    report["traceback"] = traceback.format_exc()[-2500:]
-                    _write_progress(99, "Unreal export failed", detail=str(exc)[:250])
-                print("__UE_SCENE_GLB__" + json.dumps(report, ensure_ascii=False))
-                """
-                        # YAML already removes the outer block-scalar indentation. Do not strip
-                        # a fixed number of spaces from each line: that corrupts nested Python
-                        # blocks (for example, a try body becomes aligned with its try statement).
-                        # Dedent only common indentation, then syntax-check the exact code sent to UE.
-                        code = textwrap.dedent(code).strip()
-                        code = code.replace("__OUTPUT_PATH__", repr(unreal_path))
-                        code = code.replace("__PROGRESS_PATH__", repr(str(progress_path).replace("\\", "/")))
-                        try:
-                            ast.parse(code, filename="<generated-scene-glb-export>", mode="exec")
-                        except SyntaxError as syntax_error:
-                            raise RuntimeError("Generated GLB export script failed local syntax validation: " + str(syntax_error)) from syntax_error
-                        result, status = queue_unreal(code, timeout=10000)
-                        deadline = time.monotonic() + 10000
-                        while status == 202 and time.monotonic() < deadline:
-                            result, status = wait_unreal_job(result.get("job_id", ""), timeout=60)
-                        if status == 202:
-                            raise TimeoutError("Unreal GLB export is still running after the 10,000-second execution limit")
-                        if status != 200 or not result.get("ok"):
-                            raise RuntimeError(result.get("error") or result.get("message") or str(result))
-                        output = str(result.get("output", ""))
-                        marker = "__UE_SCENE_GLB__"
-                        line = next((item for item in output.splitlines() if marker in item), "")
-                        if not line:
-                            raise RuntimeError("Unreal returned no GLB export report: " + output[-1200:])
-                        report = json.loads(line.split(marker, 1)[1])
-                        if not report.get("ok"):
-                            raise RuntimeError(report.get("error") or "Unreal GLB export failed")
-                        model_files = report.get("mesh_files", []) or []
-                        if model_files:
-                            for item in model_files:
-                                file_path = (job_dir / str(item.get("file", ""))).resolve()
-                                if file_path.parent != job_dir or not file_path.is_file() or file_path.stat().st_size < 32:
-                                    raise RuntimeError("Per-actor GLB file is missing or invalid: " + str(item.get("file")))
-                                with file_path.open("rb") as stream:
-                                    if stream.read(4) != b"glTF":
-                                        raise RuntimeError("Per-actor export is not a binary GLB: " + str(item.get("file")))
-                            size = sum((job_dir / item["file"]).stat().st_size for item in model_files)
-                            stored_path = ""
-                        else:
-                            if not temp_path.is_file() or temp_path.stat().st_size < 32:
-                                raise RuntimeError("The exported GLB file is missing or empty")
-                            with temp_path.open("rb") as stream:
-                                if stream.read(4) != b"glTF":
-                                    raise RuntimeError("The exported file is not a valid binary glTF (GLB)")
-                            size = temp_path.stat().st_size
-                            stored_path = str(temp_path)
-                        with SCENE_MODEL_LOCK:
-                            previous_dir = SCENE_MODEL_STATE.get("job_dir", "")
-                            SCENE_MODEL_STATE.update({"status": "ready", "job_id": job_id,
-                                                      "progress": 98, "phase": "GLB export complete · loading in browser",
-                                                      "completed": len(model_files) if model_files else 1,
-                                                      "total": len(model_files) if model_files else 1,
-                                                      "detail": str(report.get("mesh_count", 0)) + " meshes ready",
-                                                      "path": stored_path, "job_dir": str(job_dir),
-                                                      "model_files": model_files,
-                                                      "version": int(SCENE_MODEL_STATE.get("version", 0)) + 1,
-                                                      "updated": time.time(), "size": size,
-                                                      "mesh_node_names": report.get("mesh_node_names", []),
-                                                      "mesh_count": report.get("mesh_count", 0),
-                                                      "selected_mesh_actor_count": report.get("selected_mesh_actor_count", 0),
-                                                      "static_mesh_components": report.get("static_mesh_components", 0),
-                                                      "skeletal_mesh_components": report.get("skeletal_mesh_components", 0),
-                                                      "export_mode": report.get("export_mode", "whole_level"),
-                                                      "error": ""})
-                        if previous_dir and previous_dir != str(job_dir):
-                            try:
-                                shutil.rmtree(previous_dir, ignore_errors=True)
-                            except Exception:
-                                pass
-                        log("Offline scene snapshot exported: job=%s size=%s bytes meshes=%s nodes=%s mode=%s" % (
-                            job_id, size, report.get("mesh_count", 0), report.get("mesh_nodes", 0),
-                            report.get("export_mode", "whole_level")))
-                    except Exception as exc:
-                        temp_path.unlink(missing_ok=True)
-                        with SCENE_MODEL_LOCK:
-                            SCENE_MODEL_STATE.update({"status": "failed", "job_id": job_id,
-                                                      "phase": "Scene export failed", "detail": str(exc)[:300],
-                                                      "error": str(exc)[:1800]})
-                        log("Actual scene geometry export failed: job=%s error=%s" % (job_id, repr(exc)))
+                        shutil.rmtree(previous_dir, ignore_errors=True)
+                    except Exception:
+                        pass
+                log("Offline scene snapshot exported: job=%s size=%s bytes meshes=%s nodes=%s mode=%s" % (
+                    job_id, size, report.get("mesh_count", 0), report.get("mesh_nodes", 0),
+                    report.get("export_mode", "whole_level")))
+            except Exception as exc:
+                temp_path.unlink(missing_ok=True)
+                with SCENE_MODEL_LOCK:
+                    SCENE_MODEL_STATE.update({"status": "failed", "job_id": job_id,
+                                              "phase": "Scene export failed", "detail": str(exc)[:300],
+                                              "error": str(exc)[:1800]})
+                log("Actual scene geometry export failed: job=%s error=%s" % (job_id, repr(exc)))
         
         
-                @app.post("/api/scene/model/export")
-                @monitor_auth
-                def api_scene_model_export():
-                    if not bridge_connected():
-                        return jsonify(ok=False, error="Unreal Python Bridge is offline"), 503
-                    with SCENE_MODEL_LOCK:
-                        if SCENE_MODEL_STATE.get("status") in ("queued", "running"):
-                            return jsonify(ok=True, status=SCENE_MODEL_STATE["status"], job_id=SCENE_MODEL_STATE.get("job_id", "")), 202
-                        job_id = uuid.uuid4().hex
-                        SCENE_MODEL_STATE.update({"status": "queued", "job_id": job_id, "error": "",
-                                                  "progress": 0, "phase": "Queued for Unreal export",
-                                                  "completed": 0, "total": 0, "detail": "Waiting for export worker",
-                                                  "started_at": time.time()})
-                    threading.Thread(target=_scene_model_export_worker, args=(job_id,),
-                                     name="UE-SceneGLB-" + job_id[:8], daemon=True).start()
-                    log("Actual scene geometry export queued: job=%s" % job_id)
-                    return jsonify(ok=True, status="queued", job_id=job_id), 202
+        @app.post("/api/scene/model/export")
+        @monitor_auth
+        def api_scene_model_export():
+            if not bridge_connected():
+                return jsonify(ok=False, error="Unreal Python Bridge is offline"), 503
+            with SCENE_MODEL_LOCK:
+                if SCENE_MODEL_STATE.get("status") in ("queued", "running"):
+                    return jsonify(ok=True, status=SCENE_MODEL_STATE["status"], job_id=SCENE_MODEL_STATE.get("job_id", "")), 202
+                job_id = uuid.uuid4().hex
+                SCENE_MODEL_STATE.update({"status": "queued", "job_id": job_id, "error": "",
+                                          "progress": 0, "phase": "Queued for Unreal export",
+                                          "completed": 0, "total": 0, "detail": "Waiting for export worker",
+                                          "started_at": time.time()})
+            threading.Thread(target=_scene_model_export_worker, args=(job_id,),
+                             name="UE-SceneGLB-" + job_id[:8], daemon=True).start()
+            log("Actual scene geometry export queued: job=%s" % job_id)
+            return jsonify(ok=True, status="queued", job_id=job_id), 202
         
         
-                @app.get("/api/scene/model/status")
-                @monitor_auth
-                def api_scene_model_status():
-                    with SCENE_MODEL_LOCK:
-                        state = dict(SCENE_MODEL_STATE)
-                    current_job = str(state.get("job_id", ""))
-                    if current_job:
-                        progress_file = (SCENE_MODEL_DIR / ("offline_scene_" + current_job) / "progress.json").resolve()
-                        try:
-                            if progress_file.parent.parent == SCENE_MODEL_DIR and progress_file.is_file():
-                                progress_data = json.loads(progress_file.read_text(encoding="utf-8"))
-                                if isinstance(progress_data, dict):
-                                    for key in ("progress", "phase", "completed", "total", "detail", "updated_at"):
-                                        if key in progress_data:
-                                            state[key] = progress_data[key]
-                        except Exception as progress_read_error:
-                            state["progress_read_warning"] = str(progress_read_error)[:160]
-                    state.setdefault("progress", 0)
-                    state.setdefault("phase", state.get("status", "idle"))
-                    state.pop("path", None)
-                    state["model_url"] = "/api/scene/model.glb" if state.get("status") == "ready" and state.get("path") else ""
-                    state["model_files"] = [dict(item, url="/api/scene/model/file/%s/%s" %
-                                                  (state.get("job_id", ""), item.get("file", "")))
-                                            for item in (state.get("model_files", []) or [])]
-                    state.pop("job_dir", None)
-                    state["offline_snapshot"] = True
-                    state["ok"] = state.get("status") != "failed"
-                    return jsonify(state)
+        @app.get("/api/scene/model/status")
+        @monitor_auth
+        def api_scene_model_status():
+            with SCENE_MODEL_LOCK:
+                state = dict(SCENE_MODEL_STATE)
+            current_job = str(state.get("job_id", ""))
+            if current_job:
+                progress_file = (SCENE_MODEL_DIR / ("offline_scene_" + current_job) / "progress.json").resolve()
+                try:
+                    if progress_file.parent.parent == SCENE_MODEL_DIR and progress_file.is_file():
+                        progress_data = json.loads(progress_file.read_text(encoding="utf-8"))
+                        if isinstance(progress_data, dict):
+                            for key in ("progress", "phase", "completed", "total", "detail", "updated_at"):
+                                if key in progress_data:
+                                    state[key] = progress_data[key]
+                except Exception as progress_read_error:
+                    state["progress_read_warning"] = str(progress_read_error)[:160]
+            state.setdefault("progress", 0)
+            state.setdefault("phase", state.get("status", "idle"))
+            state.pop("path", None)
+            state["model_url"] = "/api/scene/model.glb" if state.get("status") == "ready" and state.get("path") else ""
+            state["model_files"] = [dict(item, url="/api/scene/model/file/%s/%s" %
+                                          (state.get("job_id", ""), item.get("file", "")))
+                                    for item in (state.get("model_files", []) or [])]
+            state.pop("job_dir", None)
+            state["offline_snapshot"] = True
+            state["ok"] = state.get("status") != "failed"
+            return jsonify(state)
         
         
-                @app.get("/api/scene/model/file/<job_id>/<filename>")
-                @monitor_auth
-                def api_scene_model_file(job_id, filename):
-                    with SCENE_MODEL_LOCK:
-                        current_job = SCENE_MODEL_STATE.get("job_id", "")
-                        job_dir = SCENE_MODEL_STATE.get("job_dir", "")
-                        allowed = {str(item.get("file", "")) for item in (SCENE_MODEL_STATE.get("model_files", []) or [])}
-                    if job_id != current_job or filename not in allowed or not job_dir:
-                        return jsonify(ok=False, error="offline_scene_mesh_not_found"), 404
-                    target = (Path(job_dir).resolve() / filename).resolve()
-                    if target.parent != Path(job_dir).resolve() or not target.is_file() or not _inside_root(target):
-                        return jsonify(ok=False, error="offline_scene_mesh_not_found"), 404
-                    response = send_file(target, mimetype="model/gltf-binary", conditional=False, max_age=0)
-                    response.headers["Cache-Control"] = "no-store, max-age=0"
-                    response.headers["X-Scene-Model-Version"] = str(SCENE_MODEL_STATE.get("version", 0))
-                    return response
+        @app.get("/api/scene/model/file/<job_id>/<filename>")
+        @monitor_auth
+        def api_scene_model_file(job_id, filename):
+            with SCENE_MODEL_LOCK:
+                current_job = SCENE_MODEL_STATE.get("job_id", "")
+                job_dir = SCENE_MODEL_STATE.get("job_dir", "")
+                allowed = {str(item.get("file", "")) for item in (SCENE_MODEL_STATE.get("model_files", []) or [])}
+            if job_id != current_job or filename not in allowed or not job_dir:
+                return jsonify(ok=False, error="offline_scene_mesh_not_found"), 404
+            target = (Path(job_dir).resolve() / filename).resolve()
+            if target.parent != Path(job_dir).resolve() or not target.is_file() or not _inside_root(target):
+                return jsonify(ok=False, error="offline_scene_mesh_not_found"), 404
+            response = send_file(target, mimetype="model/gltf-binary", conditional=False, max_age=0)
+            response.headers["Cache-Control"] = "no-store, max-age=0"
+            response.headers["X-Scene-Model-Version"] = str(SCENE_MODEL_STATE.get("version", 0))
+            return response
         
         
-                @app.get("/api/scene/model.glb")
-                @monitor_auth
-                def api_scene_model_glb():
-                    with SCENE_MODEL_LOCK:
-                        model_path = SCENE_MODEL_STATE.get("path", "")
-                        model_version = SCENE_MODEL_STATE.get("version", 0)
-                    target = Path(model_path).resolve() if model_path else None
-                    if not target or not target.is_file() or not _inside_root(target):
-                        return jsonify(ok=False, error="actual_scene_model_not_ready"), 404
-                    response = send_file(target, mimetype="model/gltf-binary", conditional=False, max_age=0)
-                    response.headers["Cache-Control"] = "no-store, max-age=0"
-                    response.headers["X-Scene-Model-Version"] = str(model_version)
-                    return response
+        @app.get("/api/scene/model.glb")
+        @monitor_auth
+        def api_scene_model_glb():
+            with SCENE_MODEL_LOCK:
+                model_path = SCENE_MODEL_STATE.get("path", "")
+                model_version = SCENE_MODEL_STATE.get("version", 0)
+            target = Path(model_path).resolve() if model_path else None
+            if not target or not target.is_file() or not _inside_root(target):
+                return jsonify(ok=False, error="actual_scene_model_not_ready"), 404
+            response = send_file(target, mimetype="model/gltf-binary", conditional=False, max_age=0)
+            response.headers["Cache-Control"] = "no-store, max-age=0"
+            response.headers["X-Scene-Model-Version"] = str(model_version)
+            return response
         
         
         @app.get("/api/scene/export.html")
