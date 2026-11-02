@@ -4580,7 +4580,7 @@ jobs:
                 {
                     "name": "file_manager_create_zip",
                     "description": "Create a ZIP archive from selected Windows or Unreal files/folders and save it under UE58 Uploads folder. By default it uses ZIP_STORED for faster large-file packaging.",
-                    "inputSchema": {"type": "object", "properties": {"paths": {"type": "array", "items": {"type": "string"}, "minItems": 1, "maxItems": 100}, "archive_name": {"type": "string"}, "compress": {"type": "boolean", "default": false}}, "required": ["paths"], "additionalProperties": False}
+                    "inputSchema": {"type": "object", "properties": {"paths": {"type": "array", "items": {"type": "string"}, "minItems": 1, "maxItems": 100}, "archive_name": {"type": "string"}, "compress": {"type": "boolean", "default": False}}, "required": ["paths"], "additionalProperties": False}
                 },
                 {
                     "name": "unreal_upload_binary_file",
@@ -4599,7 +4599,7 @@ jobs:
                         "source": {"type": "string", "description": "Absolute Windows file path, or a path relative to UE58 workspace root."},
                         "tag": {"type": "string", "default": "ue5.8"},
                         "filename": {"type": "string", "description": "Optional Release asset name."},
-                        "replace_existing": {"type": "boolean", "default": false},
+                        "replace_existing": {"type": "boolean", "default": False},
                         "confirm_public_upload": {"type": "boolean", "description": "Must be true to publish this file publicly."}
                     }, "required": ["source", "confirm_public_upload"], "additionalProperties": False}
                 }
@@ -4628,6 +4628,11 @@ jobs:
                 {"name": "unreal_install_plugin_from_zip", "description": "Install one Unreal plugin from a ZIP already staged inside D:\\UE58\\Uploads, enable it for the active project, back up the project descriptor and restart Unreal. Requires confirm_install=true. The ZIP must contain exactly one .uplugin descriptor and be <=500 MiB.", "inputSchema": {"type": "object", "properties": {"source": {"type": "string"}, "confirm_install": {"type": "boolean"}}, "required": ["source", "confirm_install"], "additionalProperties": False}}
             ])
             return tools
+
+        # Validate and freeze the File Manager tool schemas during API startup.
+        # This catches Python/JSON literal mistakes before the public MCP endpoint is exposed.
+        FILE_MANAGER_MCP_TOOLS = file_manager_mcp_tools()
+        log("FILE_MANAGER_MCP_SCHEMA_VALID=true tools=%s" % len(FILE_MANAGER_MCP_TOOLS))
 
         def mcp_text_result(send, request_obj, value, is_error=False):
             response_obj = {
@@ -5263,7 +5268,7 @@ jobs:
                     result_obj = cached_response.get("result")
                     if isinstance(result_obj, dict) and isinstance(result_obj.get("tools"), list):
                         existing_names = {item.get("name") for item in result_obj["tools"] if isinstance(item, dict)}
-                        for item in file_manager_mcp_tools():
+                        for item in FILE_MANAGER_MCP_TOOLS:
                             if item.get("name") not in existing_names:
                                 result_obj["tools"].append(item)
                         if modern_mode:
@@ -5430,7 +5435,7 @@ jobs:
                                 MCP_CONNECTION["last_session_seen"] = time.time()
                         if isinstance(parsed, dict) and isinstance(parsed.get("result"), dict) and isinstance(parsed["result"].get("tools"), list):
                             existing = {item.get("name") for item in parsed["result"]["tools"] if isinstance(item, dict)}
-                            for item in file_manager_mcp_tools():
+                            for item in FILE_MANAGER_MCP_TOOLS:
                                 if item["name"] not in existing:
                                     parsed["result"]["tools"].append(item)
                             if modern_mode:
@@ -5541,7 +5546,7 @@ jobs:
             try:
                 parsed = asyncio.run(_fetch_native_tools_cache(timeout_seconds=210))
                 native_count = len(parsed.get("result", {}).get("tools", []))
-                total_count = native_count + len(file_manager_mcp_tools())
+                total_count = native_count + len(FILE_MANAGER_MCP_TOOLS)
                 return jsonify(ok=True, native_tool_count=native_count, total_tool_count=total_count,
                                elapsed_seconds=round(time.time() - started, 2), cached=True)
             except Exception as exc:
