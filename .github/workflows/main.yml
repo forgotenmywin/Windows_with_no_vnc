@@ -382,7 +382,7 @@ jobs:
         Set-Content -LiteralPath "$pythonDir\init_unreal.py" -Value $bridge -Encoding utf8
 
         $api = @'
-        import asyncio, base64, binascii, contextlib, hashlib, json, os, queue, re, secrets, shutil, tempfile, threading, time, traceback, uuid
+        import asyncio, base64, binascii, contextlib, hashlib, json, os, queue, re, secrets, shutil, tempfile, threading, time, traceback, uuid, textwrap
         from collections import deque
         from pathlib import Path
         from functools import wraps
@@ -2553,7 +2553,7 @@ jobs:
 
 
         def _scene_model_export_worker(job_id):
-            """Export the active Unreal world to a real, textured GLB without modifying the level."""
+            """Export actual renderable mesh geometry from the active Unreal level without modifying it."""
             job_dir = (SCENE_MODEL_DIR / ("offline_scene_" + job_id)).resolve()
             job_dir.mkdir(parents=True, exist_ok=True)
             temp_path = (job_dir / "scene_model.glb").resolve()
@@ -2579,7 +2579,8 @@ jobs:
                 if not bridge_connected():
                     raise RuntimeError("Unreal Python Bridge is offline")
                 unreal_path = str(temp_path).replace("\\", "/")
-                code = r"""import json, os, time, unreal, traceback
+                code = r"""
+        import json, os, time, unreal, traceback
         output_path = __OUTPUT_PATH__
         progress_path = __PROGRESS_PATH__
         report = {"ok": False, "path": output_path, "error": ""}
@@ -2912,13 +2913,19 @@ jobs:
             report["error"] = str(exc)[:1800]
             report["traceback"] = traceback.format_exc()[-2500:]
             _write_progress(99, "Unreal export failed", detail=str(exc)[:250])
-        print("__UE_SCENE_GLB__" + json.dumps(report, ensure_ascii=False))"""
-                # The multiline script is embedded inside a YAML/PowerShell block. Strip
-                # its common eight-space wrapper indentation before sending it to Unreal;
-                # without this, Python raises IndentationError on the second line.
-                code = "\n".join(line[8:] if line.startswith("        ") else line for line in code.splitlines())
+        print("__UE_SCENE_GLB__" + json.dumps(report, ensure_ascii=False))
+        """
+                # YAML already removes the outer block-scalar indentation. Do not strip
+                # a fixed number of spaces from each line: that corrupts nested Python
+                # blocks (for example, a try body becomes aligned with its try statement).
+                # Dedent only common indentation, then syntax-check the exact code sent to UE.
+                code = textwrap.dedent(code).strip()
                 code = code.replace("__OUTPUT_PATH__", repr(unreal_path))
                 code = code.replace("__PROGRESS_PATH__", repr(str(progress_path).replace("\\", "/")))
+                try:
+                    ast.parse(code, filename="<generated-scene-glb-export>", mode="exec")
+                except SyntaxError as syntax_error:
+                    raise RuntimeError("Generated GLB export script failed local syntax validation: " + str(syntax_error)) from syntax_error
                 result, status = queue_unreal(code, timeout=10000)
                 deadline = time.monotonic() + 10000
                 while status == 202 and time.monotonic() < deadline:
