@@ -1705,15 +1705,23 @@ jobs:
 
         async function loadActualModel(version, forceFrame=false, modelFiles=[], snapshotJob=''){
           const status=document.getElementById('sceneModelStatus');
-          status.textContent='Loading offline Unreal geometry and materials…';
+          status.textContent='Loading exported Unreal geometry…';
           try{
             const loader=new GLTFLoader();
             clearGroup();
             clearSelectionBox();selectedObject=null;selectedActor=null;selectableMeshes=[];
             let meshCount=0, vertexCount=0;
             const sources=Array.isArray(modelFiles)&&modelFiles.length ? modelFiles : [{url:'/api/scene/model.glb',actor_label:'Full Unreal scene',object_name:'',file:'scene_model.glb'}];
-            for(const source of sources){
-              const gltf=await loader.loadAsync((source.url||('/api/scene/model/file/'+encodeURIComponent(snapshotJob)+'/'+encodeURIComponent(source.file)))+'?v='+encodeURIComponent(version));
+            const gltfLoadCache=new Map();
+            const loadedSources=await Promise.all(sources.map(async source=>{
+              const modelUrl=(source.url||('/api/scene/model/file/'+encodeURIComponent(snapshotJob)+'/'+encodeURIComponent(source.file)))+'?v='+encodeURIComponent(version);
+              let gltfPromise=gltfLoadCache.get(modelUrl);
+              if(!gltfPromise){gltfPromise=loader.loadAsync(modelUrl);gltfLoadCache.set(modelUrl,gltfPromise);}
+              const loadedGltf=await gltfPromise;
+              return {source,gltf:{scene:loadedGltf.scene.clone(true)}};
+            }));
+            for(const loaded of loadedSources){
+              const {source,gltf}=loaded;
               if(source.transform){
                 const tr=source.transform,loc=tr.location||{},rot=tr.rotation||{},sc=tr.scale||{};
                 gltf.scene.position.set(numberOr(loc.x)*0.01,numberOr(loc.z)*0.01,-numberOr(loc.y)*0.01);
@@ -1772,8 +1780,9 @@ jobs:
             const state=await response.json();
             if(!response.ok) throw new Error(state.error||'Model status unavailable');
             if(state.status==='queued'||state.status==='running'){
-              document.getElementById('sceneModelStatus').textContent='Unreal is exporting real meshes and supported materials…';
-              modelPollTimer=setTimeout(pollSceneModel,2200); return;
+              const elapsed=state.started_at?Math.max(0,Math.floor(Date.now()/1000-Number(state.started_at))):0;
+              document.getElementById('sceneModelStatus').textContent='Fast mesh export running… '+elapsed+'s';
+              modelPollTimer=setTimeout(pollSceneModel,800); return;
             }
             modelExportBusy=false;
             if(state.status==='ready' && Number(state.version)!==loadedModelVersion){
@@ -1809,7 +1818,7 @@ jobs:
             const payload=await response.json();
             if(!response.ok) throw new Error(payload.error||'Could not start the Unreal GLB export');
             if(modelPollTimer) clearTimeout(modelPollTimer);
-            modelPollTimer=setTimeout(pollSceneModel,700);
+            modelPollTimer=setTimeout(pollSceneModel,350);
           }catch(error){
             modelExportBusy=false;
             document.getElementById('sceneModelStatus').textContent='Offline snapshot capture could not start: '+error.message;
@@ -2439,7 +2448,10 @@ jobs:
 
 
         def _scene_model_export_worker(job_id):
-            """Export the active Unreal world to a real, textured GLB without modifying the level."""
+            """Fast, read-only geometry export of the active Unreal level."""
+            with SCENE_MODEL_LOCK:
+                if SCENE_MODEL_STATE.get("job_id") == job_id:
+                    SCENE_MODEL_STATE.update({"status": "running", "started_at": time.time(), "error": ""})
             job_dir = (SCENE_MODEL_DIR / ("offline_scene_" + job_id)).resolve()
             job_dir.mkdir(parents=True, exist_ok=True)
             temp_path = (job_dir / "scene_model.glb").resolve()
@@ -2459,24 +2471,29 @@ jobs:
             os.makedirs(os.path.dirname(output_path), exist_ok=True)
             if os.path.isfile(output_path):
                 os.remove(output_path)
+            # FAST MODE: export mesh assets directly instead of exporting the complete
+            # world multiple times. This avoids slow level/material-bake passes and keeps
+            # the transform and identity of every component instance in the viewer.
             options = unreal.GLTFExportOptions()
-            # Bake material inputs using the mesh's UV/tangent data where the 5.8 exporter supports it.
-            # This improves the appearance of many complex materials in the standalone GLB viewer.
-            try:
-                options.set_editor_property("bake_material_inputs", unreal.GLTFMaterialBakeMode.USE_MESH_DATA)
-            except Exception as material_bake_error:
-                print("GLTF material baking option unavailable; using exporter defaults: " + str(material_bake_error))
-            # Keep Unreal's full scene geometry, actor transforms and supported material data.
-            for property_name, property_value in (("export_lights", True), ("export_cameras", True),
-                                                   ("export_vertex_colors", False), ("export_morph_targets", True),
-                                                   ("export_vertex_skin_weights", True), ("make_skinned_meshes_root", True)):
+            fast_options = (
+                ("bake_material_inputs", unreal.GLTFMaterialBakeMode.DISABLED),
+                ("texture_image_format", unreal.GLTFTextureImageFormat.NONE),
+                ("export_lights", False),
+                ("export_cameras", False),
+                ("export_morph_targets", False),
+                ("export_vertex_colors", False),
+                ("export_vertex_skin_weights", True),
+                ("make_skinned_meshes_root", True),
+                ("export_lightmaps", False),
+                ("export_animation_sequences", False),
+            )
+            for property_name, property_value in fast_options:
                 try:
                     options.set_editor_property(property_name, property_value)
                 except Exception:
                     pass
-            # Explicitly collect renderable actor components from the active editor level.
-            # Passing a populated SelectedActors set avoids ambiguity between the editor world
-            # and the level actor list in some UE 5.8 Python builds.
+
+            # Read the active editor level only. Do not change, select, or move actors.
             try:
                 actor_subsystem = unreal.get_editor_subsystem(unreal.EditorActorSubsystem)
                 level_actors = list(actor_subsystem.get_all_level_actors() or [])
@@ -2484,74 +2501,87 @@ jobs:
                 print("EditorActorSubsystem unavailable; using EditorLevelLibrary: " + str(actor_subsystem_error))
                 level_actors = list(unreal.EditorLevelLibrary.get_all_level_actors() or [])
 
-            mesh_actor_list = []
+            mesh_components = []
             static_component_count = 0
             skeletal_component_count = 0
             skipped_hidden_component_count = 0
+            actor_names_with_meshes = set()
             for actor in level_actors:
                 if actor is None:
                     continue
-                actor_has_mesh = False
                 try:
-                    static_components = actor.get_components_by_class(unreal.StaticMeshComponent)
+                    if bool(actor.is_hidden_ed()):
+                        continue
                 except Exception:
-                    static_components = []
-                for component in static_components or []:
-                    if component is None:
-                        continue
+                    pass
+                for component_class, asset_property, component_kind in (
+                    (unreal.StaticMeshComponent, "static_mesh", "StaticMesh"),
+                    (unreal.SkeletalMeshComponent, "skeletal_mesh", "SkeletalMesh"),
+                ):
                     try:
-                        mesh_asset = component.get_editor_property("static_mesh")
+                        components = actor.get_components_by_class(component_class) or []
                     except Exception:
-                        mesh_asset = None
-                    if mesh_asset is None:
-                        continue
-                    try:
-                        component_visible = bool(component.get_editor_property("visible"))
-                    except Exception:
-                        component_visible = True
-                    if not component_visible:
-                        skipped_hidden_component_count += 1
-                        continue
-                    static_component_count += 1
-                    actor_has_mesh = True
+                        components = []
+                    for component in components:
+                        if component is None:
+                            continue
+                        try:
+                            asset = component.get_editor_property(asset_property)
+                        except Exception:
+                            asset = None
+                        if asset is None:
+                            continue
+                        try:
+                            visible = bool(component.get_editor_property("visible"))
+                        except Exception:
+                            visible = True
+                        if not visible:
+                            skipped_hidden_component_count += 1
+                            continue
+                        try:
+                            transform = component.get_world_transform()
+                            translation = transform.translation
+                            rotation = transform.rotation
+                            scale3d = transform.scale3d
+                            transform_payload = {
+                                "location": {"x": float(translation.x), "y": float(translation.y), "z": float(translation.z)},
+                                "rotation": {"x": float(rotation.x), "y": float(rotation.y),
+                                             "z": float(rotation.z), "w": float(rotation.w)},
+                                "scale": {"x": float(scale3d.x), "y": float(scale3d.y), "z": float(scale3d.z)},
+                            }
+                        except Exception as transform_error:
+                            raise RuntimeError("Could not read transform for %s/%s: %s" %
+                                               (actor.get_name(), component.get_name(), transform_error))
+                        try:
+                            actor_label = str(actor.get_actor_label() or actor.get_name())
+                        except Exception:
+                            actor_label = str(actor.get_name())
+                        try:
+                            asset_path = str(asset.get_path_name())
+                        except Exception:
+                            asset_path = str(asset.get_name())
+                        mesh_components.append({
+                            "actor_label": actor_label[:180],
+                            "object_name": str(actor.get_name())[:180],
+                            "component_name": str(component.get_name())[:180],
+                            "asset": asset,
+                            "asset_path": asset_path[:500],
+                            "component_kind": component_kind,
+                            "transform": transform_payload,
+                        })
+                        actor_names_with_meshes.add(str(actor.get_name()))
+                        if component_kind == "StaticMesh":
+                            static_component_count += 1
+                        else:
+                            skeletal_component_count += 1
 
-                try:
-                    skeletal_components = actor.get_components_by_class(unreal.SkeletalMeshComponent)
-                except Exception:
-                    skeletal_components = []
-                for component in skeletal_components or []:
-                    if component is None:
-                        continue
-                    try:
-                        mesh_asset = component.get_editor_property("skeletal_mesh")
-                    except Exception:
-                        mesh_asset = None
-                    if mesh_asset is None:
-                        continue
-                    try:
-                        component_visible = bool(component.get_editor_property("visible"))
-                    except Exception:
-                        component_visible = True
-                    if not component_visible:
-                        skipped_hidden_component_count += 1
-                        continue
-                    skeletal_component_count += 1
-                    actor_has_mesh = True
-
-                if actor_has_mesh:
-                    mesh_actor_list.append(actor)
-
-            if not mesh_actor_list:
+            if not mesh_components:
                 raise RuntimeError(
-                    "No visible mesh components were found in the active level. "
-                    "Actor count=%d, static mesh components=%d, skeletal mesh components=%d."
-                    % (len(level_actors), static_component_count, skeletal_component_count)
+                    "No visible StaticMeshComponent or SkeletalMeshComponent with an assigned mesh asset was found. "
+                    "Actor count=%d, static components=%d, skeletal components=%d, hidden components skipped=%d. "
+                    "If this is the default preview level, check the Unreal log for EMPTY_LEVEL_PREVIEW_CREATED."
+                    % (len(level_actors), static_component_count, skeletal_component_count, skipped_hidden_component_count)
                 )
-
-            try:
-                export_actor_set = set(mesh_actor_list)
-            except Exception as selection_error:
-                raise RuntimeError("Could not build Unreal SelectedActors set: " + str(selection_error))
 
             def _read_glb_json(file_name):
                 import struct
@@ -2582,203 +2612,101 @@ jobs:
                     raise RuntimeError("GLB has no JSON scene description")
                 return document
 
-            def _run_gltf_export(target_path, selected_set, export_object=None):
-                export_target = export_object if export_object is not None else world
-                raw = unreal.GLTFExporter.export_to_gltf(export_target, target_path, options, selected_set)
-                messages = None
-                if isinstance(raw, tuple):
-                    if raw and isinstance(raw[0], bool) and not raw[0]:
-                        raise RuntimeError("Unreal GLTFExporter returned failure: " + str(raw))
-                    messages = raw[-1] if len(raw) > 1 else None
-                elif isinstance(raw, bool):
-                    if not raw:
-                        raise RuntimeError("Unreal GLTFExporter returned false")
-                else:
-                    messages = raw
+            def _run_mesh_asset_export(asset, target_path):
+                # GLTFExporter officially accepts UStaticMesh and USkeletalMesh assets.
+                raw = unreal.GLTFExporter.export_to_gltf(asset, target_path, options, set())
+                messages = raw[-1] if isinstance(raw, tuple) and len(raw) > 1 else raw
+                if isinstance(raw, tuple) and raw and isinstance(raw[0], bool) and not raw[0]:
+                    raise RuntimeError("GLTFExporter returned failure: " + str(raw))
+                if isinstance(raw, bool) and not raw:
+                    raise RuntimeError("GLTFExporter returned false")
                 errors = getattr(messages, "errors", None) if messages is not None else None
                 if errors:
-                    raise RuntimeError("Unreal GLTFExporter errors: " + "; ".join(str(item) for item in errors)[:1600])
-                return _read_glb_json(target_path)
+                    raise RuntimeError("GLTFExporter errors: " + "; ".join(str(item) for item in errors)[:1200])
+                document = _read_glb_json(target_path)
+                nodes = [node for node in document.get("nodes", []) if "mesh" in node]
+                meshes = document.get("meshes", [])
+                if not meshes or not nodes:
+                    raise RuntimeError("Asset export contains no mesh nodes")
+                return document, nodes, len(meshes)
+
+            # Export each distinct mesh asset once, then reference it for every component
+            # instance. The browser clones the cached GLTF scene and applies each transform.
+            asset_cache = {}
+            per_actor_files = []
+            mesh_node_rows = []
+            total_mesh_count = 0
+            export_errors = []
+            for component_index, item in enumerate(mesh_components):
+                asset_key = item["asset_path"]
+                cached_asset = asset_cache.get(asset_key)
+                if cached_asset is None:
+                    asset_file_name = "mesh_asset_%04d.glb" % len(asset_cache)
+                    asset_file = os.path.join(os.path.dirname(output_path), asset_file_name)
+                    try:
+                        if os.path.isfile(asset_file):
+                            os.remove(asset_file)
+                        asset_document, asset_nodes, asset_mesh_count = _run_mesh_asset_export(item["asset"], asset_file)
+                        cached_asset = {
+                            "file": asset_file_name,
+                            "mesh_count": asset_mesh_count,
+                            "node_names": [str(node.get("name") or ("Mesh node " + str(i + 1)))[:180]
+                                           for i, node in enumerate(asset_nodes[:100])],
+                        }
+                        asset_cache[asset_key] = cached_asset
+                        print("[UE58 FAST GLB] exported asset %s (%s meshes)" % (asset_key, asset_mesh_count))
+                    except Exception as asset_error:
+                        export_errors.append(item["actor_label"] + "/" + item["component_name"] + ": " + str(asset_error)[:300])
+                        try:
+                            if os.path.isfile(asset_file):
+                                os.remove(asset_file)
+                        except Exception:
+                            pass
+                        continue
+                per_actor_files.append({
+                    "file": cached_asset["file"],
+                    "actor_label": item["actor_label"],
+                    "object_name": item["object_name"],
+                    "component_name": item["component_name"],
+                    "asset_path": item["asset_path"],
+                    "transform": item["transform"],
+                    "mesh_count": cached_asset["mesh_count"],
+                    "node_names": cached_asset["node_names"],
+                })
+                total_mesh_count += int(cached_asset["mesh_count"])
+                for node_name in cached_asset["node_names"]:
+                    mesh_node_rows.append({"name": item["actor_label"] + " / " + node_name})
+
+            if not per_actor_files:
+                raise RuntimeError(
+                    "Fast mesh-asset export failed for every visible component. Actors=%d, components=%d, "
+                    "static=%d, skeletal=%d. Errors: %s"
+                    % (len(level_actors), len(mesh_components), static_component_count,
+                       skeletal_component_count, "; ".join(export_errors[:8]) or "no exporter details")
+                )
 
             report.update({
                 "scene_actor_count": len(level_actors),
-                "selected_mesh_actor_count": len(mesh_actor_list),
+                "selected_mesh_actor_count": len(actor_names_with_meshes),
                 "static_mesh_components": static_component_count,
                 "skeletal_mesh_components": skeletal_component_count,
                 "skipped_hidden_components": skipped_hidden_component_count,
+                "export_mode": "fast_unique_mesh_asset_exports",
+                "mesh_files": per_actor_files,
+                "mesh_count": total_mesh_count,
+                "mesh_nodes": len(mesh_node_rows),
+                "asset_export_count": len(asset_cache),
+                "asset_export_errors": export_errors[:20],
             })
-            print("[UE58 GLB] level_actors=%d mesh_actors=%d static_components=%d skeletal_components=%d" % (
-                len(level_actors), len(mesh_actor_list), static_component_count, skeletal_component_count
-            ))
+            print("[UE58 FAST GLB] complete actors=%d instances=%d unique_assets=%d meshes=%d" %
+                  (len(level_actors), len(per_actor_files), len(asset_cache), total_mesh_count))
 
-            primary_export_error = ""
-            try:
-                document = _run_gltf_export(output_path, export_actor_set)
-                mesh_count = len(document.get("meshes", []))
-                mesh_node_rows = [node for node in document.get("nodes", []) if "mesh" in node]
-            except Exception as primary_error:
-                primary_export_error = str(primary_error)[:900]
-                try:
-                    if os.path.isfile(output_path):
-                        os.remove(output_path)
-                except Exception:
-                    pass
-                document = {}
-                mesh_count = 0
-                mesh_node_rows = []
-
-            report["export_mode"] = "selected_mesh_actors"
-            report["primary_export_error"] = primary_export_error
-            # Some UE builds accept the populated actor set but still produce an empty scene.
-            # Retry with the documented all-actors mode before reporting a failure.
-            if mesh_count < 1 or not mesh_node_rows:
-                fallback_path = output_path + ".all_actors.glb"
-                try:
-                    if os.path.isfile(fallback_path):
-                        os.remove(fallback_path)
-                    fallback_document = _run_gltf_export(fallback_path, set())
-                    fallback_meshes = len(fallback_document.get("meshes", []))
-                    fallback_nodes = [node for node in fallback_document.get("nodes", []) if "mesh" in node]
-                    if fallback_meshes > 0 and fallback_nodes:
-                        os.replace(fallback_path, output_path)
-                        document = fallback_document
-                        mesh_count = fallback_meshes
-                        mesh_node_rows = fallback_nodes
-                        report["export_mode"] = "all_actors_fallback"
-                    else:
-                        os.remove(fallback_path)
-                except Exception as fallback_error:
-                    try:
-                        if os.path.isfile(fallback_path):
-                            os.remove(fallback_path)
-                    except Exception:
-                        pass
-                    report["fallback_error"] = str(fallback_error)[:900]
-
-            per_actor_files = []
-            # Last-resort export path: export one selected actor at a time. This avoids
-            # Unreal 5.8 builds which accept the whole-world export call but silently
-            # write a scene with zero mesh nodes for a multi-actor level.
-            if mesh_count < 1 or not mesh_node_rows:
-                try:
-                    if os.path.isfile(output_path):
-                        os.remove(output_path)
-                except Exception:
-                    pass
-                for actor_index, actor in enumerate(mesh_actor_list):
-                    actor_file = os.path.join(os.path.dirname(output_path), "actor_%04d.glb" % actor_index)
-                    try:
-                        if os.path.isfile(actor_file):
-                            os.remove(actor_file)
-                        actor_doc = _run_gltf_export(actor_file, {actor})
-                        actor_meshes = len(actor_doc.get("meshes", []))
-                        actor_nodes = [node for node in actor_doc.get("nodes", []) if "mesh" in node]
-                        if actor_meshes < 1 or not actor_nodes:
-                            raise RuntimeError("actor export contained no mesh nodes")
-                        try:
-                            actor_label = str(actor.get_actor_label() or actor.get_name())
-                        except Exception:
-                            actor_label = str(actor.get_name())
-                        per_actor_files.append({
-                            "file": os.path.basename(actor_file),
-                            "actor_label": actor_label[:180],
-                            "object_name": str(actor.get_name())[:180],
-                            "mesh_count": actor_meshes,
-                            "node_names": [str(node.get("name") or ("Mesh node " + str(i + 1)))[:180]
-                                           for i, node in enumerate(actor_nodes[:100])]
-                        })
-                    except Exception as actor_error:
-                        # Asset-level fallback: export each actual StaticMesh asset directly,
-                        # then preserve the component's world transform as viewer metadata.
-                        # This is still real Unreal mesh data; no placeholder geometry is made.
-                        asset_exports = 0
-                        try:
-                            components = actor.get_components_by_class(unreal.StaticMeshComponent) or []
-                        except Exception:
-                            components = []
-                        for component_index, component in enumerate(components):
-                            asset_file = ""
-                            try:
-                                mesh_asset = component.get_editor_property("static_mesh")
-                                if mesh_asset is None:
-                                    continue
-                                try:
-                                    visible = bool(component.get_editor_property("visible"))
-                                except Exception:
-                                    visible = True
-                                if not visible:
-                                    continue
-                                asset_file = os.path.join(os.path.dirname(output_path),
-                                                          "asset_%04d_%03d.glb" % (actor_index, component_index))
-                                if os.path.isfile(asset_file):
-                                    os.remove(asset_file)
-                                asset_doc = _run_gltf_export(asset_file, set(), mesh_asset)
-                                asset_meshes = len(asset_doc.get("meshes", []))
-                                asset_nodes = [node for node in asset_doc.get("nodes", []) if "mesh" in node]
-                                if asset_meshes < 1 or not asset_nodes:
-                                    raise RuntimeError("mesh asset export contained no mesh nodes")
-                                world_transform = component.get_world_transform()
-                                translation = world_transform.translation
-                                rotation = world_transform.rotation
-                                scale3d = world_transform.scale3d
-                                transform_payload = {
-                                    "location": {"x": float(translation.x), "y": float(translation.y), "z": float(translation.z)},
-                                    "rotation": {"x": float(rotation.x), "y": float(rotation.y),
-                                                 "z": float(rotation.z), "w": float(rotation.w)},
-                                    "scale": {"x": float(scale3d.x), "y": float(scale3d.y), "z": float(scale3d.z)}
-                                }
-                                try:
-                                    actor_label = str(actor.get_actor_label() or actor.get_name())
-                                except Exception:
-                                    actor_label = str(actor.get_name())
-                                per_actor_files.append({
-                                    "file": os.path.basename(asset_file),
-                                    "actor_label": actor_label[:180],
-                                    "object_name": str(actor.get_name())[:180],
-                                    "component_name": str(component.get_name())[:180],
-                                    "asset_path": str(mesh_asset.get_path_name())[:300],
-                                    "transform": transform_payload,
-                                    "mesh_count": asset_meshes,
-                                    "node_names": [str(node.get("name") or ("Mesh node " + str(i + 1)))[:180]
-                                                   for i, node in enumerate(asset_nodes[:100])]
-                                })
-                                asset_exports += 1
-                            except Exception as asset_error:
-                                report.setdefault("asset_fallback_errors", []).append(
-                                    str(actor.get_name()) + "/" + str(component.get_name()) + ": " + str(asset_error)[:300])
-                                try:
-                                    if asset_file and os.path.isfile(asset_file):
-                                        os.remove(asset_file)
-                                except Exception:
-                                    pass
-                        if asset_exports < 1:
-                            report.setdefault("per_actor_errors", []).append(
-                                str(actor.get_name()) + ": " + str(actor_error)[:350])
-                        try:
-                            if os.path.isfile(actor_file):
-                                os.remove(actor_file)
-                        except Exception:
-                            pass
-                if per_actor_files:
-                    report["export_mode"] = "one_world_export_per_mesh_actor"
-                    report["mesh_files"] = per_actor_files
-                    mesh_count = sum(int(row.get("mesh_count", 0)) for row in per_actor_files)
-                    mesh_node_rows = [{"name": row.get("actor_label", "Mesh")} for row in per_actor_files]
-                else:
-                    raise RuntimeError(
-                        "GLTFExporter created no renderable meshes in whole-level, all-actor, or per-actor export. "
-                        "Level actors=%d, mesh actors=%d, static components=%d, skeletal components=%d. "
-                        "Primary=%s; Fallback=%s; PerActor=%s"
-                        % (len(level_actors), len(mesh_actor_list), static_component_count,
-                           skeletal_component_count, report.get("primary_export_error", "none"),
-                           report.get("fallback_error", "no fallback error"),
-                           "; ".join(report.get("per_actor_errors", [])[:8]))
-                    )
-
+            mesh_count = total_mesh_count
             mesh_node_names = [str(node.get("name") or ("Mesh node " + str(index + 1)))[:180]
                                for index, node in enumerate(mesh_node_rows[:500])]
-            size_bytes = (sum(os.path.getsize(os.path.join(os.path.dirname(output_path), row["file"]))
-                              for row in per_actor_files) if per_actor_files else os.path.getsize(output_path))
+            size_bytes = (sum(os.path.getsize(os.path.join(os.path.dirname(output_path), file_name))
+                              for file_name in sorted(set(row["file"] for row in per_actor_files)))
+                          if per_actor_files else os.path.getsize(output_path))
             report.update({"ok": True, "size": size_bytes,
                            "mesh_count": mesh_count, "mesh_nodes": len(mesh_node_rows),
                            "mesh_node_names": mesh_node_names, "error": ""})
@@ -2792,7 +2720,7 @@ jobs:
                 while status == 202 and time.monotonic() < deadline:
                     result, status = wait_unreal_job(result.get("job_id", ""), timeout=60)
                 if status == 202:
-                    raise TimeoutError("Unreal GLB export is still running after 15 minutes")
+                    raise TimeoutError("Unreal GLB export is still running after the 10,000-second execution limit")
                 if status != 200 or not result.get("ok"):
                     raise RuntimeError(result.get("error") or result.get("message") or str(result))
                 output = str(result.get("output", ""))
