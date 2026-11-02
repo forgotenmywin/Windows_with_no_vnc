@@ -124,6 +124,7 @@ jobs:
         bAutoStartServer=True
         ServerPortNumber=8000
         ServerUrlPath=/mcp
+        bEnableToolSearch=True
         '@
         Set-Content -LiteralPath "$config\DefaultEngine.ini" -Value $engineConfig -Encoding utf8
 
@@ -4660,55 +4661,114 @@ jobs:
             return messages
 
         async def read_mcp_http_reply(response, request_obj):
-            """Read one MCP response; return on the matching SSE event, not stream EOF."""
+            """Read one MCP JSON/SSE reply as soon as a complete JSON-RPC message arrives.
+
+            Unreal 5.8 may keep the HTTP connection alive after writing its one reply.
+            Waiting for EOF (or even for an SSE blank-line terminator) can therefore
+            turn a valid response into a read timeout and an artificial HTTP 502.
+            """
             content_type = response.headers.get("content-type", "").lower()
-            if "text/event-stream" not in content_type:
-                raw = await response.aread()
-                try:
-                    parsed = json.loads(raw.decode("utf-8")) if raw else None
-                except Exception:
-                    parsed = None
-                return raw, parsed, False
-
             wanted_id = request_obj.get("id") if isinstance(request_obj, dict) else None
-            data_lines = []
-            event_count = 0
 
-            def decode_event(lines):
-                payload = "\n".join(lines).strip()
+            def decode_json_message(payload):
+                payload = str(payload or "").strip()
                 if not payload or payload == "[DONE]":
                     return None
                 try:
                     value = json.loads(payload)
                 except Exception:
                     return None
-                for item in (value if isinstance(value, list) else [value]):
-                    if isinstance(item, dict) and (wanted_id is None or item.get("id") == wanted_id):
+                candidates = value if isinstance(value, list) else [value]
+                for item in candidates:
+                    if not isinstance(item, dict):
+                        continue
+                    if wanted_id is None or item.get("id") == wanted_id:
                         return item
                 return None
 
-            async for line in response.aiter_lines():
+            if "text/event-stream" not in content_type:
+                received = bytearray()
+                async for chunk in response.aiter_bytes():
+                    if chunk:
+                        received.extend(chunk)
+                        try:
+                            parsed = json.loads(received.decode("utf-8"))
+                        except Exception:
+                            continue
+                        if isinstance(parsed, dict) and (wanted_id is None or parsed.get("id") == wanted_id):
+                            return bytes(received), parsed, False
+                        if isinstance(parsed, list):
+                            matched = decode_json_message(json.dumps(parsed, ensure_ascii=False))
+                            if matched is not None:
+                                return json.dumps(matched, ensure_ascii=False, separators=(",", ":")).encode("utf-8"), matched, False
+                raw = bytes(received)
+                try:
+                    parsed = json.loads(raw.decode("utf-8")) if raw else None
+                except Exception:
+                    parsed = None
+                return raw, parsed, False
+
+            line_buffer = ""
+            data_lines = []
+            event_count = 0
+
+            def consume_sse_line(line):
+                nonlocal data_lines, event_count
                 if line == "":
                     if data_lines:
                         event_count += 1
-                        matched = decode_event(data_lines)
+                        matched = decode_json_message("\n".join(data_lines))
                         data_lines = []
                         if matched is not None:
                             raw = json.dumps(matched, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-                            return raw, matched, True
-                elif line.startswith("data:"):
+                            return raw, matched
+                    return None
+                if line.startswith("data:"):
                     data_lines.append(line[5:].lstrip())
+                    # Most MCP replies fit in one SSE data line. Parse immediately,
+                    # without waiting for the server to close the stream or emit '\n\n'.
+                    matched = decode_json_message("\n".join(data_lines))
+                    if matched is not None:
+                        event_count += 1
+                        raw = json.dumps(matched, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+                        data_lines = []
+                        return raw, matched
                 elif line.startswith(":"):
-                    # SSE keep-alive comment: the JSON-RPC event may follow later.
-                    continue
+                    return None
+                return None
 
+            async for chunk in response.aiter_text():
+                if not chunk:
+                    continue
+                line_buffer += chunk
+                while "\n" in line_buffer:
+                    line, line_buffer = line_buffer.split("\n", 1)
+                    line = line.rstrip("\r")
+                    found = consume_sse_line(line)
+                    if found is not None:
+                        return found[0], found[1], True
+
+                # Unreal's one-shot SSE response can arrive without a terminating
+                # newline/blank line. Try the current unfinished data line as well.
+                candidate_line = line_buffer.rstrip("\r")
+                if candidate_line.startswith("data:"):
+                    candidate = decode_json_message(candidate_line[5:].lstrip())
+                    if candidate is not None:
+                        raw = json.dumps(candidate, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+                        return raw, candidate, True
+
+            if line_buffer:
+                found = consume_sse_line(line_buffer.rstrip("\r"))
+                if found is not None:
+                    return found[0], found[1], True
             if data_lines:
                 event_count += 1
-                matched = decode_event(data_lines)
+                matched = decode_json_message("\n".join(data_lines))
                 if matched is not None:
                     raw = json.dumps(matched, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
                     return raw, matched, True
             raise RuntimeError("Upstream MCP SSE ended without matching JSON-RPC reply; id=%r events=%d" % (wanted_id, event_count))
+
 
         async def mcp_post_and_read(client, target, headers, request_obj, content=None, json_body=None):
             """POST MCP JSON-RPC and capture one response without waiting for an SSE stream to close."""
@@ -4723,7 +4783,7 @@ jobs:
             timeout = httpx.Timeout(connect=10.0, read=float(timeout_seconds), write=30.0, pool=10.0)
             async with httpx.AsyncClient(timeout=timeout, trust_env=False) as client:
                 last_error = None
-                for attempt in range(1, 3):
+                for attempt in range(1, 4):
                     init_id = "ue58-native-tools-cache-init-" + uuid.uuid4().hex[:12]
                     init_payload = {
                         "jsonrpc": "2.0", "id": init_id, "method": "initialize",
@@ -4752,11 +4812,15 @@ jobs:
                     }
                     if session_id:
                         notify_headers["Mcp-Session-Id"] = session_id
-                    notify = await client.post(
-                        target, headers=notify_headers,
-                        json={"jsonrpc": "2.0", "method": "notifications/initialized"})
-                    if notify.status_code not in (200, 202, 204):
-                        last_error = "notifications/initialized HTTP %s: %s" % (notify.status_code, notify.text[:700])
+                    # Notifications have no JSON-RPC response. Read only the HTTP
+                    # response headers; do not wait for an optional persistent SSE body.
+                    async with client.stream(
+                        "POST", target, headers=notify_headers,
+                        json={"jsonrpc": "2.0", "method": "notifications/initialized"}) as notify:
+                        notify_status = notify.status_code
+                        notify_content_type = notify.headers.get("content-type", "")
+                    if notify_status not in (200, 202, 204):
+                        last_error = "notifications/initialized HTTP %s (content-type=%s)" % (notify_status, notify_content_type)
                         log("MCP local tool-catalog warmup attempt %s notification failed: %s" % (attempt, last_error))
                         continue
 
@@ -4793,7 +4857,7 @@ jobs:
                         len(native_tools), len(list_raw), was_sse))
                     return parsed
 
-            raise RuntimeError("Could not prefetch Unreal tools/list locally: " + str(last_error or "unknown error"))
+            raise RuntimeError("Could not prefetch Unreal tools/list locally after 3 attempts: " + str(last_error or "unknown error"))
 
         async def send_mcp_json(send, obj, headers=None, status=200):
             payload = json.dumps(obj, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
@@ -5536,6 +5600,9 @@ jobs:
         if ($apiText -notmatch 'async def public_app' -or $apiText -notmatch 'canonical_request_path') {
           throw 'PUBLIC_MCP_ROUTER_INVALID: /mcp public ASGI dispatcher was not generated.'
         }
+        if ($apiText -notmatch 'Try the current unfinished data line as well' -or $apiText -notmatch 'Read only the HTTP') {
+          throw 'MCP_STREAM_READER_INVALID: immediate SSE parsing and nonblocking notification handling are required.'
+        }
         Write-Host 'PYTHON_SYNTAX_VALIDATION=true'
         Write-Host 'MCP_PROXY_STATIC_VALIDATION=true'
     - name: Launch API, Unreal and Cloudflare tunnel
@@ -5915,9 +5982,9 @@ jobs:
           throw 'NATIVE_MCP_LISTENER_READY=false. Do not add the MCP URL in ChatGPT yet; inspect UEControl\Saved\Logs\UnrealEditor.log and unreal-stdout.log for LogModelContextProtocol errors.'
         }
 
-        # Warm the full native AllToolsets catalog over localhost. The first tools/list
-        # can take longer than Cloudflare's edge request window; prefetching here keeps
-        # the public tools/list response fast and deterministic.
+        # Prewarm the native Unreal tool catalog over localhost when possible.
+        # This is an optimization only: the live proxy can still forward tools/list
+        # if this cache warmup is temporarily unavailable.
         Write-Host 'MCP_NATIVE_TOOLS_WARMUP_START=true (local Unreal -> local API; up to 210 seconds)'
         $warmupHeaders = @{ Authorization = "Bearer $env:BRIDGE_TOKEN" }
         try {
@@ -5933,7 +6000,8 @@ jobs:
               Get-Content -LiteralPath $diagnosticFile -Tail 100 -ErrorAction SilentlyContinue
             }
           }
-          throw ("MCP_NATIVE_TOOLS_WARMUP_FAILED: " + $_.Exception.Message)
+          Write-Warning ("MCP_NATIVE_TOOLS_WARMUP_SKIPPED: " + $_.Exception.Message)
+          Write-Warning 'The workflow will continue with live native tools/list forwarding. The public MCP handshake below remains mandatory and will still fail the run if the actual endpoint is broken.'
         }
 
         # End-to-end public MCP test. A local GET/405 only proves the Unreal listener
