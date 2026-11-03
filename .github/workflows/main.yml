@@ -91,16 +91,7 @@ jobs:
         $project = "$root\UEControl"
         $pythonDir = "$project\Content\Python"
         $config = "$project\Config"
-        $projectSaved = "$project\Saved\RemoteStudio"
-        $projectFolders = @(
-          $pythonDir, $config, "$root\Projects", "$root\Screenshots", "$root\Uploads", "$root\Logs",
-          "$project\Content\Maps", "$project\Content\Meshes", "$project\Content\StaticMeshes",
-          "$project\Content\Materials", "$project\Content\Textures", "$project\Content\Blueprints",
-          "$project\Content\Audio", "$project\Content\Environment", "$project\Content\Exports",
-          "$project\Content\Imports", "$project\Plugins", "$projectSaved\Backups", "$projectSaved\Builds",
-          "$projectSaved\SceneExports", "$projectSaved\Screenshots"
-        )
-        New-Item -ItemType Directory -Force -Path $projectFolders | Out-Null
+        New-Item -ItemType Directory -Force -Path $pythonDir, $config, "$root\Projects", "$root\Screenshots", "$root\Uploads", "$root\Logs" | Out-Null
 
         $uproject = @'
         {
@@ -121,8 +112,8 @@ jobs:
 
         $engineConfig = @'
         [/Script/EngineSettings.GameMapsSettings]
-        EditorStartupMap=/Game/Maps/RemoteStudio_Main
-        GameDefaultMap=/Game/Maps/RemoteStudio_Main
+        EditorStartupMap=/Engine/Maps/Entry
+        GameDefaultMap=/Engine/Maps/Entry
 
         [/Script/PythonScriptPlugin.PythonScriptPluginSettings]
         +StartupScripts=D:/UE58/UEControl/Content/Python/init_unreal.py
@@ -180,36 +171,6 @@ jobs:
         except Exception:
             log("FATAL: cannot import Unreal Python module:\n" + traceback.format_exc())
             raise
-
-
-        def ensure_project_workspace_map():
-            """Create the default working level inside the active project's Content/Maps, never under Engine/Content."""
-            target = "/Game/Maps/RemoteStudio_Main"
-            try:
-                project_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
-                config_path = os.path.join(project_dir, "Config", "DefaultEngine.ini")
-                try:
-                    with open(config_path, "r", encoding="utf-8-sig") as stream:
-                        config_text = stream.read()
-                except OSError:
-                    config_text = ""
-                # Only bootstrap this map for projects configured to use it. Existing project maps stay untouched.
-                if target not in config_text:
-                    log("PROJECT_WORKSPACE_MAP_SKIPPED: project already has its own map configuration")
-                    return True
-                if unreal.EditorAssetLibrary.does_asset_exist(target):
-                    log("PROJECT_WORKSPACE_MAP_READY: " + target)
-                    return True
-                level_subsystem = unreal.get_editor_subsystem(unreal.LevelEditorSubsystem)
-                if level_subsystem is None:
-                    raise RuntimeError("LevelEditorSubsystem is unavailable")
-                if not level_subsystem.new_level(target, False):
-                    raise RuntimeError("Unreal could not create " + target)
-                log("PROJECT_WORKSPACE_MAP_CREATED: " + target)
-                return True
-            except Exception:
-                log("PROJECT_WORKSPACE_MAP_ERROR:\n" + traceback.format_exc()[-2500:])
-                return False
 
         if not TOKEN:
             log("FATAL: BRIDGE_TOKEN is missing from Unreal process environment")
@@ -408,7 +369,6 @@ jobs:
                 OUTGOING.put({"id": job_id, "output": output, "error": error})
 
             try:
-                ensure_project_workspace_map()
                 CALLBACK_HANDLE = unreal.register_slate_post_tick_callback(editor_tick)
                 threading.Thread(target=network_worker, name="UE58-Remote-Network", daemon=True).start()
                 builtins._UE58_REMOTE_BRIDGE_ACTIVE = True
@@ -455,6 +415,9 @@ jobs:
         MCP_LEGACY_SESSION_ID = ""
         MCP_LEGACY_SESSION_INITIALIZED = False
         MCP_LEGACY_SESSION_LOCK = asyncio.Lock()
+        # Unreal Editor tool execution is serialized: concurrent AllToolsets calls can
+        # contend for the same editor thread and leave every client waiting.
+        MCP_NATIVE_TOOL_LOCK = asyncio.Lock()
         MCP_MODERN_PROTOCOL = "2026-07-28"
         MCP_LEGACY_PROTOCOL = "2025-11-25"
         # Native Unreal tool schemas can take a long time to enumerate on first access.
@@ -707,7 +670,7 @@ jobs:
                     log("Google Drive upload progress: %s%%" % int(status.progress() * 100))
             return response
 
-        def github_release_upload(source_path, tag, filename="", release_name="", release_notes=""):
+        def github_release_upload(source_path, tag, filename="", release_name="", release_notes="", replace_existing=True):
             import requests
             from urllib.parse import quote
             from os import environ
@@ -729,11 +692,18 @@ jobs:
                 "Accept": "application/vnd.github+json", "X-GitHub-Api-Version": "2026-03-10"})
             resp = session.get(base + "/releases/tags/" + quote(tag, safe=""), timeout=(10, 30))
             if resp.status_code == 404:
+                # Creating a Release for a missing tag makes GitHub create that tag
+                # from the repository default branch. Existing tags are reused.
+                repo_resp = session.get(base, timeout=(10, 30))
+                if not repo_resp.ok:
+                    raise RuntimeError("Could not read repository default branch: HTTP %s %s" % (repo_resp.status_code, repo_resp.text[:300]))
+                default_branch = str(repo_resp.json().get("default_branch") or "main")
                 resp = session.post(base + "/releases", json={"tag_name": tag,
+                    "target_commitish": default_branch,
                     "name": release_name or tag, "body": release_notes or "Uploaded by UE Remote API",
                     "draft": False, "prerelease": False, "generate_release_notes": False}, timeout=(10, 30))
                 if resp.status_code != 201:
-                    raise RuntimeError("Could not create GitHub Release: HTTP %s %s" % (resp.status_code, resp.text[:500]))
+                    raise RuntimeError("Could not create GitHub Release/tag '%s' from '%s': HTTP %s %s" % (tag, default_branch, resp.status_code, resp.text[:500]))
                 release = resp.json()
             elif resp.ok:
                 release = resp.json()
@@ -748,6 +718,8 @@ jobs:
                 raise RuntimeError("Could not list release assets: HTTP %s" % aresp.status_code)
             for old in aresp.json():
                 if old.get("name") == name or old.get("name", "").startswith(name + ".part"):
+                    if not replace_existing:
+                        raise RuntimeError("Release asset already exists: %s (enable Replace same-name assets or choose a different filename)" % old.get("name"))
                     deleted = session.delete(base + "/releases/assets/" + str(old["id"]), timeout=(10, 30))
                     if deleted.status_code != 204:
                         raise RuntimeError("Could not replace old asset %s" % old.get("name"))
@@ -969,7 +941,7 @@ jobs:
         @app.post("/unreal/screenshot")
         @monitor_auth
         def screenshot():
-            out = PROJECT_SCREENSHOTS_DIR / ("ue_" + time.strftime("%Y%m%d_%H%M%S") + ".png")
+            out = ROOT / "Screenshots" / ("ue_" + time.strftime("%Y%m%d_%H%M%S") + ".png")
             out.parent.mkdir(parents=True, exist_ok=True)
             target = str(out).replace("\\", "/")
             code = ("import unreal\nworld = unreal.get_editor_subsystem(unreal.UnrealEditorSubsystem).get_editor_world()\n" +
@@ -1003,6 +975,7 @@ jobs:
                 project_logs.add(_current_project().parent / "Saved" / "Logs")
             except Exception:
                 pass
+            project_logs.add(ROOT / "UEControl" / "Saved" / "Logs")
             for unreal_log_dir in project_logs:
                 if unreal_log_dir.is_dir():
                     for path in sorted(unreal_log_dir.glob("*.log")):
@@ -1187,16 +1160,6 @@ jobs:
             add("UE58 Workspace", ROOT, "unreal")
             add("Unreal Extracted", ROOT / "Extracted", "unreal")
             add("Projects", ROOT / "Projects", "unreal")
-            try:
-                active_project_root = _current_project().parent
-                add("Active Project Content", active_project_root / "Content", "project")
-                add("Active Project Imports", active_project_root / "Content" / "Imports", "project")
-                add("Active Project Saved", active_project_root / "Saved", "project")
-                add("Active Project Backups", active_project_root / "Saved" / "RemoteStudio" / "Backups", "project")
-                add("Active Project Screenshots", active_project_root / "Saved" / "RemoteStudio" / "Screenshots", "project")
-                add("Active Project Exports", active_project_root / "Saved" / "RemoteStudio" / "Exports", "project")
-            except Exception:
-                pass
             add("Uploads", UPLOAD_ROOT, "workspace")
             add("Logs", LOG_DIR, "workspace")
             add("Backups", ROOT / "Backups", "workspace")
@@ -1304,12 +1267,10 @@ jobs:
             name = _fs_safe_name(archive_name or ("UE58_Files_" + time.strftime("%Y%m%d_%H%M%S") + ".zip"))
             if not name.lower().endswith(".zip"):
                 name += ".zip"
-            # ZIPs created from project files are project deliverables, not workspace staging files.
-            export_root = PROJECT_EXPORTS_DIR.resolve()
-            export_root.mkdir(parents=True, exist_ok=True)
-            destination = export_root / name
+            UPLOAD_ROOT.mkdir(parents=True, exist_ok=True)
+            destination = UPLOAD_ROOT / name
             if destination.exists():
-                destination = export_root / (destination.stem + "_" + uuid.uuid4().hex[:8] + ".zip")
+                destination = UPLOAD_ROOT / (destination.stem + "_" + uuid.uuid4().hex[:8] + ".zip")
             temp_path = destination.with_name(destination.name + ".building-" + uuid.uuid4().hex)
             compression = zipfile.ZIP_DEFLATED if compress else zipfile.ZIP_STORED
             count = 0
@@ -1383,9 +1344,7 @@ jobs:
             if upload is None:
                 return jsonify(ok=False, error="multipart field 'file' is required"), 400
             try:
-                default_import_dir = _current_project().parent / "Content" / "Imports"
-                default_import_dir.mkdir(parents=True, exist_ok=True)
-                folder = _fs_resolve(request.form.get("directory") or str(default_import_dir))
+                folder = _fs_resolve(request.form.get("directory", str(UPLOAD_ROOT)))
                 if not folder.is_dir():
                     return jsonify(ok=False, error="destination_must_be_a_folder"), 400
                 raw_name = str(upload.filename or "upload.bin").replace("\\", "/").split("/")[-1]
@@ -1511,7 +1470,8 @@ jobs:
                             filename = stem[:100] + "_" + time.strftime("%Y%m%d_%H%M%S") + "_" + uuid.uuid4().hex[:5] + suffix
                         log("GITHUB_RELEASE_UPLOAD_STARTED tag=%s source=%s asset=%s" % (tag, source, filename))
                         value = github_release_upload(source, tag, filename,
-                            body.get("release_name", ""), body.get("release_notes", ""))
+                            body.get("release_name", ""), body.get("release_notes", ""),
+                            replace_existing=replace_existing)
                         results.append(value)
                         log("GITHUB_RELEASE_UPLOAD_COMPLETED tag=%s source=%s asset=%s bytes=%s" % (
                             tag, source, filename, source.stat().st_size))
@@ -1537,8 +1497,8 @@ jobs:
         <main style="min-width:0"><div class="tabs"><button class="tab active" data-tab="files">Files</button><button class="tab" data-tab="logs">Activity logs</button></div>
         <section id="filesTab" class="panel"><div class="pathbar"><input id="pathInput" spellcheck="false" placeholder="Choose a Windows folder path"><button class="btn" id="goPath">Go</button><button class="btn" id="upBtn">Up</button><button class="btn" id="refreshBtn">Refresh</button></div><div class="crumb" id="currentPath">Choose a drive or Unreal folder.</div>
         <div class="toolbar"><input id="filterInput" placeholder="Filter names or extensions…"><button class="btn" id="selectAllBtn">Select visible</button><button class="btn" id="clearSelectionBtn">Clear selection</button><span class="right muted small" id="directoryInfo"></span></div>
-        <div class="toolbar"><button class="btn primary" id="zipBtn">ZIP selected</button><button class="btn primary" id="releaseBtn">Send selected to GitHub Release</button><button class="btn" id="downloadBtn">Download selected</button><button class="btn" id="renameBtn">Rename selected</button><button class="btn danger" id="deleteBtn">Delete selected</button><button class="btn" id="newFolderBtn">New folder</button></div>
-        <div class="grid2"><div class="drop"><div class="small muted">Upload file(s) from this computer into the currently open Windows folder.</div><div class="toolbar"><input type="file" id="localFiles" multiple><label class="small"><input type="checkbox" id="uploadOverwrite"> Replace same-name files</label><button class="btn" id="uploadBtn">Upload here</button></div></div><div class="drop"><div class="small muted">GitHub Release destination (assets become publicly downloadable).</div><div class="toolbar"><label class="small">Tag <input id="releaseTag" value="ue5.8" style="width:110px"></label><label class="small"><input type="checkbox" id="replaceRelease"> Replace same-name Release assets</label></div><div class="small muted">When replacement is off, unique timestamped asset names are used. Files larger than the Release asset limit are split into numbered parts automatically.</div></div></div>
+        <div class="toolbar"><button class="btn primary" id="zipBtn">ZIP selected files / folders</button><button class="btn primary" id="releaseBtn">Send selected to GitHub Release</button><button class="btn" id="downloadBtn">Download selected</button><button class="btn" id="renameBtn">Rename selected</button><button class="btn danger" id="deleteBtn">Delete selected</button><button class="btn" id="newFolderBtn">New folder</button></div>
+        <div class="grid2"><div class="drop"><div class="small muted">Upload file(s) from this computer into the currently open Windows folder.</div><div class="toolbar"><input type="file" id="localFiles" multiple><label class="small"><input type="checkbox" id="uploadOverwrite"> Replace same-name files</label><button class="btn" id="uploadBtn">Upload here</button></div></div><div class="drop"><div class="small muted">GitHub Release destination (assets become publicly downloadable).</div><div class="toolbar"><label class="small">Tag <input id="releaseTag" value="ue5.8" style="width:110px"></label><label class="small"><input type="checkbox" id="replaceRelease"> Replace same-name Release assets</label></div><div class="small muted">If the tag or Release does not exist, it is created automatically from the repository default branch. Select a folder and use ZIP to include that entire folder and all subfolders. When replacement is off, unique timestamped asset names are used. Large files are split into numbered parts automatically.</div></div></div>
         <div class="status" id="fileStatus" aria-live="polite"></div><div class="tablewrap"><table><thead><tr><th><input type="checkbox" id="headerCheck"></th><th>Name</th><th>Extension / Type</th><th>Size</th><th>Modified</th><th>Action</th></tr></thead><tbody id="fileRows"><tr><td colspan="6" class="muted">Choose a location.</td></tr></tbody></table></div><div class="toolbar"><button class="btn" id="prevPageBtn">Previous</button><span class="muted small" id="pageInfo">—</span><button class="btn" id="nextPageBtn">Next</button></div></section>
         <section id="logsTab" class="panel hidden"><div class="toolbar"><select id="logSource"><option value="all">All log sources</option></select><select id="logLevel"><option value="all">All levels</option><option>ERROR</option><option>WARN</option><option>INFO</option><option>DEBUG</option></select><input id="logQuery" placeholder="Search logs…"><button class="btn" id="refreshLogsBtn">Refresh logs</button><label class="small"><input type="checkbox" id="autoLogs" checked> Auto refresh</label></div><div class="statline"><span id="logSummary">Waiting for logs…</span><span id="lastLogUpdate"></span></div><div id="logOutput" class="logs">Logs will appear here. File transfers, ZIP jobs, GitHub Release uploads, API commands and MCP operations are recorded.</div></section>
         </main></div>
@@ -1559,7 +1519,7 @@ jobs:
         function downloadPath(path){location.href='/api/fs/download?path='+encodeURIComponent(path);}
         $('goPath').onclick=()=>openDir($('pathInput').value);$('pathInput').addEventListener('keydown',e=>{if(e.key==='Enter')openDir($('pathInput').value);});$('upBtn').onclick=()=>{if(state.path&&state.parent&&state.parent!==state.path)openDir(state.parent);};$('refreshBtn').onclick=()=>openDir(state.path,state.offset);$('filterInput').oninput=renderRows;$('selectAllBtn').onclick=()=>{visibleEntries().forEach(x=>state.selected.add(x.path));renderRows();};$('clearSelectionBtn').onclick=()=>{state.selected.clear();renderRows();};$('headerCheck').onchange=()=>{visibleEntries().forEach(x=>x.checked=$('headerCheck').checked?(state.selected.add(x.path),true):(state.selected.delete(x.path),false));renderRows();};$('prevPageBtn').onclick=()=>openDir(state.path,Math.max(0,state.offset-state.limit));$('nextPageBtn').onclick=()=>openDir(state.path,state.offset+state.limit);
         $('downloadBtn').onclick=async()=>{const paths=selectedPaths();if(!paths.length)return status('Select at least one item.','error');if(paths.length===1){const item=state.entries.find(x=>x.path===paths[0]);if(item&&!item.is_dir)return downloadPath(paths[0]);}try{status('Creating ZIP for download…');const j=await api('/api/fs/zip',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({paths})});status('ZIP ready: '+j.name+' · '+human(j.size),'ok');downloadPath(j.path);}catch(e){status('ZIP/download failed: '+e.message,'error');}};
-        $('zipBtn').onclick=async()=>{const paths=selectedPaths();if(!paths.length)return status('Select files or folders first.','error');const name=prompt('ZIP filename (without or with .zip):','UE58_Selected_Files.zip');if(name===null)return;try{status('Creating ZIP… this may take time for large Unreal folders.');const j=await api('/api/fs/zip',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({paths,archive_name:name,compress:false})});status('ZIP created: '+j.path+' · '+j.files+' files · '+human(j.size),'ok');}catch(e){status('ZIP failed: '+e.message,'error');}};
+        $('zipBtn').onclick=async()=>{const paths=selectedPaths();if(!paths.length)return status('Select files or folders first.','error');const name=prompt('ZIP filename (without or with .zip):','UE58_Selected_Files.zip');if(name===null)return;try{status('Creating ZIP from selected file(s)/folder(s), including all nested subfolders…');const j=await api('/api/fs/zip',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({paths,archive_name:name,compress:false})});status('ZIP created: '+j.path+' · '+j.files+' files · '+human(j.size),'ok');}catch(e){status('ZIP failed: '+e.message,'error');}};
         $('releaseBtn').onclick=async()=>{const paths=selectedPaths();if(!paths.length)return status('Select one or more files. Folders must be ZIPped first.','error');if(paths.length>50)return status('Maximum 50 files per Release upload request.','error');const tag=$('releaseTag').value.trim()||'ue5.8';const replace=$('replaceRelease').checked;const message='Publish '+paths.length+' file(s) to GitHub Release tag '+tag+'?\n\nThese assets are publicly downloadable.'+(replace?'\nExisting assets with the same name may be replaced.':'\nUnique names will be generated; existing assets are preserved.');if(!confirm(message))return;try{status('Uploading '+paths.length+' file(s) to GitHub Release…');const j=await api('/api/fs/release-upload',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({paths,tag,replace_existing:replace,confirm_public_upload:true})});const links=(j.results||[]).flatMap(x=>x.assets||[]).map(x=>x.url).filter(Boolean);status('Release upload finished: '+j.uploaded+' uploaded, '+j.failed+' failed. '+links.join(' | '),j.failed?'error':'ok');}catch(e){status('Release upload failed: '+e.message,'error');}await loadLogs();};
         $('uploadBtn').onclick=async()=>{const files=[...$('localFiles').files];if(!files.length)return status('Choose local files first.','error');const b=$('uploadBtn');b.disabled=true;let ok=0,fail=[];for(const f of files){try{const data=new FormData();data.append('file',f);data.append('directory',state.path);data.append('overwrite',$('uploadOverwrite').checked?'true':'false');await api('/api/fs/upload',{method:'POST',body:data});ok++;}catch(e){fail.push(f.name+': '+e.message);}}b.disabled=false;$('localFiles').value='';status(ok+' uploaded; '+fail.length+' failed. '+fail.join(' | '),fail.length?'error':'ok');await openDir(state.path,state.offset);await loadLogs();};
         $('newFolderBtn').onclick=async()=>{const name=prompt('New folder name:');if(!name)return;try{const j=await api('/api/fs/create-folder',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({parent:state.path,name})});status('Folder created: '+j.path,'ok');await openDir(state.path,state.offset);}catch(e){status('Create folder failed: '+e.message,'error');}};
@@ -1586,7 +1546,7 @@ jobs:
 
         # ---- Extended read-only scene monitor, project/plugin manager, checkpoints, packaging and MCP gateway ----
         import ipaddress, socket, subprocess, zipfile
-
+        
         CURRENT_PROJECT_FILE = (ROOT / "UEControl" / "UEControl.uproject").resolve()
         CONTROL_DIR = ROOT / "control"
         BACKUP_DIR = ROOT / "Backups"
@@ -1607,7 +1567,6 @@ jobs:
         SCENE_MODEL_DIR = (ROOT / "Screenshots").resolve()
         SCENE_MODEL_DIR.mkdir(parents=True, exist_ok=True)
         SCENE_HTML_PATH = (SCENE_MODEL_DIR / "unreal-scene-viewer.html").resolve()
-        PROJECT_SCREENSHOTS_DIR = (ROOT / "Screenshots").resolve()
         SCENE_AUTO_LOCK = threading.RLock()
         SCENE_AUTO_TIMER = None
         SCENE_AUTO_PENDING = False
@@ -1619,7 +1578,7 @@ jobs:
         PLUGIN_INDEX_LOCK = threading.RLock()
         PACKAGE_JOBS = {}
         PACKAGE_LOCK = threading.RLock()
-
+        
         # Headless Unreal commandlet jobs are supervised by the long-running PowerShell
         # process. That supervisor owns the GUI Editor lifecycle so an intentional
         # Editor shutdown never looks like a crashed GitHub Actions runner.
@@ -1627,157 +1586,23 @@ jobs:
         HEADLESS_ROOT.mkdir(parents=True, exist_ok=True)
         HEADLESS_COMMAND_FILE = CONTROL_DIR / "headless-command.json"
         HEADLESS_LOCK = threading.RLock()
+        HEADLESS_PENDING_SAVE_JOB = ""
         HEADLESS_MAX_SCRIPT_CHARS = 200000
         HEADLESS_MAX_TIMEOUT_SECONDS = 10000
-
-
+        
+        
         def _inside_root(path):
             path = Path(path).resolve()
             return path == ROOT or ROOT in path.parents
-
-
+        
+        
         def _current_project():
             global CURRENT_PROJECT_FILE
             if CURRENT_PROJECT_FILE.is_file() and _inside_root(CURRENT_PROJECT_FILE):
                 return CURRENT_PROJECT_FILE
             return (ROOT / "UEControl" / "UEControl.uproject").resolve()
-
-
-        def _project_remote_dir(project_file=None):
-            project = Path(project_file or _current_project()).resolve()
-            if project.suffix.lower() == ".uproject":
-                project_root = project.parent
-            else:
-                project_root = project
-            return project_root / "Saved" / "RemoteStudio"
-
-
-        def _refresh_project_paths(project_file=None):
-            """Rebind generated backups, builds, exports and screenshots to the selected project's own Saved folder."""
-            global BACKUP_DIR, BUILD_DIR, SCENE_MODEL_DIR, SCENE_HTML_PATH, PROJECT_SCREENSHOTS_DIR, PROJECT_EXPORTS_DIR
-            remote_root = _project_remote_dir(project_file)
-            BACKUP_DIR = remote_root / "Backups"
-            BUILD_DIR = remote_root / "Builds"
-            SCENE_MODEL_DIR = remote_root / "SceneExports"
-            SCENE_HTML_PATH = SCENE_MODEL_DIR / "unreal-scene-viewer.html"
-            PROJECT_SCREENSHOTS_DIR = remote_root / "Screenshots"
-            PROJECT_EXPORTS_DIR = remote_root / "Exports"
-            for folder in (BACKUP_DIR, BUILD_DIR, SCENE_MODEL_DIR, PROJECT_SCREENSHOTS_DIR, PROJECT_EXPORTS_DIR):
-                folder.mkdir(parents=True, exist_ok=True)
-            return remote_root
-
-
-        def _ensure_ini_setting(text, section, key, value, replace_engine_value=False):
-            lines = text.splitlines()
-            header = "[" + section + "]"
-            start = next((i for i, line in enumerate(lines) if line.strip().lower() == header.lower()), None)
-            if start is None:
-                if lines and lines[-1].strip():
-                    lines.append("")
-                lines.extend([header, key + "=" + value])
-                return "\n".join(lines) + "\n"
-            end = next((i for i in range(start + 1, len(lines)) if lines[i].strip().startswith("[")), len(lines))
-            found = []
-            for i in range(start + 1, end):
-                if lines[i].strip().lower().startswith(key.lower() + "="):
-                    found.append(i)
-            if not found:
-                lines.insert(end, key + "=" + value)
-            else:
-                for i in found:
-                    current = lines[i].split("=", 1)[1].strip()
-                    if not replace_engine_value or not current or current.lower().startswith("/engine/"):
-                        lines[i] = key + "=" + value
-            return "\n".join(lines) + "\n"
-
-
-        def _ensure_project_structure(project_file):
-            """Keep every Unreal-owned asset, plugin, build, checkpoint and export under its owning project."""
-            project = Path(project_file).resolve()
-            project_root = project.parent
-            content_root = project_root / "Content"
-            saved_root = project_root / "Saved" / "RemoteStudio"
-            folders = [
-                content_root / name for name in (
-                    "Maps", "Meshes", "StaticMeshes", "Materials", "Textures",
-                    "Blueprints", "Audio", "Environment", "Exports", "Imports", "Python"
-                )
-            ] + [project_root / "Plugins", saved_root / "Backups", saved_root / "Builds", saved_root / "Exports", saved_root / "SceneExports", saved_root / "Screenshots", saved_root / "Incoming"]
-            for folder in folders:
-                folder.mkdir(parents=True, exist_ok=True)
-
-            config_file = project_root / "Config" / "DefaultEngine.ini"
-            config_file.parent.mkdir(parents=True, exist_ok=True)
-            config_text = config_file.read_text(encoding="utf-8-sig") if config_file.is_file() else ""
-
-            # Do not replace an existing project map with a blank starter map. If the
-            # project has exactly one map (or one clearly named Main/Entry/Level map),
-            # use that; create RemoteStudio_Main only for projects with no identifiable map.
-            project_maps = sorted(content_root.rglob("*.umap"), key=lambda item: str(item).lower())
-            preferred_names = {"main", "mainmap", "entry", "level", "persistentlevel", "map"}
-            preferred_maps = [item for item in project_maps if item.stem.lower() in preferred_names]
-            configured_project_map = ""
-            for map_key in ("EditorStartupMap", "GameDefaultMap"):
-                for line in config_text.splitlines():
-                    if line.strip().lower().startswith(map_key.lower() + "="):
-                        candidate = line.split("=", 1)[1].strip().strip('"')
-                        if candidate.lower().startswith("/game/"):
-                            configured_project_map = candidate
-                            break
-                if configured_project_map:
-                    break
-            selected_map = None
-            if configured_project_map:
-                workspace_map = configured_project_map
-            else:
-                if len(project_maps) == 1:
-                    selected_map = project_maps[0]
-                elif len(preferred_maps) == 1:
-                    selected_map = preferred_maps[0]
-                if selected_map is not None:
-                    workspace_map = "/Game/" + selected_map.relative_to(content_root).with_suffix("").as_posix()
-                else:
-                    workspace_map = "/Game/Maps/RemoteStudio_Main"
-
-            config_text = _ensure_ini_setting(
-                config_text, "/Script/EngineSettings.GameMapsSettings", "EditorStartupMap",
-                workspace_map, replace_engine_value=True
-            )
-            config_text = _ensure_ini_setting(
-                config_text, "/Script/EngineSettings.GameMapsSettings", "GameDefaultMap",
-                workspace_map, replace_engine_value=True
-            )
-            script_path = (content_root / "Python" / "init_unreal.py").resolve().as_posix()
-            # Replace only an old bridge startup entry; leave unrelated project startup scripts intact.
-            lines = config_text.splitlines()
-            section = "[/Script/PythonScriptPlugin.PythonScriptPluginSettings]"
-            start = next((i for i, line in enumerate(lines) if line.strip().lower() == section.lower()), None)
-            if start is None:
-                if lines and lines[-1].strip():
-                    lines.append("")
-                lines.extend([section, "+StartupScripts=" + script_path, "bDeveloperMode=True", "bRemoteExecution=False"])
-            else:
-                end = next((i for i in range(start + 1, len(lines)) if lines[i].strip().startswith("[")), len(lines))
-                section_lines = []
-                for i in range(start + 1, end):
-                    line = lines[i]
-                    if line.strip().lower().startswith("+startupscripts=") and "init_unreal.py" in line.lower():
-                        continue
-                    section_lines.append(line)
-                section_lines.append("+StartupScripts=" + script_path)
-                if not any(x.strip().lower().startswith("bdevelopermode=") for x in section_lines):
-                    section_lines.append("bDeveloperMode=True")
-                if not any(x.strip().lower().startswith("bremoteexecution=") for x in section_lines):
-                    section_lines.append("bRemoteExecution=False")
-                lines = lines[:start + 1] + section_lines + lines[end:]
-            config_file.write_text("\n".join(lines) + "\n", encoding="utf-8")
-            return {"project_root": str(project_root), "content_root": str(content_root),
-                    "workspace_map": workspace_map, "saved_root": str(saved_root)}
-
-
-        _refresh_project_paths()
-
-
+        
+        
         def _project_files():
             found = {}
             excluded = {"Extracted", "parts", "Uploads", "Screenshots", "Logs", "Builds", "Backups", "control", "Config"}
@@ -1794,8 +1619,8 @@ jobs:
             if current.is_file():
                 found[str(current)] = current
             return sorted(found.values(), key=lambda p: p.name.lower())
-
-
+        
+        
         def _project_payload():
             current = str(_current_project())
             rows = []
@@ -1806,31 +1631,20 @@ jobs:
                 except OSError:
                     continue
             return rows
-
-
+        
+        
         def _backup_file(source, label="config"):
             source = Path(source).resolve()
             if not source.is_file() or not _inside_root(source):
                 return None
-            # Detect the owning project for project files; use the active project for engine/global files.
-            owner_root = None
-            for folder in (source.parent, *source.parents):
-                if not _inside_root(folder):
-                    continue
-                try:
-                    if any(folder.glob("*.uproject")):
-                        owner_root = folder
-                        break
-                except OSError:
-                    pass
-            dest_dir = ((owner_root or _current_project().parent) / "Saved" / "RemoteStudio" / "Backups" / label)
-            dest_dir.mkdir(parents=True, exist_ok=True)
             stamp = time.strftime("%Y%m%d_%H%M%S") + "_" + uuid.uuid4().hex[:6]
+            dest_dir = BACKUP_DIR / label
+            dest_dir.mkdir(parents=True, exist_ok=True)
             dest = dest_dir / (source.name + "." + stamp + ".bak")
             shutil.copy2(source, dest)
             return str(dest)
-
-
+        
+        
         def _write_editor_command(action, project_file, checkpoint=""):
             target = Path(project_file).resolve()
             if target.suffix.lower() != ".uproject" or not _inside_root(target) or not target.is_file():
@@ -1842,8 +1656,8 @@ jobs:
             os.replace(tmp, EDITOR_COMMAND_FILE)
             log("EDITOR COMMAND queued: %s project=%s" % (action, target))
             return payload
-
-
+        
+        
         def _ensure_bridge_in_project(project_file):
             project_file = Path(project_file).resolve()
             source = ROOT / "UEControl" / "Content" / "Python" / "init_unreal.py"
@@ -1857,8 +1671,8 @@ jobs:
             if target.exists():
                 _backup_file(target, "startup_scripts")
             shutil.copy2(source, target)
-
-
+        
+        
         def prepare_project(project_file, ensure_remote_plugins=True):
             project_file = Path(project_file).resolve()
             if project_file.suffix.lower() != ".uproject" or not project_file.is_file() or not _inside_root(project_file):
@@ -1885,11 +1699,10 @@ jobs:
                 os.replace(tmp, project_file)
             else:
                 backup = None
-            workspace = _ensure_project_structure(project_file)
             _ensure_bridge_in_project(project_file)
-            return {"project_file": str(project_file), "backup": backup, "workspace": workspace}
-
-
+            return {"project_file": str(project_file), "backup": backup}
+        
+        
         def _available_plugin_descriptor_paths(project_file=None):
             project_file = Path(project_file or _current_project()).resolve()
             engine_plugins = next((p for p in (ROOT / "Extracted").glob("*/Engine/Plugins") if p.is_dir()), None)
@@ -1932,13 +1745,13 @@ jobs:
             with PLUGIN_INDEX_LOCK:
                 PLUGIN_INDEX_CACHE.update({"roots": roots_key, "paths": dict(result), "built_at": time.time()})
             return result
-
-
+        
+        
         def _available_plugin_descriptors(project_file=None):
             """Return descriptor paths by plugin name; JSON metadata is loaded only for visible pages."""
             return _available_plugin_descriptor_paths(project_file)
-
-
+        
+        
         def _project_plugin_state(project_file=None, query="", offset=0, limit=75):
             project_file = Path(project_file or _current_project()).resolve()
             data = json.loads(project_file.read_text(encoding="utf-8-sig"))
@@ -1971,8 +1784,8 @@ jobs:
                     "enabled_count": sum(enabled.values()), "available_count": len(available),
                     "filtered_count": total, "offset": offset, "limit": limit,
                     "has_more": offset + len(rows) < total, "query": needle}
-
-
+        
+        
         def _scene_snapshot_from_unreal(timeout=10000, job_id=""):
             # Only reads world actors: transform, bounds, type and visibility. It never edits the level.
             progress_path = (SCENE_MODEL_DIR / ("scene_scan_" + str(job_id) + ".json")).resolve()
@@ -2088,8 +1901,8 @@ jobs:
                 SCENE_CACHE.update(payload)
                 SCENE_CACHE["error"] = ""
             return payload
-
-
+        
+        
         def _scene_scan_worker(job_id):
             global SCENE_ACTIVE_JOB
             with SCENE_JOB_LOCK:
@@ -2119,8 +1932,8 @@ jobs:
                 with SCENE_JOB_LOCK:
                     if SCENE_ACTIVE_JOB == job_id:
                         SCENE_ACTIVE_JOB = ""
-
-
+        
+        
         def _start_scene_scan(force=False):
             global SCENE_ACTIVE_JOB
             with SCENE_LOCK:
@@ -2144,8 +1957,8 @@ jobs:
                 threading.Thread(target=_scene_scan_worker, args=(job_id,), name="UE-SceneScan-" + job_id[:8], daemon=True).start()
                 log("Scene scan queued: job=%s" % job_id)
                 return {"ok": True, "status": "queued", "job_id": job_id}
-
-
+        
+        
         def _scene_job_payload(job_id=""):
             with SCENE_JOB_LOCK:
                 chosen = str(job_id or SCENE_ACTIVE_JOB)
@@ -2173,8 +1986,8 @@ jobs:
             return {"ok": row.get("status") != "failed", "job": row,
                     "scene": cached if cached.get("updated") else None,
                     "bridge_connected": bridge_connected()}
-
-
+        
+        
         @app.get("/api/scene/snapshot")
         @monitor_auth
         def api_scene_snapshot():
@@ -2189,14 +2002,14 @@ jobs:
             payload["bridge_connected"] = bridge_connected()
             payload["ok"] = bool(cached.get("updated") or job.get("ok"))
             return jsonify(payload)
-
-
+        
+        
         @app.get("/api/scene/status")
         @monitor_auth
         def api_scene_status():
             return jsonify(_scene_job_payload(request.args.get("job_id", "")))
-
-
+        
+        
         def _scene_model_export_worker(job_id):
             """Export actual renderable mesh geometry from the active Unreal level without modifying it."""
             job_dir = (SCENE_MODEL_DIR / ("offline_scene_" + job_id)).resolve()
@@ -2274,7 +2087,7 @@ jobs:
                 print("EditorActorSubsystem unavailable; using EditorLevelLibrary: " + str(actor_subsystem_error))
                 level_actors = list(unreal.EditorLevelLibrary.get_all_level_actors() or [])
             _write_progress(10, "Scanning active Unreal level", total=len(level_actors), detail=str(len(level_actors)) + " Actors found")
-
+        
             mesh_actor_list = []
             static_component_count = 0
             skeletal_component_count = 0
@@ -2307,7 +2120,7 @@ jobs:
                         continue
                     static_component_count += 1
                     actor_has_mesh = True
-
+        
                 try:
                     skeletal_components = actor.get_components_by_class(unreal.SkeletalMeshComponent)
                 except Exception:
@@ -2330,26 +2143,26 @@ jobs:
                         continue
                     skeletal_component_count += 1
                     actor_has_mesh = True
-
+        
                 if actor_has_mesh:
                     mesh_actor_list.append(actor)
                 if (actor_scan_index + 1) == len(level_actors) or (actor_scan_index + 1) % max(1, len(level_actors) // 25) == 0:
                     _write_progress(10 + int(12 * (actor_scan_index + 1) / max(1, len(level_actors))),
                                     "Scanning mesh components", actor_scan_index + 1, len(level_actors),
                                     str(len(mesh_actor_list)) + " mesh Actors identified")
-
+        
             if not mesh_actor_list:
                 raise RuntimeError(
                     "No visible mesh components were found in the active level. "
                     "Actor count=%d, static mesh components=%d, skeletal mesh components=%d."
                     % (len(level_actors), static_component_count, skeletal_component_count)
                 )
-
+        
             try:
                 export_actor_set = set(mesh_actor_list)
             except Exception as selection_error:
                 raise RuntimeError("Could not build Unreal SelectedActors set: " + str(selection_error))
-
+        
             def _read_glb_json(file_name):
                 import struct
                 if not os.path.isfile(file_name) or os.path.getsize(file_name) < 32:
@@ -2378,7 +2191,7 @@ jobs:
                 if not isinstance(document, dict):
                     raise RuntimeError("GLB has no JSON scene description")
                 return document
-
+        
             def _run_gltf_export(target_path, selected_set, export_object=None):
                 export_target = export_object if export_object is not None else world
                 raw = unreal.GLTFExporter.export_to_gltf(export_target, target_path, options, selected_set)
@@ -2396,7 +2209,7 @@ jobs:
                 if errors:
                     raise RuntimeError("Unreal GLTFExporter errors: " + "; ".join(str(item) for item in errors)[:1600])
                 return _read_glb_json(target_path)
-
+        
             report.update({
                 "scene_actor_count": len(level_actors),
                 "selected_mesh_actor_count": len(mesh_actor_list),
@@ -2407,7 +2220,7 @@ jobs:
             print("[UE58 GLB] level_actors=%d mesh_actors=%d static_components=%d skeletal_components=%d" % (
                 len(level_actors), len(mesh_actor_list), static_component_count, skeletal_component_count
             ))
-
+        
             # Export each actual mesh asset directly. This avoids silent-empty-world behavior
             # sometimes seen when UWorld export is passed a SelectedActors set in UE 5.8.
             # GLTFExporter supports UStaticMesh and USkeletalMesh objects as direct inputs.
@@ -2418,7 +2231,7 @@ jobs:
             processed_components = 0
             _write_progress(26, "Exporting actual mesh assets", 0, total_components,
                             "Direct UStaticMesh/USkeletalMesh export; material baking disabled")
-
+        
             for actor_index, actor in enumerate(mesh_actor_list):
                 try:
                     actor_label = str(actor.get_actor_label() or actor.get_name())
@@ -2433,7 +2246,7 @@ jobs:
                     component_groups.append(("SkeletalMesh", list(actor.get_components_by_class(unreal.SkeletalMeshComponent) or []), "skeletal_mesh"))
                 except Exception as component_error:
                     export_errors.append(str(actor_label) + " skeletal components: " + str(component_error)[:240])
-
+        
                 for component_kind, components, asset_property in component_groups:
                     for component in components:
                         if component is None:
@@ -2452,7 +2265,7 @@ jobs:
                                                  " asset lookup: " + str(asset_error)[:220])
                         if mesh_asset is None:
                             continue
-
+        
                         actor_file = os.path.join(os.path.dirname(output_path),
                                                   "mesh_component_%04d.glb" % processed_components)
                         try:
@@ -2502,7 +2315,7 @@ jobs:
                                         "Exporting actual mesh assets", processed_components, total_components,
                                         "Exported " + str(len(per_actor_files)) + " component GLB files; " +
                                         str(processed_components) + " of " + str(total_components) + " components processed")
-
+        
             if per_actor_files:
                 report["export_mode"] = "direct_mesh_asset_per_component"
                 report["mesh_files"] = per_actor_files
@@ -2541,7 +2354,7 @@ jobs:
                             "No GLB geometry was created. Direct asset errors: %s. Selected-world fallback: %s. All-world fallback: %s"
                             % (primary_export_error or "none", report.get("world_fallback_error", "none"), str(all_world_error)[:900])
                         )
-
+        
             if not mesh_node_rows and per_actor_files:
                 mesh_node_rows = [{"name": row.get("actor_label", "Mesh") + " / " + row.get("component_name", "Component")}
                                   for row in per_actor_files]
@@ -2651,8 +2464,8 @@ jobs:
                                               "phase": "Scene export failed", "detail": str(exc)[:300],
                                               "error": str(exc)[:1800]})
                 log("Actual scene geometry export failed: job=%s error=%s" % (job_id, repr(exc)))
-
-
+        
+        
         @app.post("/api/scene/model/export")
         @monitor_auth
         def api_scene_model_export():
@@ -2671,8 +2484,8 @@ jobs:
                              name="UE-SceneGLB-" + job_id[:8], daemon=True).start()
             log("Actual scene geometry export queued: job=%s" % job_id)
             return jsonify(ok=True, status="queued", job_id=job_id), 202
-
-
+        
+        
         @app.get("/api/scene/model/status")
         @monitor_auth
         def api_scene_model_status():
@@ -2704,8 +2517,8 @@ jobs:
             state.pop("html_path", None)
             state["ok"] = state.get("status") != "failed"
             return jsonify(state)
-
-
+        
+        
         @app.get("/api/scene/model/file/<job_id>/<filename>")
         @monitor_auth
         def api_scene_model_file(job_id, filename):
@@ -2722,8 +2535,8 @@ jobs:
             response.headers["Cache-Control"] = "no-store, max-age=0"
             response.headers["X-Scene-Model-Version"] = str(SCENE_MODEL_STATE.get("version", 0))
             return response
-
-
+        
+        
         @app.get("/api/viewer/status")
         @viewer_auth
         def api_viewer_status():
@@ -2792,8 +2605,8 @@ jobs:
             response.headers["Cache-Control"] = "no-store, max-age=0"
             response.headers["X-Scene-Model-Version"] = str(model_version)
             return response
-
-
+        
+        
         @app.get("/api/scene/export.html")
         @monitor_auth
         def api_scene_export_html():
@@ -2969,8 +2782,8 @@ jobs:
                                  download_name="unreal-scene-viewer.html", max_age=0)
             response.headers["Cache-Control"] = "no-store, max-age=0"
             return response
-
-
+        
+        
         @app.get("/api/scene/viewer.exe")
         @monitor_auth
         def api_scene_viewer_exe():
@@ -3003,7 +2816,6 @@ jobs:
                 prep = prepare_project(project, ensure_remote_plugins=True)
                 global CURRENT_PROJECT_FILE
                 CURRENT_PROJECT_FILE = project
-                _refresh_project_paths(project)
                 command = _write_editor_command("open_project", project)
                 return jsonify(ok=True, message="Project switch queued. The Editor will restart with this project.",
                                project_file=str(project), backup=prep.get("backup"), command=command)
@@ -3164,9 +2976,7 @@ jobs:
             if not project.is_file() or not _inside_root(project):
                 raise ValueError("Project not found inside D:\\UE58")
             stamp = time.strftime("%Y%m%d_%H%M%S")
-            checkpoint_dir = _project_remote_dir(project) / "Backups"
-            checkpoint_dir.mkdir(parents=True, exist_ok=True)
-            out = checkpoint_dir / (project.stem + "_checkpoint_" + stamp + "_" + uuid.uuid4().hex[:5] + ".zip")
+            out = BACKUP_DIR / (project.stem + "_checkpoint_" + stamp + "_" + uuid.uuid4().hex[:5] + ".zip")
             skip = {"Intermediate", "DerivedDataCache", "Saved", ".git", ".vs", "Binaries", "Builds"}
             base = project.parent
             total = 0
@@ -3212,9 +3022,7 @@ jobs:
         @monitor_auth
         def api_checkpoint_list():
             rows = []
-            checkpoint_dir = _project_remote_dir() / "Backups"
-            checkpoint_dir.mkdir(parents=True, exist_ok=True)
-            for item in sorted(checkpoint_dir.glob("*_checkpoint_*.zip"), key=lambda p: p.stat().st_mtime, reverse=True)[:50]:
+            for item in sorted(BACKUP_DIR.glob("*_checkpoint_*.zip"), key=lambda p: p.stat().st_mtime, reverse=True)[:50]:
                 rows.append({"name": item.name, "path": str(item), "size": item.stat().st_size, "modified": item.stat().st_mtime})
             return jsonify(ok=True, checkpoints=rows)
 
@@ -3227,9 +3035,8 @@ jobs:
                 return jsonify(ok=False, error="confirm_restore=true is required"), 400
             archive = Path(body.get("checkpoint", "")).resolve()
             project = _current_project()
-            checkpoint_dir = (_project_remote_dir(project) / "Backups").resolve()
-            if archive.parent != checkpoint_dir or not archive.is_file() or archive.suffix.lower() != ".zip" or not archive.name.startswith(project.stem + "_checkpoint_"):
-                return jsonify(ok=False, error="Choose a checkpoint ZIP created inside the active project's Saved/RemoteStudio/Backups folder"), 400
+            if archive.parent != BACKUP_DIR.resolve() or not archive.is_file() or archive.suffix.lower() != ".zip" or not archive.name.startswith(project.stem + "_checkpoint_"):
+                return jsonify(ok=False, error="Choose a checkpoint ZIP created for the active project inside D:\\UE58\\Backups"), 400
             # Validate every zip member before the supervisor extracts it.
             with zipfile.ZipFile(archive, "r") as zf:
                 for member in zf.infolist():
@@ -3335,7 +3142,78 @@ jobs:
             return None
 
 
+        def _headless_write_command(payload):
+            """Atomically hand one validated job to the PowerShell supervisor."""
+            with HEADLESS_LOCK:
+                if HEADLESS_COMMAND_FILE.exists():
+                    raise RuntimeError("another headless job is queued or running")
+                if EDITOR_COMMAND_FILE.exists():
+                    raise RuntimeError("another Editor restart/project command is queued; wait for it to finish")
+                command_tmp = HEADLESS_COMMAND_FILE.with_suffix(".tmp")
+                command_tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+                os.replace(command_tmp, HEADLESS_COMMAND_FILE)
+
+
+        def _headless_set_status(job_id, **updates):
+            status = _read_headless_status(job_id)
+            if not status:
+                raise RuntimeError("headless job status disappeared: " + str(job_id))
+            status.update(updates)
+            _write_headless_status(_headless_status_path(job_id), status)
+            return status
+
+
+        def _headless_wait_for_editor_save(job_id, save_job_id, payload, max_wait_seconds):
+            """Complete an asynchronous live-Editor save before starting the commandlet."""
+            global HEADLESS_PENDING_SAVE_JOB
+            job_dir = _headless_status_path(job_id).parent
+            cancel_flag = job_dir / "cancel-requested.flag"
+            deadline = time.time() + max(60, int(max_wait_seconds))
+            try:
+                _headless_set_status(job_id, status="queued", phase="waiting_for_editor_save",
+                    save_job_id=save_job_id, save_started_at=time.time(),
+                    message="Waiting for the live Unreal Editor to save dirty packages; commandlet has not started.")
+                while time.time() < deadline:
+                    current = _read_headless_status(job_id) or {}
+                    if current.get("status") == "cancelled" or cancel_flag.exists():
+                        _headless_set_status(job_id, status="cancelled", finished_at=time.time(),
+                            error="Cancelled while waiting for the Editor save; no commandlet was started.")
+                        return
+                    save_result, save_status = wait_unreal_job(save_job_id, 25)
+                    if save_status == 202 and save_result.get("status") == "pending":
+                        _headless_set_status(job_id, status="queued", phase="waiting_for_editor_save",
+                            save_last_checked_at=time.time(), save_message="Editor save is still running; the job remains queued safely.")
+                        continue
+                    if save_status != 200 or not save_result.get("ok"):
+                        raise RuntimeError("Editor save failed (HTTP %s): %s" % (save_status, save_result))
+
+                    # Match the original flow: enable the Python plugins only after the
+                    # live Editor has saved, immediately before the supervisor closes it.
+                    backup = _enable_python_for_headless(Path(payload["project_file"]))
+                    payload["python_plugin_backup"] = backup
+                    _headless_set_status(job_id, status="queued", phase="commandlet_queued", save_completed_at=time.time(),
+                        save_output=str(save_result.get("output", ""))[-4000:],
+                        python_plugin_backup=backup,
+                        message="Editor save completed; commandlet queued for the supervisor.")
+                    _headless_write_command(payload)
+                    log("Headless job save completed; command dispatched: id=%s" % job_id)
+                    return
+                raise TimeoutError("Timed out waiting for the live Unreal Editor save; commandlet was not started.")
+            except Exception as exc:
+                try:
+                    _headless_set_status(job_id, status="failed", finished_at=time.time(), error=str(exc),
+                        message="The live Editor save did not complete; no headless commandlet was started.")
+                except Exception:
+                    pass
+                log("Headless job could not pass Editor-save gate: id=%s error=%s" % (job_id, repr(exc)))
+            finally:
+                with HEADLESS_LOCK:
+                    if HEADLESS_PENDING_SAVE_JOB == job_id:
+                        HEADLESS_PENDING_SAVE_JOB = ""
+
+
         def _enqueue_headless_job(args):
+            global HEADLESS_PENDING_SAVE_JOB
             args = args or {}
             if args.get("confirm_run") is not True:
                 raise ValueError("confirm_run=true is required; headless Python can modify project assets and files")
@@ -3366,15 +3244,10 @@ jobs:
                 raise RuntimeError("project_is_open_in_editor: set stop_editor=true to save and close the current Editor before running a commandlet on this same project")
             if same_open_project and project != _current_project():
                 raise RuntimeError("target_project_is_open_in_another_editor_instance: close that secondary Editor manually before headless execution")
-            if EDITOR_COMMAND_FILE.exists():
-                raise RuntimeError("another Editor restart/project command is queued; wait for it to finish")
-            if same_open_project and stop_editor:
-                save_code = "import unreal\nprint('SAVE_DIRTY_RESULT=' + str(unreal.EditorLoadingAndSavingUtils.save_dirty_packages(True, True)))"
-                save_result, save_status = queue_unreal(save_code, 35)
-                if save_status != 200 or not save_result.get("ok"):
-                    raise RuntimeError("Could not save the open project before headless run: " + str(save_result))
 
             with HEADLESS_LOCK:
+                if HEADLESS_PENDING_SAVE_JOB:
+                    raise RuntimeError("another headless job is waiting for the live Editor save: " + HEADLESS_PENDING_SAVE_JOB)
                 if HEADLESS_COMMAND_FILE.exists():
                     raise RuntimeError("another headless job is queued or running")
                 if EDITOR_COMMAND_FILE.exists():
@@ -3395,7 +3268,6 @@ jobs:
                 wrapper += "print('UE_HEADLESS_JOB_ID=' + %r)\n" % job_id
                 script_path.write_text(wrapper + code + "\n", encoding="utf-8")
 
-                backup = _enable_python_for_headless(project)
                 payload = {
                     "job_id": job_id,
                     "project_file": str(project),
@@ -3409,10 +3281,12 @@ jobs:
                     "resume_project_file": str(_current_project()),
                     "created_at": time.time(),
                     "map_path": map_path,
-                    "python_plugin_backup": backup,
+                    "python_plugin_backup": None,
                 }
+                initial_status = "queued"
+                initial_phase = "waiting_for_editor_save" if same_open_project and stop_editor else "commandlet_queued"
                 initial = {
-                    "ok": True, "job_id": job_id, "status": "queued",
+                    "ok": True, "job_id": job_id, "status": initial_status, "phase": initial_phase,
                     "project_file": str(project), "map_path": map_path,
                     "created_at": payload["created_at"], "started_at": None,
                     "finished_at": None, "exit_code": None,
@@ -3421,12 +3295,66 @@ jobs:
                     "headless": True, "renderer": "nullrhi",
                     "editor_will_stop": payload["stop_editor"],
                     "editor_will_resume": payload["resume_editor"],
-                    "python_plugin_backup": backup,
+                    "python_plugin_backup": None,
+                    "message": "Preparing headless job; waiting for Editor save." if initial_phase == "waiting_for_editor_save" else "Headless job queued.",
                 }
                 _write_headless_status(status_path, initial)
-                command_tmp = HEADLESS_COMMAND_FILE.with_suffix(".tmp")
-                command_tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-                os.replace(command_tmp, HEADLESS_COMMAND_FILE)
+                if same_open_project and stop_editor:
+                    # Reserve the single pending-save slot before queue_unreal waits,
+                    # preventing two callers from simultaneously saving/stopping the Editor.
+                    HEADLESS_PENDING_SAVE_JOB = job_id
+
+            if same_open_project and stop_editor:
+                save_code = "import unreal\nprint('SAVE_DIRTY_RESULT=' + str(unreal.EditorLoadingAndSavingUtils.save_dirty_packages(True, True)))"
+                # Do not hold the HTTP/MCP request open while the Editor performs a save.
+                # queue_unreal returns 202 when the save exceeds this short initial window;
+                # the daemon waiter continues polling and dispatches the command only after
+                # the save has completed successfully.
+                try:
+                    save_result, save_status = queue_unreal(save_code, 8)
+                except Exception as exc:
+                    with HEADLESS_LOCK:
+                        if HEADLESS_PENDING_SAVE_JOB == job_id:
+                            HEADLESS_PENDING_SAVE_JOB = ""
+                    _headless_set_status(job_id, status="failed", finished_at=time.time(), error="Could not queue the Editor save: " + str(exc))
+                    raise RuntimeError("Could not queue the open Editor save before headless run: " + str(exc))
+                if save_status == 202 and save_result.get("job_id"):
+                    waiter = threading.Thread(
+                        target=_headless_wait_for_editor_save,
+                        args=(job_id, str(save_result["job_id"]), payload, min(max(timeout_seconds, 600), 1800)),
+                        daemon=True,
+                        name="UE58-Headless-SaveWait-" + job_id[:8],
+                    )
+                    try:
+                        waiter.start()
+                    except Exception as exc:
+                        with HEADLESS_LOCK:
+                            if HEADLESS_PENDING_SAVE_JOB == job_id:
+                                HEADLESS_PENDING_SAVE_JOB = ""
+                        _headless_set_status(job_id, status="failed", finished_at=time.time(), error="Could not start Editor-save waiter: " + str(exc))
+                        raise RuntimeError("Could not start asynchronous Editor-save waiter: " + str(exc))
+                    log("Headless job waiting asynchronously for Editor save: id=%s save_job=%s" % (job_id, save_result["job_id"]))
+                    return {"ok": True, "job_id": job_id, "status": "queued", "phase": "waiting_for_editor_save",
+                            "headless": True, "renderer": "nullrhi", "project_file": str(project),
+                            "status_endpoint": "/api/unreal/headless/status?job_id=" + job_id,
+                            "editor_will_stop": True, "editor_will_resume": bool(resume_editor),
+                            "save_job_id": save_result["job_id"],
+                            "message": "Editor save is running asynchronously. The commandlet will start automatically after the save succeeds; poll the job status."}
+                with HEADLESS_LOCK:
+                    if HEADLESS_PENDING_SAVE_JOB == job_id:
+                        HEADLESS_PENDING_SAVE_JOB = ""
+                if save_status != 200 or not save_result.get("ok"):
+                    _headless_set_status(job_id, status="failed", finished_at=time.time(), error="Could not save the open project: " + str(save_result))
+                    raise RuntimeError("Could not save the open project before headless run: " + str(save_result))
+                payload["python_plugin_backup"] = _enable_python_for_headless(project)
+                _headless_set_status(job_id, status="queued", save_completed_at=time.time(),
+                    save_output=str(save_result.get("output", ""))[-4000:],
+                    python_plugin_backup=payload["python_plugin_backup"],
+                    message="Editor save completed; commandlet queued for the supervisor.")
+            else:
+                payload["python_plugin_backup"] = _enable_python_for_headless(project)
+
+            _headless_write_command(payload)
             log("Headless Unreal commandlet job queued: id=%s project=%s stop_editor=%s resume_editor=%s" %
                 (job_id, project, payload["stop_editor"], payload["resume_editor"]))
             return {"ok": True, "job_id": job_id, "status": "queued", "headless": True,
@@ -3444,6 +3372,9 @@ jobs:
                 return {"ok": True, "job_id": job_id, "status": status.get("status"), "cancelled": False}
             job_dir = _headless_status_path(job_id).parent
             (job_dir / "cancel-requested.flag").write_text(str(time.time()), encoding="ascii")
+            if status.get("phase") == "waiting_for_editor_save":
+                _headless_set_status(job_id, status="cancelled", finished_at=time.time(),
+                    error="Cancellation requested while waiting for Editor save; commandlet will not start.")
             return {"ok": True, "job_id": job_id, "cancel_requested": True, "status": status.get("status")}
 
 
@@ -3863,7 +3794,7 @@ jobs:
                 if not uat:
                     raise FileNotFoundError("RunUAT.bat not found in extracted Unreal Engine")
                 project = Path(project_file).resolve()
-                output_dir = _project_remote_dir(project) / "Builds" / (project.stem + "_Win64_" + job_id[:8])
+                output_dir = BUILD_DIR / (project.stem + "_Win64_" + job_id[:8])
                 output_dir.mkdir(parents=True, exist_ok=True)
                 archive_dir = output_dir / "Package"
                 command = ["cmd.exe", "/c", str(uat), "BuildCookRun", "-project=" + str(project),
@@ -3937,14 +3868,8 @@ jobs:
         @monitor_auth
         def api_package_download():
             path = Path(request.args.get("path", "")).resolve()
-            allowed_build_path = False
-            for project_item in _project_files():
-                project_build_dir = (project_item.parent / "Saved" / "RemoteStudio" / "Builds").resolve()
-                if path == project_build_dir or project_build_dir in path.parents:
-                    allowed_build_path = True
-                    break
-            if not allowed_build_path:
-                return jsonify(ok=False, error="Path must be inside a project's Saved/RemoteStudio/Builds folder"), 400
+            if path.parent != BUILD_DIR and BUILD_DIR not in path.parents:
+                return jsonify(ok=False, error="Path must be inside Builds"), 400
             if not path.is_file() or path.suffix.lower() != ".zip":
                 return jsonify(ok=False, error="package ZIP not found"), 404
             return send_file(path, as_attachment=True, download_name=path.name)
@@ -4105,9 +4030,9 @@ jobs:
 
         def _install_plugin_from_path(source):
             source = Path(source).resolve()
-            upload_roots = [UPLOAD_ROOT.resolve(), (_current_project().parent / "Content" / "Imports").resolve()]
+            upload_roots = [UPLOAD_ROOT.resolve()]
             if not source.is_file() or not any(root == source or root in source.parents for root in upload_roots):
-                raise ValueError("Plugin ZIP must be inside D:\\UE58\\Uploads or the active project's Content/Imports folder")
+                raise ValueError("Plugin ZIP must be an existing file inside D:\\UE58\\Uploads")
             if source.suffix.lower() != ".zip" or source.stat().st_size > 500 * 1024 * 1024:
                 raise ValueError("Plugin ZIP must be .zip and at most 500 MiB")
             with zipfile.ZipFile(source, "r") as archive:
@@ -4320,7 +4245,6 @@ jobs:
                 prep = prepare_project(project, ensure_remote_plugins=True)
                 global CURRENT_PROJECT_FILE
                 CURRENT_PROJECT_FILE = project
-                _refresh_project_paths(project)
                 cmd = _write_editor_command("open_project", project)
                 return {"ok": True, "project_file": str(project), "backup": prep.get("backup"), "restart": cmd}
             if name == "unreal_save_all_dirty_assets":
@@ -4404,13 +4328,8 @@ jobs:
         mcp_server = MCPServer("unreal-engine-remote-control", instructions=(
             "Remote tools for Unreal Editor 5.8.4. Tools can execute arbitrary Python in the live Editor "
             "or in a finite headless UnrealEditor-Cmd commandlet. Such scripts run with the Unreal process "
-            "OS permissions and can modify project assets and files. PROJECT-LOCAL STORAGE RULE: create or "
-            "save every new level and Unreal asset inside the ACTIVE project's /Game tree, never under /Engine. "
-            "Use /Game/Maps for levels, /Game/Meshes or /Game/StaticMeshes for geometry, /Game/Materials for "
-            "materials, /Game/Textures for textures, /Game/Blueprints for Blueprints, and /Game/Audio for audio. "
-            "Project plugins belong in <project>/Plugins; project checkpoints, exports and builds belong under "
-            "<project>/Saved/RemoteStudio. The dedicated file-helper tools are restricted to D:\\UE58. "
-            "Confirm destructive actions before running them."
+            "OS permissions and can modify project assets and files; the dedicated file-helper tools are "
+            "restricted to D:\\UE58. Confirm destructive actions before running them."
         ))
 
         def mcp_json(value):
@@ -4545,7 +4464,7 @@ jobs:
         @mcp_server.tool()
         def unreal_take_screenshot(timeout_seconds: int = 60) -> str:
             """Capture a 1920x1080 Unreal screenshot and return its saved path."""
-            out = PROJECT_SCREENSHOTS_DIR / ("ue_mcp_" + time.strftime("%Y%m%d_%H%M%S") + ".png")
+            out = ROOT / "Screenshots" / ("ue_mcp_" + time.strftime("%Y%m%d_%H%M%S") + ".png")
             target = str(out).replace("\\", "/")
             code = ("import unreal\nworld = unreal.get_editor_subsystem(unreal.UnrealEditorSubsystem).get_editor_world()\n" +
                     "unreal.SystemLibrary.execute_console_command(world, 'HighResShot 1920x1080 filename=\\\"" + target + "\\\"')\n" + repr("SCREENSHOT_REQUESTED " + target))
@@ -4571,7 +4490,7 @@ jobs:
             except Exception as exc: return mcp_json({"ok": False, "error": str(exc)})
 
         def upload_target(filename: str, destination_folder: str = ""):
-            """Resolve a filename under the active project's Content/Imports folder."""
+            """Resolve a filename under D:\\UE58\\Uploads only."""
             filename = str(filename or "").strip()
             if (not filename or filename in (".", "..")
                 or Path(filename).name != filename
@@ -4581,10 +4500,9 @@ jobs:
             folder_parts = [] if not folder_value else folder_value.split("/")
             if any(part in ("", ".", "..") or ":" in part for part in folder_parts):
                 raise ValueError("destination_folder must be a relative folder under Uploads")
-            project_import_root = (_current_project().parent / "Content" / "Imports").resolve()
-            folder = project_import_root.joinpath(*folder_parts).resolve()
-            if folder != project_import_root and project_import_root not in folder.parents:
-                raise ValueError("destination must remain inside the active project's Content/Imports folder")
+            folder = UPLOAD_ROOT.joinpath(*folder_parts).resolve()
+            if folder != UPLOAD_ROOT and UPLOAD_ROOT not in folder.parents:
+                raise ValueError("destination must remain inside D:\\UE58\\Uploads")
             folder.mkdir(parents=True, exist_ok=True)
             target = (folder / filename).resolve()
             if target.parent != folder:
@@ -4611,7 +4529,7 @@ jobs:
         @mcp_server.tool()
         def unreal_upload_binary_file(filename: str, content_base64: str,
                                       destination_folder: str = "", overwrite: bool = False) -> str:
-            """Upload a binary attachment (for example .blend, .fbx, .zip, .png) from the MCP client into the active project's Content/Imports folder. Pass the file bytes as Base64. Supports up to 8 MiB per call for MCP clients that can pass large arguments. For chat-attached files, prefer the chunked upload tools to keep each request small."""
+            """Upload a binary attachment (for example .blend, .fbx, .zip, .png) from the MCP client into D:\\UE58\\Uploads. Pass the file bytes as Base64. Supports up to 8 MiB per call for MCP clients that can pass large arguments. For chat-attached files, prefer the chunked upload tools to keep each request small."""
             try:
                 encoded = str(content_base64 or "")
                 if len(encoded) > ((UPLOAD_SINGLE_FILE_LIMIT + 2) // 3) * 4 + 16:
@@ -4632,7 +4550,7 @@ jobs:
         @mcp_server.tool()
         def unreal_begin_binary_upload(filename: str, total_size: int,
                                        destination_folder: str = "", overwrite: bool = False) -> str:
-            """Start a chunked binary upload into the active project's Content/Imports folder for files over 8 MiB. Then call unreal_upload_binary_chunk for each Base64 chunk and unreal_finish_binary_upload when all chunks are sent. Chunk size is 16 KiB to keep individual MCP tool arguments manageable. Maximum file size is 2 GiB."""
+            """Start a chunked binary upload to D:\\UE58\\Uploads for files over 8 MiB. Then call unreal_upload_binary_chunk for each Base64 chunk and unreal_finish_binary_upload when all chunks are sent. Chunk size is 16 KiB to keep individual MCP tool arguments manageable. Maximum file size is 2 GiB."""
             try:
                 total_size = int(total_size)
                 if total_size < 1 or total_size > UPLOAD_MAX_FILE_SIZE:
@@ -4642,7 +4560,7 @@ jobs:
                     return mcp_json({"ok": False, "error": "target already exists; set overwrite=true to replace it", "path": str(target)})
                 upload_id = uuid.uuid4().hex
                 chunk_count = (total_size + UPLOAD_CHUNK_BYTES - 1) // UPLOAD_CHUNK_BYTES
-                staging = (_current_project().parent / "Saved" / "RemoteStudio" / "Incoming" / upload_id)
+                staging = UPLOAD_ROOT / ".incoming" / upload_id
                 staging.mkdir(parents=True, exist_ok=False)
                 with UPLOAD_LOCK:
                     UPLOAD_SESSIONS[upload_id] = {
@@ -4804,11 +4722,11 @@ jobs:
                 },
                 {
                     "name": "unreal_upload_binary_file",
-                    "description": "Upload a small file into the active project's Content/Imports folder. Binary content must be Base64 and is limited to 8 MiB. The file stays with its owning project.",
+                    "description": "Upload a small file into D:\\UE58\\Uploads. Binary content must be Base64 and is limited to 8 MiB; use the resulting path with github_release_upload_file to publish it.",
                     "inputSchema": {"type": "object", "properties": {
                         "filename": {"type": "string", "description": "A simple filename without directory separators."},
                         "content_base64": {"type": "string", "description": "Base64-encoded file bytes; maximum decoded size 8 MiB."},
-                        "destination_folder": {"type": "string", "default": "", "description": "Optional subfolder under the active project's Content/Imports folder."},
+                        "destination_folder": {"type": "string", "default": "", "description": "Optional subfolder under Uploads."},
                         "overwrite": {"type": "boolean", "default": False}
                     }, "required": ["filename", "content_base64"], "additionalProperties": False}
                 },
@@ -5622,6 +5540,24 @@ jobs:
                 await send_mcp_json(send, response_obj, headers=local_response_headers)
                 return
 
+            native_tool_lock_acquired = False
+            if method == "tools/call":
+                try:
+                    # One native Unreal tool at a time. Fail fast rather than allowing
+                    # concurrent requests to queue behind an Editor operation until the
+                    # outer MCP connector's request deadline expires.
+                    await asyncio.wait_for(MCP_NATIVE_TOOL_LOCK.acquire(), timeout=8.0)
+                    native_tool_lock_acquired = True
+                except asyncio.TimeoutError:
+                    with MONITOR_LOCK:
+                        MCP_CONNECTION["last_status"] = 409
+                        MCP_CONNECTION["last_error"] = "Another Unreal tool call is still running."
+                    request_id = request_obj.get("id") if isinstance(request_obj, dict) else None
+                    busy = {"jsonrpc": "2.0", "id": request_id,
+                            "error": {"code": -32004, "message": "Another Unreal Editor tool call is still running. Wait for it to finish, then retry this request."}}
+                    await send_mcp_json(send, busy, status=200)
+                    return
+
             event_id = None
             if method == "tools/call" and isinstance(params, dict):
                 event_id = monitor_event_start(params.get("name", "unknown"), params.get("arguments", {}))
@@ -5629,10 +5565,10 @@ jobs:
             log("MCP request: %s %s -> %s; method=%s" % (
                 scope.get("method", "POST"), raw_path, target, method or "non-JSON-RPC"))
             try:
-                # Bound upstream waits. The native Unreal MCP endpoint returns one
+                # Bound upstream waits to stay inside the external MCP connector deadline. The native Unreal MCP endpoint returns one
                 # finite response for POST; unlimited streaming waits can leave a
                 # Cloudflare request hanging until the client cancels it.
-                mcp_timeout = httpx.Timeout(connect=10.0, read=180.0, write=60.0, pool=15.0)
+                mcp_timeout = httpx.Timeout(connect=10.0, read=120.0, write=60.0, pool=15.0)
                 async with httpx.AsyncClient(timeout=mcp_timeout, trust_env=False) as client:
                     upstream_body = bytes(body)
                     # tools/list: stop at the matching SSE event rather than waiting for EOF.
@@ -5745,18 +5681,33 @@ jobs:
                             monitor_event_finish(event_id, response.status_code,
                                                  response_preview=monitor_response_preview(response_body[:12000]))
             except Exception as exc:
+                is_timeout = isinstance(exc, (httpx.TimeoutException, TimeoutError))
+                diagnostic_status = 504 if is_timeout else 502
                 with MONITOR_LOCK:
-                    MCP_CONNECTION["last_status"] = 502
+                    MCP_CONNECTION["last_status"] = diagnostic_status
                     MCP_CONNECTION["last_error"] = str(exc)[:500]
                 if event_id:
-                    monitor_event_finish(event_id, 502, repr(exc))
-                log("Native MCP proxy error: %s: %s" % (type(exc).__name__, str(exc)[:1200]))
+                    monitor_event_finish(event_id, diagnostic_status, repr(exc))
+                log("Native MCP proxy %s: %s: %s" % ("timeout" if is_timeout else "error", type(exc).__name__, str(exc)[:1200]))
                 log("Native MCP proxy traceback: %s" % traceback.format_exc()[-4000:])
-                err = json.dumps({"ok": False, "error": "native_mcp_proxy_failed",
-                                  "detail": type(exc).__name__ + ": " + str(exc)[:600]}, separators=(",", ":")).encode("utf-8")
-                await send({"type": "http.response.start", "status": 502,
-                            "headers": [(b"content-type", b"application/json; charset=utf-8"), (b"content-length", str(len(err)).encode())]})
-                await send({"type": "http.response.body", "body": err})
+                request_id = request_obj.get("id") if isinstance(request_obj, dict) else None
+                if isinstance(request_obj, dict) and request_obj.get("jsonrpc") == "2.0" and request_id is not None:
+                    message = ("Unreal native MCP did not answer within the configured 120-second limit. "
+                               "The Editor may be busy; wait for the current operation to finish before retrying.") if is_timeout else (
+                               "Unreal native MCP proxy failed: " + type(exc).__name__ + ": " + str(exc)[:400])
+                    rpc_error = {"jsonrpc": "2.0", "id": request_id,
+                                 "error": {"code": -32002 if is_timeout else -32003, "message": message}}
+                    await send_mcp_json(send, rpc_error, status=200,
+                                        headers=[(b"x-ue-mcp-diagnostic", b"upstream-timeout" if is_timeout else b"upstream-error")])
+                else:
+                    err = json.dumps({"ok": False, "error": "native_mcp_proxy_timeout" if is_timeout else "native_mcp_proxy_failed",
+                                      "detail": type(exc).__name__ + ": " + str(exc)[:600]}, separators=(",", ":")).encode("utf-8")
+                    await send({"type": "http.response.start", "status": diagnostic_status,
+                                "headers": [(b"content-type", b"application/json; charset=utf-8"), (b"content-length", str(len(err)).encode())]})
+                    await send({"type": "http.response.body", "body": err})
+            finally:
+                if native_tool_lock_acquired:
+                    MCP_NATIVE_TOOL_LOCK.release()
 
         @app.post("/internal/mcp/warmup")
         @bridge_auth
@@ -5819,23 +5770,20 @@ jobs:
         & $python -m py_compile 'D:\UE58\api_server.py' 'D:\UE58\UEControl\Content\Python\init_unreal.py'
         if ($LASTEXITCODE -ne 0) { throw 'Generated Python scripts failed syntax validation.' }
         $apiText = Get-Content -LiteralPath 'D:\UE58\api_server.py' -Raw -Encoding utf8
-        if ($apiText -notmatch '(?m)^\s{8}mcp_timeout\s*=\s*httpx\.Timeout\(connect=10\.0, read=180\.0, write=60\.0, pool=15\.0\)\s*$') {
+        if ($apiText -notmatch '(?m)^\s{8}mcp_timeout\s*=\s*httpx\.Timeout\(connect=10\.0, read=120\.0, write=60\.0, pool=15\.0\)\s*$') {
           throw 'MCP_TIMEOUT_ASSIGNMENT_INVALID: mcp_timeout must be a standalone executable Python line, not part of a comment.'
         }
         if ($apiText -notmatch 'async def public_app' -or $apiText -notmatch 'canonical_request_path') {
           throw 'PUBLIC_MCP_ROUTER_INVALID: /mcp public ASGI dispatcher was not generated.'
+        }
+        if ($apiText -notmatch 'def _headless_wait_for_editor_save' -or $apiText -notmatch 'wait_unreal_job\(save_job_id, 25\)' -or $apiText -notmatch 'waiting_for_editor_save') {
+          throw 'HEADLESS_ASYNC_SAVE_INVALID: pending Editor saves must complete in the background before commandlet dispatch.'
         }
         if ($apiText -notmatch 'Try the current unfinished data line as well' -or $apiText -notmatch 'Read only the HTTP') {
           throw 'MCP_STREAM_READER_INVALID: immediate SSE parsing and nonblocking notification handling are required.'
         }
         Write-Host 'PYTHON_SYNTAX_VALIDATION=true'
         Write-Host 'MCP_PROXY_STATIC_VALIDATION=true'
-        if ($apiText -notmatch 'PROJECT-LOCAL STORAGE RULE' -or $apiText -notmatch '_refresh_project_paths') { throw 'PROJECT_LOCAL_STORAGE_POLICY_MISSING: project-local asset paths were not generated.' }
-        if ($apiText -match 'EditorStartupMap=/Engine/Maps/Entry') { throw 'ENGINE_MAP_REFERENCE_FOUND: project startup map must be project-local.' }
-        Write-Host 'PROJECT_LOCAL_STORAGE_VALIDATION=true'
-        if ($apiText -notmatch 'Content/Imports' -or $apiText -notmatch 'PROJECT_SCREENSHOTS_DIR' -or $apiText -notmatch 'PROJECT_EXPORTS_DIR') { throw 'PROJECT_LOCAL_OUTPUT_PATHS_MISSING: imports/screenshots/exports must be project-local.' }
-        if ($apiText -match 'destination = UPLOAD_ROOT / name') { throw 'GLOBAL_ZIP_OUTPUT_FOUND: project file archives must be saved under the active project.' }
-        Write-Host 'PROJECT_LOCAL_OUTPUT_PATHS_VALIDATION=true'
     - name: Launch API, Unreal and Cloudflare tunnel
       shell: pwsh
       env:
