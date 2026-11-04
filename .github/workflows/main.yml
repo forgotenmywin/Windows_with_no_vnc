@@ -495,7 +495,7 @@ jobs:
         Set-Content -LiteralPath "$pythonDir\init_unreal.py" -Value $bridge -Encoding utf8
 
         $api = @'
-        import asyncio, base64, binascii, contextlib, hashlib, io, json, os, queue, re, secrets, shutil, tempfile, threading, time, traceback, uuid, textwrap
+        import ast, asyncio, base64, binascii, contextlib, hashlib, io, json, os, queue, re, secrets, shutil, tempfile, threading, time, traceback, uuid, textwrap
         from collections import deque
         from pathlib import Path
         from functools import wraps
@@ -1746,7 +1746,14 @@ jobs:
         <div class="toolbar"><button class="btn primary" id="zipBtn">ZIP selected files / folders</button><button class="btn primary" id="releaseBtn">Send selected to GitHub Release</button><button class="btn" id="downloadBtn">Download selected</button><button class="btn" id="copySelectedBtn">Copy selected here</button><button class="btn" id="copyCurrentPathBtn">Copy folder path</button><button class="btn" id="renameBtn">Rename selected</button><button class="btn danger" id="deleteBtn">Delete selected</button><button class="btn" id="newFolderBtn">New folder</button></div>
         <div class="grid2"><div class="drop"><div class="small muted">Upload file(s) from this computer into the currently open Windows folder.</div><div class="toolbar"><input type="file" id="localFiles" multiple><label class="small"><input type="checkbox" id="uploadOverwrite"> Replace same-name files</label><button class="btn" id="uploadBtn">Upload here</button></div></div><div class="drop"><div class="small muted">GitHub Release destination (assets become publicly downloadable).</div><div class="toolbar"><label class="small">Tag <input id="releaseTag" value="ue5.8" style="width:110px"></label><label class="small"><input type="checkbox" id="replaceRelease"> Replace same-name Release assets</label></div><div class="small muted">If the tag or Release does not exist, it is created automatically from the repository default branch. Select a folder and use ZIP to include that entire folder and all subfolders. When replacement is off, unique timestamped asset names are used. Large files are split into numbered parts automatically.</div></div></div>
         <div class="status" id="fileStatus" aria-live="polite"></div><div class="tablewrap"><table><thead><tr><th><input type="checkbox" id="headerCheck"></th><th>Name</th><th>Extension / Type</th><th>Size</th><th>Modified</th><th>Action</th></tr></thead><tbody id="fileRows"><tr><td colspan="6" class="muted">Choose a location.</td></tr></tbody></table></div><div class="toolbar"><button class="btn" id="prevPageBtn">Previous</button><span class="muted small" id="pageInfo">—</span><button class="btn" id="nextPageBtn">Next</button></div></section>
-        <section id="threeDTab" class="panel hidden"><h2>3D Export from Unreal Engine</h2><div class="muted small">Export directly from the currently open Unreal Editor. GLB is one binary file. glTF is JSON plus its referenced .bin/textures, and the system creates a ZIP bundle for easy download.</div><div class="toolbar"><label>Format <select id="threeDFormat"><option value="glb">GLB (.glb)</option><option value="gltf">glTF (.gltf + resources)</option></select></label><label>Source <select id="threeDScope"><option value="level">Whole active Level</option><option value="selected">Selected Actors in Unreal Editor</option></select></label><button class="btn primary" id="threeDExportBtn">Export 3D model</button><button class="btn" id="threeDOpenFolderBtn" disabled>Open export folder in Files</button></div><div class="status" id="threeDStatus" aria-live="polite">No export started.</div><div class="toolbar" id="threeDLinks" hidden></div><div class="small muted">Output folder: D:\UE58\Uploads\3D_Exports. You can also start an export through ChatGPT MCP using unreal_export_3d and check it with unreal_get_3d_export_status. For an external viewer, download the model and drop it into <a href="https://sandbox.babylonjs.com/" target="_blank" rel="noopener" style="color:#9bcfff">Babylon.js Sandbox</a>.</div><div id="threeDPreview" style="height:520px;margin-top:12px;border:1px solid var(--line);border-radius:8px;overflow:hidden;background:#0b111a" hidden><iframe id="threeDFrame" title="3D model preview" style="width:100%;height:100%;border:0" allow="fullscreen"></iframe></div></section>
+        <section id="threeDTab" class="panel hidden"><h2>3D Export from Unreal Engine</h2><div class="muted small">Export directly from the currently open Unreal Editor. GLB is one binary file. glTF is JSON plus its referenced .bin/textures, and the system creates a ZIP bundle for easy download.</div><div class="toolbar"><label>Format <select id="threeDFormat"><option value="glb">GLB (.glb)</option><option value="gltf">glTF (.gltf + resources)</option></select></label><label>Source <select id="threeDScope"><option value="level">Whole active Level</option><option value="selected">Selected Actors in Unreal Editor</option></select></label><button class="btn primary" id="threeDExportBtn">Export 3D model</button><button class="btn" id="threeDOpenFolderBtn" disabled>Open export folder in Files</button></div><div class="status" id="threeDStatus" aria-live="polite">No export started.</div>
+        <div id="threeDProgressWrap" hidden style="margin:12px 0;padding:12px;border:1px solid var(--line);border-radius:9px;background:#0b131d">
+          <div class="statline" style="align-items:center"><span id="threeDPercent" style="font-size:18px;font-weight:700">0%</span><span id="threeDPhase">Waiting</span><span id="threeDProgressKind" class="muted small">Progress</span></div>
+          <div role="progressbar" aria-label="3D export progress" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" id="threeDProgressTrack" style="height:12px;background:#263649;border-radius:20px;overflow:hidden;margin:8px 0"><div id="threeDProgressBar" style="height:100%;width:0%;background:linear-gradient(90deg,#2784d8,#43c58a);border-radius:20px;transition:width .35s ease"></div></div>
+          <div class="small" style="margin:7px 0;overflow-wrap:anywhere"><b>Currently processing:</b> <span id="threeDCurrentFile">—</span></div>
+          <div class="small muted" style="margin:7px 0">Actors and mesh assets detected in the selected source:</div><div id="threeDTargets" style="max-height:150px;overflow:auto;padding:8px;background:#080d13;border:1px solid var(--line);border-radius:7px;font:11px/1.5 Consolas,monospace">Waiting for Unreal Editor…</div>
+          <div class="small" style="margin:10px 0 5px;font-weight:700">Live export log</div><pre id="threeDExportLog" style="white-space:pre-wrap;overflow-wrap:anywhere;overflow:auto;max-height:220px;min-height:80px;margin:0;padding:9px;background:#080d13;border:1px solid var(--line);border-radius:7px;font:11px/1.55 Consolas,monospace">Export events will appear here.</pre>
+        </div><div class="toolbar" id="threeDLinks" hidden></div><div class="small muted">Output folder: D:\UE58\Uploads\3D_Exports. You can also start an export through ChatGPT MCP using unreal_export_3d and check it with unreal_get_3d_export_status. For an external viewer, download the model and drop it into <a href="https://sandbox.babylonjs.com/" target="_blank" rel="noopener" style="color:#9bcfff">Babylon.js Sandbox</a>.</div><div id="threeDPreview" style="height:520px;margin-top:12px;border:1px solid var(--line);border-radius:8px;overflow:hidden;background:#0b111a" hidden><iframe id="threeDFrame" title="3D model preview" style="width:100%;height:100%;border:0" allow="fullscreen"></iframe></div></section>
         <section id="logsTab" class="panel hidden"><div class="toolbar"><select id="logSource"><option value="all">All log sources</option></select><select id="logLevel"><option value="all">All levels</option><option>ERROR</option><option>WARN</option><option>INFO</option><option>DEBUG</option></select><input id="logQuery" placeholder="Search logs…"><button class="btn" id="refreshLogsBtn">Refresh logs</button><label class="small"><input type="checkbox" id="autoLogs" checked> Auto refresh</label></div><div class="statline"><span id="logSummary">Waiting for logs…</span><span id="lastLogUpdate"></span></div><div id="logOutput" class="logs">Logs will appear here. File transfers, ZIP jobs, GitHub Release uploads, API commands and MCP operations are recorded.</div></section>
         </main></div>
         <script>
@@ -1777,8 +1784,20 @@ jobs:
         $('deleteBtn').onclick=async()=>{const paths=selectedPaths();if(!paths.length)return status('Select files or folders first.','error');if(!confirm('Permanently delete '+paths.length+' selected item(s) from the Windows runner? This cannot be undone.'))return;let ok=0,fail=[];for(const path of paths){try{await api('/api/fs/delete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({path,confirm_delete:true})});ok++;}catch(e){fail.push(path+': '+e.message);}}status(ok+' deleted; '+fail.length+' failed. '+fail.join(' | '),fail.length?'error':'ok');await openDir(state.path,state.offset);await loadLogs();};
         document.querySelectorAll('[data-tab]').forEach(b=>b.onclick=()=>{state.tab=b.dataset.tab;document.querySelectorAll('[data-tab]').forEach(x=>x.classList.toggle('active',x===b));$('filesTab').classList.toggle('hidden',state.tab!=='files');$('threeDTab').classList.toggle('hidden',state.tab!=='3d');$('logsTab').classList.toggle('hidden',state.tab!=='logs');if(state.tab==='logs')loadLogs();});
          let threeDJobId='';let threeDPoll=null;let threeDDirectory='';
-         $('threeDExportBtn').onclick=async()=>{const b=$('threeDExportBtn');b.disabled=true;$('threeDLinks').hidden=true;$('threeDPreview').hidden=true;$('threeDFrame').src='about:blank';$('threeDStatus').textContent='Queueing Unreal export…';try{const j=await api('/api/3d/export',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({format:$('threeDFormat').value,scope:$('threeDScope').value})});threeDJobId=j.job_id;if(threeDPoll)clearInterval(threeDPoll);await pollThreeD();threeDPoll=setInterval(pollThreeD,1500);}catch(e){$('threeDStatus').textContent='Export could not start: '+e.message;$('threeDStatus').className='status error';b.disabled=false;}};
-         async function pollThreeD(){if(!threeDJobId)return;try{const j=await api('/api/3d/status/'+encodeURIComponent(threeDJobId));const x=j.job||{};$('threeDStatus').textContent=(x.phase||x.status||'Export')+' · '+(x.progress||0)+'% · '+(x.detail||'');if(x.status==='completed'){clearInterval(threeDPoll);threeDPoll=null;$('threeDExportBtn').disabled=false;threeDDirectory=x.directory;$('threeDOpenFolderBtn').disabled=false;const main=(x.files||[]).find(f=>f.name===x.main_file);const bundle=(x.files||[]).find(f=>f.bundle);const fileUrl='/api/3d/file/'+encodeURIComponent(threeDJobId)+'/'+encodeURIComponent(x.main_file);const bundleUrl=bundle?'/api/3d/file/'+encodeURIComponent(threeDJobId)+'/'+encodeURIComponent(bundle.name):'';$('threeDLinks').innerHTML='<a class="btn" href="'+fileUrl+'" download>Download '+esc(x.main_file)+'</a>'+(bundleUrl?'<a class="btn primary" href="'+bundleUrl+'" download>Download complete ZIP bundle</a>':'')+'<a class="btn" href="'+x.viewer_url+'" target="_blank" rel="noopener">Open 3D preview</a>'+'<button class="btn" id="threeDCopyPathBtn">Copy export path</button>';$('threeDLinks').hidden=false;$('threeDCopyPathBtn').onclick=()=>copyText(x.directory);$('threeDStatus').textContent='Export completed · '+esc(x.format.toUpperCase())+' · '+x.actor_count+' Actor(s) · '+human(x.size)+' · '+x.directory;$('threeDStatus').className='status ok';$('threeDPreview').hidden=false;$('threeDFrame').src=x.viewer_url;}else if(x.status==='failed'){clearInterval(threeDPoll);threeDPoll=null;$('threeDExportBtn').disabled=false;$('threeDStatus').textContent='Export failed: '+(x.error||x.detail||'unknown error');$('threeDStatus').className='status error';}}catch(e){$('threeDStatus').textContent='Status check failed: '+e.message;$('threeDStatus').className='status error';}}
+         function renderThreeDProgress(x){
+           const wrap=$('threeDProgressWrap');wrap.hidden=false;
+           const progress=Math.max(0,Math.min(100,Number(x.progress||0)));
+           $('threeDPercent').textContent=(x.progress_estimated?'≈':'')+progress+'%';
+           $('threeDPhase').textContent=x.phase||x.status||'Exporting';
+           $('threeDProgressKind').textContent=x.progress_estimated?'Estimated while Unreal GLTFExporter runs':'Reported stage progress';
+           $('threeDProgressBar').style.width=progress+'%';$('threeDProgressTrack').setAttribute('aria-valuenow',String(progress));
+           $('threeDCurrentFile').textContent=(x.current_file||'Unreal_Level.'+(x.format||'glb'))+' · '+(x.current_target||x.detail||'');
+           const targets=x.targets||[];
+           $('threeDTargets').innerHTML=targets.length?targets.map(t=>'<div style="padding:3px 0;border-bottom:1px solid #1d2a39"><b>'+esc(t.actor||'Actor')+'</b> / '+esc(t.component||'')+' <span style="color:#8fb9dd">['+esc(t.kind||'')+']</span><br><span style="color:#9baec1">'+esc(t.asset_path||'')+'</span></div>').join(''):'Unreal Editor is discovering the Actor and Mesh asset list…';
+           const rows=x.logs||[];$('threeDExportLog').textContent=rows.map(v=>'['+(v.time||'')+'] '+(v.progress??'')+'% · '+(v.phase||'')+' — '+(v.message||'')).join('\n')||'Waiting for the first export event…';$('threeDExportLog').scrollTop=$('threeDExportLog').scrollHeight;
+         }
+         $('threeDExportBtn').onclick=async()=>{const b=$('threeDExportBtn');b.disabled=true;$('threeDLinks').hidden=true;$('threeDPreview').hidden=true;$('threeDFrame').src='about:blank';$('threeDProgressWrap').hidden=false;$('threeDPercent').textContent='0%';$('threeDPhase').textContent='Queueing';$('threeDProgressBar').style.width='0%';$('threeDCurrentFile').textContent='Waiting for Unreal Editor';$('threeDTargets').textContent='Reading active Level and Actor selection…';$('threeDExportLog').textContent='['+new Date().toLocaleTimeString()+'] Export request submitted.';$('threeDStatus').textContent='Starting export…';$('threeDStatus').className='status';try{const j=await api('/api/3d/export',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({format:$('threeDFormat').value,scope:$('threeDScope').value})});threeDJobId=j.job_id;if(threeDPoll)clearInterval(threeDPoll);await pollThreeD();threeDPoll=setInterval(pollThreeD,1000);}catch(e){$('threeDStatus').textContent='Export could not start: '+e.message;$('threeDStatus').className='status error';$('threeDExportLog').textContent+='\n['+new Date().toLocaleTimeString()+'] ERROR — '+e.message;b.disabled=false;}};
+         async function pollThreeD(){if(!threeDJobId)return;try{const j=await api('/api/3d/status/'+encodeURIComponent(threeDJobId));const x=j.job||{};renderThreeDProgress(x);$('threeDStatus').textContent=(x.phase||x.status||'Export')+' · '+(x.progress_estimated?'approximately ':'')+(x.progress||0)+'% · '+(x.detail||'');if(x.status==='completed'){if(threeDPoll)clearInterval(threeDPoll);threeDPoll=null;$('threeDExportBtn').disabled=false;threeDDirectory=x.directory;$('threeDOpenFolderBtn').disabled=false;const main=(x.files||[]).find(f=>f.name===x.main_file);const bundle=(x.files||[]).find(f=>f.bundle);const fileUrl='/api/3d/file/'+encodeURIComponent(threeDJobId)+'/'+encodeURIComponent(x.main_file);const bundleUrl=bundle?'/api/3d/file/'+encodeURIComponent(threeDJobId)+'/'+encodeURIComponent(bundle.name):'';$('threeDLinks').innerHTML='<a class="btn" href="'+fileUrl+'" download>Download '+esc(x.main_file)+'</a>'+(bundleUrl?'<a class="btn primary" href="'+bundleUrl+'" download>Download complete ZIP bundle</a>':'')+'<a class="btn" href="'+x.viewer_url+'" target="_blank" rel="noopener">Open 3D preview</a>'+'<button class="btn" id="threeDCopyPathBtn">Copy export path</button>';$('threeDLinks').hidden=false;$('threeDCopyPathBtn').onclick=()=>copyText(x.directory);$('threeDStatus').textContent='Export completed · '+esc(x.format.toUpperCase())+' · '+x.actor_count+' Actor(s) · '+human(x.size)+' · '+x.directory;$('threeDStatus').className='status ok';$('threeDPreview').hidden=false;$('threeDFrame').src=x.viewer_url;}else if(x.status==='failed'){if(threeDPoll)clearInterval(threeDPoll);threeDPoll=null;$('threeDExportBtn').disabled=false;$('threeDStatus').textContent='Export failed: '+(x.error||x.detail||'unknown error');$('threeDStatus').className='status error';$('threeDExportLog').textContent+=(x.logs||[]).length?'':'\nERROR — '+(x.error||'Unknown export error');}}catch(e){$('threeDStatus').textContent='Status check failed: '+e.message;$('threeDStatus').className='status error';}}
          $('threeDOpenFolderBtn').onclick=()=>{if(threeDDirectory){document.querySelector('[data-tab="files"]').click();openDir(threeDDirectory);}};
         async function loadLogs(){try{const q=new URLSearchParams({source:$('logSource').value,level:$('logLevel').value,q:$('logQuery').value,limit:'800'});const j=await api('/api/logs?'+q);const names=j.sources||[];const prev=$('logSource').value;if($('logSource').options.length!==names.length+1){$('logSource').innerHTML='<option value="all">All log sources</option>'+names.map(x=>`<option value="${esc(x)}">${esc(x)}</option>`).join('');$('logSource').value=names.includes(prev)?prev:'all';}const rows=j.entries||[];$('logSummary').textContent=rows.length+' log entries · '+(j.connection?.bridge_connected?'Bridge connected':'Bridge offline');$('lastLogUpdate').textContent='Updated '+new Date().toLocaleTimeString();$('logOutput').textContent=rows.map(x=>`[${x.timestamp}] [${x.level}] [${x.source}] ${x.message}`).join('\n')||'No matching logs.';$('logOutput').scrollTop=$('logOutput').scrollHeight;}catch(e){$('logSummary').textContent='Log error: '+e.message;}}
         $('refreshLogsBtn').onclick=loadLogs;$('logSource').onchange=loadLogs;$('logLevel').onchange=loadLogs;$('logQuery').onkeydown=e=>{if(e.key==='Enter')loadLogs();};setInterval(()=>{if($('autoLogs').checked&&state.tab==='logs')loadLogs();},5000);setInterval(()=>$('clock').textContent=new Date().toLocaleString(),1000);loadRoots();
@@ -2729,25 +2748,121 @@ jobs:
                 row = dict(THREE_D_EXPORT_JOBS.get(str(job_id or ""), {}))
             if not row:
                 return {"ok": False, "error": "3d_export_job_not_found", "job_id": str(job_id or "")}
+            progress_file = row.get("progress_file")
+            if row.get("status") in ("queued", "running") and progress_file:
+                try:
+                    progress_path = Path(progress_file).resolve()
+                    if progress_path.parent == Path(row.get("directory", "")).resolve() and progress_path.is_file():
+                        progress_data = json.loads(progress_path.read_text(encoding="utf-8"))
+                        if isinstance(progress_data, dict):
+                            # While the synchronous Unreal exporter is running, its progress
+                            # file is intentionally static; preserve the server's labelled estimate.
+                            if not row.get("progress_estimated"):
+                                for key in ("progress", "phase", "detail", "progress_estimated", "completed", "total"):
+                                    if key in progress_data:
+                                        row[key] = progress_data[key]
+                            for key in ("current_file", "current_target", "targets", "logs"):
+                                if key in progress_data:
+                                    row[key] = progress_data[key]
+                except Exception as progress_error:
+                    row["progress_read_warning"] = str(progress_error)[:180]
             return {"ok": True, "job": row}
 
 
         def _three_d_export_worker(job_id, export_format, scope):
             job_dir = (THREE_D_EXPORT_DIR / job_id).resolve()
             job_dir.mkdir(parents=True, exist_ok=True)
+            progress_path = (job_dir / "progress.json").resolve()
             main_name = "Unreal_Level." + export_format
             main_path = (job_dir / main_name).resolve()
-            with THREE_D_EXPORT_LOCK:
-                THREE_D_EXPORT_JOBS[job_id].update({"status": "running", "phase": "Connecting to Unreal Editor", "progress": 3})
+            started = time.monotonic()
+
+            def _server_update(progress, phase, detail="", current_file=None, current_target=None,
+                               targets=None, estimated=False, event=True):
+                with THREE_D_EXPORT_LOCK:
+                    row = THREE_D_EXPORT_JOBS.get(job_id)
+                    if not row:
+                        return
+                    row.update({"status": "running", "progress": max(0, min(99, int(progress))),
+                                "phase": str(phase)[:180], "detail": str(detail)[:500],
+                                "progress_estimated": bool(estimated), "updated_at": time.time()})
+                    if current_file is not None:
+                        row["current_file"] = str(current_file)[:260]
+                    if current_target is not None:
+                        row["current_target"] = str(current_target)[:500]
+                    if targets is not None:
+                        row["targets"] = targets[:160]
+                    if event:
+                        logs = list(row.get("logs") or [])
+                        message = str(detail or phase)[:500]
+                        if not logs or logs[-1].get("message") != message or logs[-1].get("phase") != phase:
+                            logs.append({"time": time.strftime("%H:%M:%S"), "progress": int(progress),
+                                         "phase": str(phase)[:120], "message": message})
+                        row["logs"] = logs[-100:]
+                    row["directory"] = str(job_dir)
+                    row["progress_file"] = str(progress_path)
+
+            def _sync_unreal_progress():
+                try:
+                    if not progress_path.is_file():
+                        return False
+                    data = json.loads(progress_path.read_text(encoding="utf-8"))
+                    if not isinstance(data, dict):
+                        return False
+                    with THREE_D_EXPORT_LOCK:
+                        row = THREE_D_EXPORT_JOBS.get(job_id)
+                        if not row:
+                            return False
+                        for key in ("progress", "phase", "detail", "current_file", "current_target",
+                                    "targets", "logs", "completed", "total"):
+                            if key in data:
+                                row[key] = data[key]
+                        row["progress_estimated"] = False
+                        row["updated_at"] = time.time()
+                    return True
+                except Exception as progress_error:
+                    log("3D_EXPORT_PROGRESS_READ_WARNING job=%s error=%s" % (job_id, repr(progress_error)))
+                    return False
+
+            _server_update(2, "Queued", "Preparing the export job and output directory", main_name,
+                           "Waiting for the Unreal Editor bridge")
             try:
                 if not bridge_connected():
                     raise RuntimeError("Unreal Python Bridge is offline")
-                code = r'''import json, os, traceback, unreal
+                _server_update(5, "Connecting to Unreal Editor", "Checking the active Level and GLTFExporter plugin",
+                               main_name, "Connecting to the currently open Unreal Editor")
+                code = r'''import json, os, time, traceback, unreal
         output_path = __OUTPUT_PATH__
+        progress_path = __PROGRESS_PATH__
         export_format = __EXPORT_FORMAT__
         scope = __EXPORT_SCOPE__
-        report = {"ok": False, "format": export_format, "scope": scope, "files": [], "error": ""}
+        report = {"ok": False, "format": export_format, "scope": scope, "files": [], "error": "", "targets": []}
+        _progress_events = []
+        _targets = []
+        def _write_progress(percent, phase, detail="", current_target="", current_file=None, completed=0, total=0):
+            payload = {"progress": max(0, min(99, int(percent))), "phase": str(phase),
+                       "detail": str(detail)[:500], "current_target": str(current_target)[:500],
+                       "current_file": current_file or os.path.basename(output_path),
+                       "completed": int(completed or 0), "total": int(total or 0),
+                       "targets": _targets[:160], "logs": _progress_events[-100:],
+                       "updated_at": time.time()}
+            event = {"time": time.strftime("%H:%M:%S"), "progress": payload["progress"],
+                     "phase": str(phase)[:120], "message": str(detail or phase)[:500]}
+            if not _progress_events or _progress_events[-1].get("phase") != event["phase"] or _progress_events[-1].get("message") != event["message"]:
+                _progress_events.append(event)
+                payload["logs"] = _progress_events[-100:]
+            try:
+                os.makedirs(os.path.dirname(progress_path), exist_ok=True)
+                temporary = progress_path + ".tmp"
+                with open(temporary, "w", encoding="utf-8") as stream:
+                    json.dump(payload, stream, ensure_ascii=False)
+                os.replace(temporary, progress_path)
+            except Exception as progress_error:
+                print("[3D EXPORT] progress file update failed: " + str(progress_error))
+            print("[3D EXPORT] %s%% %s - %s" % (payload["progress"], phase, detail))
+
         try:
+            _write_progress(7, "Inspecting active Unreal Level", "Reading the currently open Level and Actor selection")
             world = unreal.get_editor_subsystem(unreal.UnrealEditorSubsystem).get_editor_world()
             if world is None:
                 raise RuntimeError("Unreal Editor has no active editor world")
@@ -2768,6 +2883,47 @@ jobs:
                     actors = list(unreal.EditorLevelLibrary.get_all_level_actors() or [])
             if not actors:
                 raise RuntimeError("The active Level contains no Actors to export")
+            _write_progress(14, "Finding source Actors and mesh assets",
+                            "Found %s Actor(s); inspecting Static Mesh and Skeletal Mesh references" % len(actors),
+                            str(world.get_path_name()), completed=0, total=len(actors))
+            for actor_index, actor in enumerate(actors):
+                try:
+                    actor_label = str(actor.get_actor_label()) if hasattr(actor, "get_actor_label") else str(actor.get_name())
+                except Exception:
+                    actor_label = str(actor.get_name())
+                found_asset = False
+                for class_name, property_name, kind in (("StaticMeshComponent", "static_mesh", "StaticMesh"),
+                                                         ("SkeletalMeshComponent", "skeletal_mesh", "SkeletalMesh")):
+                    component_class = getattr(unreal, class_name, None)
+                    if component_class is None:
+                        continue
+                    try:
+                        components = actor.get_components_by_class(component_class) or []
+                    except Exception:
+                        components = []
+                    for component in components:
+                        try:
+                            mesh_asset = component.get_editor_property(property_name)
+                            if mesh_asset:
+                                _targets.append({"actor": actor_label[:180],
+                                                 "component": str(component.get_name())[:180],
+                                                 "kind": kind,
+                                                 "asset_path": str(mesh_asset.get_path_name())[:300]})
+                                found_asset = True
+                        except Exception:
+                            pass
+                if not found_asset:
+                    _targets.append({"actor": actor_label[:180], "component": "—", "kind": "Actor",
+                                     "asset_path": "No Static/Skeletal Mesh reference found"})
+                if (actor_index + 1) % 10 == 0 or actor_index + 1 == len(actors):
+                    _write_progress(14 + int(8 * (actor_index + 1) / max(1, len(actors))),
+                                    "Inspecting source assets",
+                                    "Inspected %s of %s Actors; found %s mesh/actor entries" %
+                                    (actor_index + 1, len(actors), len(_targets)),
+                                    str(world.get_path_name()), completed=actor_index + 1, total=len(actors))
+            source_names = [item["actor"] + " → " + item["asset_path"] for item in _targets[:8]]
+            target_summary = " | ".join(source_names) if source_names else str(world.get_path_name())
+            report["targets"] = _targets[:160]
             options = unreal.GLTFExportOptions()
             try:
                 options.set_editor_property("bake_material_inputs", unreal.GLTFMaterialBakeMode.DISABLED)
@@ -2781,7 +2937,14 @@ jobs:
                 except Exception:
                     pass
             os.makedirs(os.path.dirname(output_path), exist_ok=True)
+            _write_progress(24, "Calling Unreal GLTFExporter",
+                            "Exporting %s Actor(s) from %s. The Unreal exporter does not expose per-mesh callbacks; progress during this stage is estimated by the server." %
+                            (len(actors), str(world.get_path_name())),
+                            target_summary, completed=0, total=len(actors))
             raw = unreal.GLTFExporter.export_to_gltf(world, output_path, options, set(actors))
+            _write_progress(82, "Unreal GLTFExporter returned",
+                            "The exporter call finished; validating the generated %s file and referenced resources" % export_format.upper(),
+                            str(world.get_path_name()), completed=len(actors), total=len(actors))
             messages = None
             if isinstance(raw, tuple):
                 if raw and isinstance(raw[0], bool) and not raw[0]:
@@ -2798,6 +2961,9 @@ jobs:
             if not os.path.isfile(output_path) or os.path.getsize(output_path) < 20:
                 raise RuntimeError("Unreal did not create the requested export file")
             files = [os.path.basename(output_path)]
+            _write_progress(88, "Validating exported model",
+                            "Checking file signature, mesh nodes and embedded geometry", str(output_path),
+                            completed=0, total=1)
             if export_format == "glb":
                 import struct
                 with open(output_path, "rb") as stream:
@@ -2829,7 +2995,7 @@ jobs:
                         if uri and not str(uri).startswith("data:"):
                             references.append(str(uri))
                 for uri in references:
-                    if ":" in uri or uri.startswith(("/", "\\\\")):
+                    if ":" in uri or uri.startswith(("/", "\\")):
                         raise RuntimeError("Export generated a non-local external resource URI: " + uri[:180])
                     sidecar = os.path.realpath(os.path.join(os.path.dirname(output_path), uri.replace("/", os.sep)))
                     if os.path.commonpath([os.path.realpath(os.path.dirname(output_path)), sidecar]) != os.path.realpath(os.path.dirname(output_path)):
@@ -2840,28 +3006,54 @@ jobs:
                         files.append(os.path.basename(sidecar))
             report.update({"ok": True, "files": files, "actor_count": len(actors),
                            "level": str(world.get_path_name()), "main_file": os.path.basename(output_path),
-                           "size": sum(os.path.getsize(os.path.join(os.path.dirname(output_path), x)) for x in files)})
+                           "size": sum(os.path.getsize(os.path.join(os.path.dirname(output_path), x)) for x in files),
+                           "targets": _targets[:160]})
+            _write_progress(96, "Unreal export validated",
+                            "Created %s with %s mesh/actor source entries; preparing download bundle" %
+                            (os.path.basename(output_path), len(_targets)),
+                            str(output_path), completed=1, total=1)
         except Exception as exc:
             report["error"] = str(exc)[:1800]
             report["traceback"] = traceback.format_exc()[-1800:]
+            _write_progress(99, "Unreal export failed", str(exc)[:500], str(output_path))
         print("__UE58_3D_EXPORT__" + json.dumps(report, ensure_ascii=False))
         '''
                 code = textwrap.dedent(code).strip()
                 code = code.replace("__OUTPUT_PATH__", repr(str(main_path).replace("\\", "/")))
+                code = code.replace("__PROGRESS_PATH__", repr(str(progress_path).replace("\\", "/")))
                 code = code.replace("__EXPORT_FORMAT__", repr(export_format))
                 code = code.replace("__EXPORT_SCOPE__", repr(scope))
                 ast.parse(code, filename="<ue58-file-manager-3d-export>", mode="exec")
-                with THREE_D_EXPORT_LOCK:
-                    THREE_D_EXPORT_JOBS[job_id].update({"phase": "Running Unreal GLTFExporter", "progress": 8})
-                result, status = queue_unreal(code, timeout=10000)
-                deadline = time.monotonic() + 10000
-                while status == 202 and time.monotonic() < deadline:
-                    result, status = wait_unreal_job(result.get("job_id", ""), timeout=60)
-                    with THREE_D_EXPORT_LOCK:
-                        if job_id in THREE_D_EXPORT_JOBS:
-                            THREE_D_EXPORT_JOBS[job_id].update({"phase": "Unreal is exporting", "progress": 60})
+                _server_update(10, "Submitting export to Unreal", "Queued export script on the live Editor thread",
+                               main_name, "Waiting for Unreal Editor Python execution")
+                result, status = queue_unreal(code, timeout=3)
+                unreal_job_id = result.get("job_id", "")
+                if status == 202 and unreal_job_id:
+                    deadline = time.monotonic() + 10000
+                    last_estimate = 24
+                    export_phase_started = None
+                    while status == 202 and time.monotonic() < deadline:
+                        _sync_unreal_progress()
+                        with THREE_D_EXPORT_LOCK:
+                            snapshot = dict(THREE_D_EXPORT_JOBS.get(job_id, {}))
+                        if snapshot.get("phase") == "Calling Unreal GLTFExporter":
+                            # Unreal's GLTFExporter is synchronous and offers no granular callback.
+                            # Show a clearly-labelled estimate, capped until the exporter returns.
+                            if export_phase_started is None:
+                                export_phase_started = time.monotonic()
+                            last_estimate = min(78, 24 + int((time.monotonic() - export_phase_started) * 0.9))
+                            _server_update(last_estimate, "Calling Unreal GLTFExporter",
+                                           "Estimated progress while Unreal processes the active Level; exporter API has no per-mesh progress callback",
+                                           main_name, snapshot.get("current_target", "Active Unreal Level"),
+                                           snapshot.get("targets"), estimated=True, event=False)
+                        result, status = wait_unreal_job(unreal_job_id, timeout=1)
+                    if status == 202:
+                        raise TimeoutError("Unreal export is still running after the 10,000-second execution limit")
+                elif status == 202:
+                    raise RuntimeError("Unreal bridge returned a pending job without a job_id")
                 if status != 200 or not result.get("ok"):
                     raise RuntimeError(result.get("error") or result.get("message") or str(result))
+                _sync_unreal_progress()
                 output = str(result.get("output", ""))
                 marker = "__UE58_3D_EXPORT__"
                 line = next((item for item in output.splitlines() if marker in item), "")
@@ -2870,37 +3062,60 @@ jobs:
                 report = json.loads(line.split(marker, 1)[1])
                 if not report.get("ok"):
                     raise RuntimeError(report.get("error") or "Unreal 3D export failed")
+                _server_update(91, "Collecting exported files", "Checking the main model and every glTF sidecar file",
+                               main_name, "Validating export output and referenced resources", report.get("targets", []))
                 files = []
-                for filename in report.get("files", []):
+                export_files = report.get("files", [])
+                for index, filename in enumerate(export_files):
                     safe_name = Path(str(filename)).name
                     target = (job_dir / safe_name).resolve()
                     if target.parent != job_dir or not target.is_file():
                         raise RuntimeError("Exported file or glTF sidecar is missing: " + safe_name)
                     files.append({"name": safe_name, "path": str(target), "size": target.stat().st_size})
+                    _server_update(91 + int(4 * (index + 1) / max(1, len(export_files))),
+                                   "Collecting exported files", "Collected %s of %s output file(s): %s" %
+                                   (index + 1, len(export_files), safe_name), safe_name,
+                                   "Validating exported file " + safe_name, report.get("targets", []))
                 main_name = Path(str(report.get("main_file") or main_name)).name
                 if not any(item["name"] == main_name for item in files):
                     raise RuntimeError("Main 3D file is missing from export report")
                 zip_path = job_dir / ("Unreal_3D_Export_" + export_format.upper() + ".zip")
+                _server_update(96, "Creating download bundle", "Packing the main model and its referenced resources into a ZIP bundle",
+                               zip_path.name, "Creating complete download package", report.get("targets", []))
                 with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_STORED, allowZip64=True) as archive:
                     for item in files:
                         archive.write(item["path"], arcname=item["name"])
                 files.append({"name": zip_path.name, "path": str(zip_path), "size": zip_path.stat().st_size, "bundle": True})
                 final = {"job_id": job_id, "status": "completed", "format": export_format,
                          "scope": scope, "level": report.get("level", ""), "actor_count": report.get("actor_count", 0),
-                         "main_file": main_name, "directory": str(job_dir), "files": files,
+                         "targets": report.get("targets", []), "main_file": main_name,
+                         "current_file": main_name, "current_target": "Export completed and verified",
+                         "directory": str(job_dir), "progress_file": str(progress_path), "files": files,
                          "viewer_url": "/api/3d/viewer/" + job_id,
                          "size": sum(item["size"] for item in files if not item.get("bundle")),
-                         "progress": 100, "phase": "Export completed", "detail": "Ready in File Manager"}
+                         "progress": 100, "progress_estimated": False,
+                         "phase": "Export completed", "detail": "Ready in File Manager"}
                 with THREE_D_EXPORT_LOCK:
+                    previous_logs = list(THREE_D_EXPORT_JOBS[job_id].get("logs") or [])
+                    previous_logs.append({"time": time.strftime("%H:%M:%S"), "progress": 100,
+                                          "phase": "Export completed", "message": "Output files verified and ZIP bundle created"})
+                    final["logs"] = previous_logs[-100:]
                     THREE_D_EXPORT_JOBS[job_id].update(final)
                 log("3D_EXPORT_COMPLETED job=%s format=%s scope=%s actors=%s files=%s" %
                     (job_id, export_format, scope, report.get("actor_count", 0), len(files)))
             except Exception as exc:
-                failure = {"status": "failed", "progress": 100, "phase": "Export failed", "error": str(exc)[:1800],
-                           "detail": str(exc)[:300], "directory": str(job_dir)}
+                failure = {"status": "failed", "progress": 100, "progress_estimated": False,
+                           "phase": "Export failed", "error": str(exc)[:1800],
+                           "detail": str(exc)[:500], "directory": str(job_dir),
+                           "current_file": main_name, "current_target": "Export stopped because of an error"}
                 with THREE_D_EXPORT_LOCK:
                     if job_id in THREE_D_EXPORT_JOBS:
-                        THREE_D_EXPORT_JOBS[job_id].update(failure)
+                        row = THREE_D_EXPORT_JOBS[job_id]
+                        logs = list(row.get("logs") or [])
+                        logs.append({"time": time.strftime("%H:%M:%S"), "progress": 100,
+                                     "phase": "Export failed", "message": str(exc)[:500]})
+                        failure["logs"] = logs[-100:]
+                        row.update(failure)
                 log("3D_EXPORT_FAILED job=%s error=%s" % (job_id, repr(exc)))
 
 
@@ -2919,7 +3134,12 @@ jobs:
                     return {"ok": True, "status": running.get("status"), "job_id": running.get("job_id"), "message": "A 3D export is already running"}
                 job_id = uuid.uuid4().hex
                 THREE_D_EXPORT_JOBS[job_id] = {"job_id": job_id, "status": "queued", "format": export_format,
-                    "scope": scope, "created_at": time.time(), "progress": 0, "phase": "Queued", "detail": "Waiting for Unreal Editor"}
+                    "scope": scope, "created_at": time.time(), "progress": 0, "phase": "Queued",
+                    "detail": "Waiting for Unreal Editor", "current_file": "Unreal_Level." + export_format,
+                    "current_target": "Waiting for active Unreal Level", "targets": [], "logs": [
+                        {"time": time.strftime("%H:%M:%S"), "progress": 0, "phase": "Queued",
+                         "message": "3D export request accepted; waiting for Unreal Editor"}],
+                    "progress_estimated": False}
             threading.Thread(target=_three_d_export_worker, args=(job_id, export_format, scope),
                              name="UE-3DExport-" + job_id[:8], daemon=True).start()
             log("3D_EXPORT_QUEUED job=%s format=%s scope=%s" % (job_id, export_format, scope))
