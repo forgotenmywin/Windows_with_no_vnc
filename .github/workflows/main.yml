@@ -5185,9 +5185,25 @@ jobs:
         if ($apiText -notmatch 'def _headless_wait_for_editor_save' -or $apiText -notmatch 'wait_unreal_job\(save_job_id, 25\)' -or $apiText -notmatch 'waiting_for_editor_save') {
           throw 'HEADLESS_ASYNC_SAVE_INVALID: pending Editor saves must complete in the background before commandlet dispatch.'
         }
-        if ($apiText -notmatch 'Try the current unfinished data line as well' -or $apiText -notmatch 'Read only the HTTP') {
-          throw 'MCP_STREAM_READER_INVALID: immediate SSE parsing and nonblocking notification handling are required.'
+        # Validate the actual implementation instead of requiring obsolete comment text.
+        # The SSE reader must parse a complete JSON-RPC data line before stream EOF,
+        # including a final data line that has not received its newline yet.
+        if ($apiText -notmatch 'async def read_mcp_http_reply\(' -or
+            $apiText -notmatch 'async for chunk in response\.aiter_text\(\):' -or
+            $apiText -notmatch 'candidate_line = line_buffer\.rstrip' -or
+            $apiText -notmatch 'if candidate_line\.startswith\(''data:''\):' -or
+            $apiText -notmatch 'async def mcp_post_and_read\(') {
+          throw 'MCP_STREAM_READER_INVALID: immediate SSE parsing of complete and unfinished data lines is required.'
         }
+        # Initialized notifications must inspect HTTP status/headers and close the
+        # stream without waiting for a response body that may never arrive.
+        if ($apiText -notmatch 'notify_status = notify\.status_code' -or
+            $apiText -notmatch 'notify_content_type = notify\.headers\.get\(''content-type'', ''''\)' -or
+            $apiText -notmatch 'if notify_status not in \(200, 202, 204\):') {
+          throw 'MCP_NOTIFICATION_READER_INVALID: notification handling must validate HTTP metadata without waiting for a body.'
+        }
+        Write-Host 'MCP_STREAM_READER_VALIDATION=true'
+        Write-Host 'MCP_NOTIFICATION_NONBLOCKING_VALIDATION=true'
         $bridgeText = Get-Content -LiteralPath 'D:\UE58\UEControl\Content\Python\init_unreal.py' -Raw -Encoding utf8
         if ($apiText -notmatch 'class LocalBridgeHandler' -or $apiText -notmatch 'ThreadingHTTPServer' -or $apiText -notmatch 'DEDICATED_LOCAL_BRIDGE_READY') {
           throw 'DEDICATED_BRIDGE_VALIDATION_FAILED: isolated localhost listener was not generated.'
