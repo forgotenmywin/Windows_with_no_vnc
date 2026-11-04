@@ -1417,6 +1417,17 @@ jobs:
                 raise ValueError("Name is too long (maximum 180 characters)")
             return name
 
+        def _fs_ignore_links(directory, names):
+            ignored = []
+            for name in names:
+                candidate = Path(directory) / name
+                try:
+                    if candidate.is_symlink() or (hasattr(candidate, "is_junction") and candidate.is_junction()):
+                        ignored.append(name)
+                except OSError:
+                    ignored.append(name)
+            return ignored
+
         def _fs_iter_files(source):
             if source.is_file():
                 yield source, source.name
@@ -1631,6 +1642,47 @@ jobs:
                 log("FILE_ZIP_FAILED error=%s" % repr(exc))
                 return jsonify(ok=False, error=str(exc)), 400
 
+        @app.post("/api/fs/copy")
+        @monitor_auth
+        def api_fs_copy():
+            body = request.get_json(silent=True) or {}
+            paths = body.get("paths")
+            if not isinstance(paths, list) or not paths or len(paths) > 50:
+                return jsonify(ok=False, error="select_between_1_and_50_files_or_folders"), 400
+            try:
+                destination = _fs_resolve(body.get("destination") or str(UPLOAD_ROOT))
+                if not destination.is_dir():
+                    return jsonify(ok=False, error="copy_destination_must_be_a_folder"), 400
+                copied = []
+                for raw in paths:
+                    source = _fs_resolve(raw)
+                    if not source.exists() or source.is_symlink():
+                        raise ValueError("Source is missing or is a symbolic link: " + str(source))
+                    if source == source.parent or any(source == drive for drive in _fs_drive_roots()):
+                        raise ValueError("A drive root cannot be copied")
+                    if source.is_dir() and (destination == source or source in destination.parents):
+                        raise ValueError("A folder cannot be copied into itself or one of its subfolders")
+                    base = source.name
+                    stem, suffix = (source.stem, source.suffix) if source.is_file() else (base, "")
+                    candidate = destination / (stem + "_copy" + suffix)
+                    index = 2
+                    while candidate.exists():
+                        candidate = destination / (stem + "_copy_" + str(index) + suffix)
+                        index += 1
+                    candidate = _fs_resolve(candidate)
+                    if source.is_dir():
+                        shutil.copytree(str(source), str(candidate), symlinks=False, ignore=_fs_ignore_links)
+                    else:
+                        shutil.copy2(str(source), str(candidate))
+                    copied.append({"source": str(source), "path": str(candidate),
+                                   "is_dir": candidate.is_dir(),
+                                   "size": None if candidate.is_dir() else candidate.stat().st_size})
+                log("FILE_COPY_COMPLETED count=%s destination=%s" % (len(copied), destination))
+                return jsonify(ok=True, copied=copied, count=len(copied), destination=str(destination))
+            except Exception as exc:
+                log("FILE_COPY_FAILED error=%s" % repr(exc))
+                return jsonify(ok=False, error=str(exc)), 400
+
         @app.post("/api/fs/release-upload")
         @monitor_auth
         def api_fs_release_upload():
@@ -1688,12 +1740,13 @@ jobs:
         </style></head><body>
         <header><div><h1>UE58 File Manager</h1><div class="muted small">Windows drives · Unreal Engine files · ZIP · GitHub Releases · operation logs</div></div><div class="statline"><span id="bridgeState">Bridge: checking…</span><span id="clock">—</span><span id="selectedCount">0 selected</span></div></header>
         <div class="wrap"><aside class="panel"><h2>Windows & Unreal locations</h2><div id="roots" class="roots">Loading available drives…</div><div class="status" id="rootStatus"></div><div class="small muted">The list shows accessible drive letters plus shortcuts to the UE58 workspace, Engine, active project, uploads, backups and logs.</div></aside>
-        <main style="min-width:0"><div class="tabs"><button class="tab active" data-tab="files">Files</button><button class="tab" data-tab="logs">Activity logs</button></div>
+        <main style="min-width:0"><div class="tabs"><button class="tab active" data-tab="files">Files</button><button class="tab" data-tab="3d">3D Export</button><button class="tab" data-tab="logs">Activity logs</button></div>
         <section id="filesTab" class="panel"><div class="pathbar"><input id="pathInput" spellcheck="false" placeholder="Choose a Windows folder path"><button class="btn" id="goPath">Go</button><button class="btn" id="upBtn">Up</button><button class="btn" id="refreshBtn">Refresh</button></div><div class="crumb" id="currentPath">Choose a drive or Unreal folder.</div>
         <div class="toolbar"><input id="filterInput" placeholder="Filter names or extensions…"><button class="btn" id="selectAllBtn">Select visible</button><button class="btn" id="clearSelectionBtn">Clear selection</button><span class="right muted small" id="directoryInfo"></span></div>
-        <div class="toolbar"><button class="btn primary" id="zipBtn">ZIP selected files / folders</button><button class="btn primary" id="releaseBtn">Send selected to GitHub Release</button><button class="btn" id="downloadBtn">Download selected</button><button class="btn" id="renameBtn">Rename selected</button><button class="btn danger" id="deleteBtn">Delete selected</button><button class="btn" id="newFolderBtn">New folder</button></div>
+        <div class="toolbar"><button class="btn primary" id="zipBtn">ZIP selected files / folders</button><button class="btn primary" id="releaseBtn">Send selected to GitHub Release</button><button class="btn" id="downloadBtn">Download selected</button><button class="btn" id="copySelectedBtn">Copy selected here</button><button class="btn" id="copyCurrentPathBtn">Copy folder path</button><button class="btn" id="renameBtn">Rename selected</button><button class="btn danger" id="deleteBtn">Delete selected</button><button class="btn" id="newFolderBtn">New folder</button></div>
         <div class="grid2"><div class="drop"><div class="small muted">Upload file(s) from this computer into the currently open Windows folder.</div><div class="toolbar"><input type="file" id="localFiles" multiple><label class="small"><input type="checkbox" id="uploadOverwrite"> Replace same-name files</label><button class="btn" id="uploadBtn">Upload here</button></div></div><div class="drop"><div class="small muted">GitHub Release destination (assets become publicly downloadable).</div><div class="toolbar"><label class="small">Tag <input id="releaseTag" value="ue5.8" style="width:110px"></label><label class="small"><input type="checkbox" id="replaceRelease"> Replace same-name Release assets</label></div><div class="small muted">If the tag or Release does not exist, it is created automatically from the repository default branch. Select a folder and use ZIP to include that entire folder and all subfolders. When replacement is off, unique timestamped asset names are used. Large files are split into numbered parts automatically.</div></div></div>
         <div class="status" id="fileStatus" aria-live="polite"></div><div class="tablewrap"><table><thead><tr><th><input type="checkbox" id="headerCheck"></th><th>Name</th><th>Extension / Type</th><th>Size</th><th>Modified</th><th>Action</th></tr></thead><tbody id="fileRows"><tr><td colspan="6" class="muted">Choose a location.</td></tr></tbody></table></div><div class="toolbar"><button class="btn" id="prevPageBtn">Previous</button><span class="muted small" id="pageInfo">—</span><button class="btn" id="nextPageBtn">Next</button></div></section>
+        <section id="threeDTab" class="panel hidden"><h2>3D Export from Unreal Engine</h2><div class="muted small">Export directly from the currently open Unreal Editor. GLB is one binary file. glTF is JSON plus its referenced .bin/textures, and the system creates a ZIP bundle for easy download.</div><div class="toolbar"><label>Format <select id="threeDFormat"><option value="glb">GLB (.glb)</option><option value="gltf">glTF (.gltf + resources)</option></select></label><label>Source <select id="threeDScope"><option value="level">Whole active Level</option><option value="selected">Selected Actors in Unreal Editor</option></select></label><button class="btn primary" id="threeDExportBtn">Export 3D model</button><button class="btn" id="threeDOpenFolderBtn" disabled>Open export folder in Files</button></div><div class="status" id="threeDStatus" aria-live="polite">No export started.</div><div class="toolbar" id="threeDLinks" hidden></div><div class="small muted">Output folder: D:\UE58\Uploads\3D_Exports. You can also start an export through ChatGPT MCP using unreal_export_3d and check it with unreal_get_3d_export_status. For an external viewer, download the model and drop it into <a href="https://sandbox.babylonjs.com/" target="_blank" rel="noopener" style="color:#9bcfff">Babylon.js Sandbox</a>.</div><div id="threeDPreview" style="height:520px;margin-top:12px;border:1px solid var(--line);border-radius:8px;overflow:hidden;background:#0b111a" hidden><iframe id="threeDFrame" title="3D model preview" style="width:100%;height:100%;border:0" allow="fullscreen"></iframe></div></section>
         <section id="logsTab" class="panel hidden"><div class="toolbar"><select id="logSource"><option value="all">All log sources</option></select><select id="logLevel"><option value="all">All levels</option><option>ERROR</option><option>WARN</option><option>INFO</option><option>DEBUG</option></select><input id="logQuery" placeholder="Search logs…"><button class="btn" id="refreshLogsBtn">Refresh logs</button><label class="small"><input type="checkbox" id="autoLogs" checked> Auto refresh</label></div><div class="statline"><span id="logSummary">Waiting for logs…</span><span id="lastLogUpdate"></span></div><div id="logOutput" class="logs">Logs will appear here. File transfers, ZIP jobs, GitHub Release uploads, API commands and MCP operations are recorded.</div></section>
         </main></div>
         <script>
@@ -1707,10 +1760,13 @@ jobs:
         async function loadRoots(){try{const j=await api('/api/fs/roots');state.roots=j.roots||[];$('bridgeState').textContent='Unreal bridge: '+(j.bridge_connected?'connected':'offline');$('rootStatus').textContent='Active project: '+(j.current_project||'not detected');renderRoots();const preferred=state.roots.find(r=>r.label==='Active Unreal Project')||state.roots.find(r=>r.label==='UE58 Workspace')||state.roots[0];if(preferred)await openDir(preferred.path); }catch(e){$('rootStatus').textContent='Could not load drives: '+e.message;$('rootStatus').className='status error';}}
         async function openDir(path,offset=0){try{const j=await api('/api/fs/list?path='+encodeURIComponent(path)+'&offset='+offset+'&limit='+state.limit);state.path=j.path;state.parent=j.parent||j.path;state.offset=j.offset;state.total=j.count;state.entries=j.entries||[];state.selected.clear();$('pathInput').value=state.path;$('currentPath').textContent=state.path;$('directoryInfo').textContent=j.count+' items'+(j.skipped?' · '+j.skipped+' inaccessible':'');$('pageInfo').textContent=(state.total?state.offset+1:0)+'–'+Math.min(state.total,state.offset+state.entries.length)+' of '+state.total;$('prevPageBtn').disabled=state.offset<=0;$('nextPageBtn').disabled=!j.has_more;renderRows();renderRoots();status('Folder loaded: '+state.path,'ok'); }catch(e){status('Folder could not be opened: '+e.message,'error');}}
         function visibleEntries(){const q=$('filterInput').value.trim().toLowerCase();return state.entries.filter(x=>!q||x.name.toLowerCase().includes(q)||String(x.extension).toLowerCase().includes(q));}
-        function renderRows(){const rows=visibleEntries();$('fileRows').innerHTML=rows.map(x=>`<tr><td><input type="checkbox" data-select="${esc(x.path)}" ${state.selected.has(x.path)?'checked':''}></td><td><button class="namebtn ${x.is_dir?'folder':'file'}" data-open="${esc(x.path)}" data-dir="${x.is_dir}">${x.is_dir?'📁':'📄'} ${esc(x.name)}</button></td><td>${esc(x.extension||'—')}</td><td>${human(x.size)}</td><td>${esc(x.modified)}</td><td>${x.is_dir?'<span class="muted">Open folder</span>':`<button class="btn" data-download="${esc(x.path)}">Download</button>`}</td></tr>`).join('')||'<tr><td colspan="6" class="muted">No matching files or folders.</td></tr>';
-         document.querySelectorAll('[data-select]').forEach(c=>c.onchange=()=>{if(c.checked)state.selected.add(c.dataset.select);else state.selected.delete(c.dataset.select);updateSelected();});document.querySelectorAll('[data-open]').forEach(b=>{b.onclick=()=>{if(b.dataset.dir==='true')openDir(b.dataset.open);else{if(state.selected.has(b.dataset.open))state.selected.delete(b.dataset.open);else state.selected.add(b.dataset.open);renderRows();updateSelected();}};b.ondblclick=()=>{if(b.dataset.dir==='true')openDir(b.dataset.open);};});document.querySelectorAll('[data-download]').forEach(b=>b.onclick=()=>downloadPath(b.dataset.download));updateSelected();}
+        function renderRows(){const rows=visibleEntries();$('fileRows').innerHTML=rows.map(x=>`<tr><td><input type="checkbox" data-select="${esc(x.path)}" ${state.selected.has(x.path)?'checked':''}></td><td><button class="namebtn ${x.is_dir?'folder':'file'}" data-open="${esc(x.path)}" data-dir="${x.is_dir}">${x.is_dir?'📁':'📄'} ${esc(x.name)}</button></td><td>${esc(x.extension||'—')}</td><td>${human(x.size)}</td><td>${esc(x.modified)}</td><td>${x.is_dir?'<span class="muted">Open folder</span>':`<button class="btn" data-download="${esc(x.path)}">Download</button><button class="btn" data-copy-path="${esc(x.path)}">Copy path</button>`}</td></tr>`).join('')||'<tr><td colspan="6" class="muted">No matching files or folders.</td></tr>';
+         document.querySelectorAll('[data-select]').forEach(c=>c.onchange=()=>{if(c.checked)state.selected.add(c.dataset.select);else state.selected.delete(c.dataset.select);updateSelected();});document.querySelectorAll('[data-open]').forEach(b=>{b.onclick=()=>{if(b.dataset.dir==='true')openDir(b.dataset.open);else{if(state.selected.has(b.dataset.open))state.selected.delete(b.dataset.open);else state.selected.add(b.dataset.open);renderRows();updateSelected();}};b.ondblclick=()=>{if(b.dataset.dir==='true')openDir(b.dataset.open);};});document.querySelectorAll('[data-download]').forEach(b=>b.onclick=()=>downloadPath(b.dataset.download));document.querySelectorAll('[data-copy-path]').forEach(b=>b.onclick=()=>copyText(b.dataset.copyPath));updateSelected();}
         function selectedPaths(){return [...state.selected];}
         function downloadPath(path){location.href='/api/fs/download?path='+encodeURIComponent(path);}
+        async function copyText(value){try{await navigator.clipboard.writeText(String(value));status('Copied: '+value,'ok');}catch(e){const t=document.createElement('textarea');t.value=String(value);document.body.appendChild(t);t.select();const ok=document.execCommand('copy');t.remove();status(ok?'Copied: '+value:'Clipboard permission was denied. '+value,ok?'ok':'error');}}
+        $('copyCurrentPathBtn').onclick=()=>copyText(state.path);
+        $('copySelectedBtn').onclick=async()=>{const paths=selectedPaths();if(!paths.length)return status('Select files or folders first.','error');try{const j=await api('/api/fs/copy',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({paths,destination:state.path})});status('Copied '+j.count+' item(s) into '+j.destination,'ok');await openDir(state.path,state.offset);await loadLogs();}catch(e){status('Copy failed: '+e.message,'error');}};
         $('goPath').onclick=()=>openDir($('pathInput').value);$('pathInput').addEventListener('keydown',e=>{if(e.key==='Enter')openDir($('pathInput').value);});$('upBtn').onclick=()=>{if(state.path&&state.parent&&state.parent!==state.path)openDir(state.parent);};$('refreshBtn').onclick=()=>openDir(state.path,state.offset);$('filterInput').oninput=renderRows;$('selectAllBtn').onclick=()=>{visibleEntries().forEach(x=>state.selected.add(x.path));renderRows();};$('clearSelectionBtn').onclick=()=>{state.selected.clear();renderRows();};$('headerCheck').onchange=()=>{visibleEntries().forEach(x=>x.checked=$('headerCheck').checked?(state.selected.add(x.path),true):(state.selected.delete(x.path),false));renderRows();};$('prevPageBtn').onclick=()=>openDir(state.path,Math.max(0,state.offset-state.limit));$('nextPageBtn').onclick=()=>openDir(state.path,state.offset+state.limit);
         $('downloadBtn').onclick=async()=>{const paths=selectedPaths();if(!paths.length)return status('Select at least one item.','error');if(paths.length===1){const item=state.entries.find(x=>x.path===paths[0]);if(item&&!item.is_dir)return downloadPath(paths[0]);}try{status('Creating ZIP for download…');const j=await api('/api/fs/zip',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({paths})});status('ZIP ready: '+j.name+' · '+human(j.size),'ok');downloadPath(j.path);}catch(e){status('ZIP/download failed: '+e.message,'error');}};
         $('zipBtn').onclick=async()=>{const paths=selectedPaths();if(!paths.length)return status('Select files or folders first.','error');const name=prompt('ZIP filename (without or with .zip):','UE58_Selected_Files.zip');if(name===null)return;try{status('Creating ZIP from selected file(s)/folder(s), including all nested subfolders…');const j=await api('/api/fs/zip',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({paths,archive_name:name,compress:false})});status('ZIP created: '+j.path+' · '+j.files+' files · '+human(j.size),'ok');}catch(e){status('ZIP failed: '+e.message,'error');}};
@@ -1719,7 +1775,11 @@ jobs:
         $('newFolderBtn').onclick=async()=>{const name=prompt('New folder name:');if(!name)return;try{const j=await api('/api/fs/create-folder',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({parent:state.path,name})});status('Folder created: '+j.path,'ok');await openDir(state.path,state.offset);}catch(e){status('Create folder failed: '+e.message,'error');}};
         $('renameBtn').onclick=async()=>{const paths=selectedPaths();if(paths.length!==1)return status('Select exactly one item to rename.','error');const old=paths[0].split(/[\\/]/).pop();const name=prompt('New name:',old);if(!name||name===old)return;try{const j=await api('/api/fs/rename',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({path:paths[0],new_name:name})});status('Renamed: '+j.path,'ok');await openDir(state.path,state.offset);}catch(e){status('Rename failed: '+e.message,'error');}};
         $('deleteBtn').onclick=async()=>{const paths=selectedPaths();if(!paths.length)return status('Select files or folders first.','error');if(!confirm('Permanently delete '+paths.length+' selected item(s) from the Windows runner? This cannot be undone.'))return;let ok=0,fail=[];for(const path of paths){try{await api('/api/fs/delete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({path,confirm_delete:true})});ok++;}catch(e){fail.push(path+': '+e.message);}}status(ok+' deleted; '+fail.length+' failed. '+fail.join(' | '),fail.length?'error':'ok');await openDir(state.path,state.offset);await loadLogs();};
-        document.querySelectorAll('[data-tab]').forEach(b=>b.onclick=()=>{state.tab=b.dataset.tab;document.querySelectorAll('[data-tab]').forEach(x=>x.classList.toggle('active',x===b));$('filesTab').classList.toggle('hidden',state.tab!=='files');$('logsTab').classList.toggle('hidden',state.tab!=='logs');if(state.tab==='logs')loadLogs();});
+        document.querySelectorAll('[data-tab]').forEach(b=>b.onclick=()=>{state.tab=b.dataset.tab;document.querySelectorAll('[data-tab]').forEach(x=>x.classList.toggle('active',x===b));$('filesTab').classList.toggle('hidden',state.tab!=='files');$('threeDTab').classList.toggle('hidden',state.tab!=='3d');$('logsTab').classList.toggle('hidden',state.tab!=='logs');if(state.tab==='logs')loadLogs();});
+         let threeDJobId='';let threeDPoll=null;let threeDDirectory='';
+         $('threeDExportBtn').onclick=async()=>{const b=$('threeDExportBtn');b.disabled=true;$('threeDLinks').hidden=true;$('threeDPreview').hidden=true;$('threeDFrame').src='about:blank';$('threeDStatus').textContent='Queueing Unreal export…';try{const j=await api('/api/3d/export',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({format:$('threeDFormat').value,scope:$('threeDScope').value})});threeDJobId=j.job_id;if(threeDPoll)clearInterval(threeDPoll);await pollThreeD();threeDPoll=setInterval(pollThreeD,1500);}catch(e){$('threeDStatus').textContent='Export could not start: '+e.message;$('threeDStatus').className='status error';b.disabled=false;}};
+         async function pollThreeD(){if(!threeDJobId)return;try{const j=await api('/api/3d/status/'+encodeURIComponent(threeDJobId));const x=j.job||{};$('threeDStatus').textContent=(x.phase||x.status||'Export')+' · '+(x.progress||0)+'% · '+(x.detail||'');if(x.status==='completed'){clearInterval(threeDPoll);threeDPoll=null;$('threeDExportBtn').disabled=false;threeDDirectory=x.directory;$('threeDOpenFolderBtn').disabled=false;const main=(x.files||[]).find(f=>f.name===x.main_file);const bundle=(x.files||[]).find(f=>f.bundle);const fileUrl='/api/3d/file/'+encodeURIComponent(threeDJobId)+'/'+encodeURIComponent(x.main_file);const bundleUrl=bundle?'/api/3d/file/'+encodeURIComponent(threeDJobId)+'/'+encodeURIComponent(bundle.name):'';$('threeDLinks').innerHTML='<a class="btn" href="'+fileUrl+'" download>Download '+esc(x.main_file)+'</a>'+(bundleUrl?'<a class="btn primary" href="'+bundleUrl+'" download>Download complete ZIP bundle</a>':'')+'<a class="btn" href="'+x.viewer_url+'" target="_blank" rel="noopener">Open 3D preview</a>'+'<button class="btn" id="threeDCopyPathBtn">Copy export path</button>';$('threeDLinks').hidden=false;$('threeDCopyPathBtn').onclick=()=>copyText(x.directory);$('threeDStatus').textContent='Export completed · '+esc(x.format.toUpperCase())+' · '+x.actor_count+' Actor(s) · '+human(x.size)+' · '+x.directory;$('threeDStatus').className='status ok';$('threeDPreview').hidden=false;$('threeDFrame').src=x.viewer_url;}else if(x.status==='failed'){clearInterval(threeDPoll);threeDPoll=null;$('threeDExportBtn').disabled=false;$('threeDStatus').textContent='Export failed: '+(x.error||x.detail||'unknown error');$('threeDStatus').className='status error';}}catch(e){$('threeDStatus').textContent='Status check failed: '+e.message;$('threeDStatus').className='status error';}}
+         $('threeDOpenFolderBtn').onclick=()=>{if(threeDDirectory){document.querySelector('[data-tab="files"]').click();openDir(threeDDirectory);}};
         async function loadLogs(){try{const q=new URLSearchParams({source:$('logSource').value,level:$('logLevel').value,q:$('logQuery').value,limit:'800'});const j=await api('/api/logs?'+q);const names=j.sources||[];const prev=$('logSource').value;if($('logSource').options.length!==names.length+1){$('logSource').innerHTML='<option value="all">All log sources</option>'+names.map(x=>`<option value="${esc(x)}">${esc(x)}</option>`).join('');$('logSource').value=names.includes(prev)?prev:'all';}const rows=j.entries||[];$('logSummary').textContent=rows.length+' log entries · '+(j.connection?.bridge_connected?'Bridge connected':'Bridge offline');$('lastLogUpdate').textContent='Updated '+new Date().toLocaleTimeString();$('logOutput').textContent=rows.map(x=>`[${x.timestamp}] [${x.level}] [${x.source}] ${x.message}`).join('\n')||'No matching logs.';$('logOutput').scrollTop=$('logOutput').scrollHeight;}catch(e){$('logSummary').textContent='Log error: '+e.message;}}
         $('refreshLogsBtn').onclick=loadLogs;$('logSource').onchange=loadLogs;$('logLevel').onchange=loadLogs;$('logQuery').onkeydown=e=>{if(e.key==='Enter')loadLogs();};setInterval(()=>{if($('autoLogs').checked&&state.tab==='logs')loadLogs();},5000);setInterval(()=>$('clock').textContent=new Date().toLocaleString(),1000);loadRoots();
         </script></body></html>'''
@@ -1760,6 +1820,10 @@ jobs:
                              "html_ready": False, "html_path": "", "html_error": ""}
         SCENE_MODEL_DIR = (ROOT / "Screenshots").resolve()
         SCENE_MODEL_DIR.mkdir(parents=True, exist_ok=True)
+        THREE_D_EXPORT_DIR = (UPLOAD_ROOT / "3D_Exports").resolve()
+        THREE_D_EXPORT_DIR.mkdir(parents=True, exist_ok=True)
+        THREE_D_EXPORT_JOBS = {}
+        THREE_D_EXPORT_LOCK = threading.RLock()
         SCENE_HTML_PATH = (SCENE_MODEL_DIR / "unreal-scene-viewer.html").resolve()
         SCENE_AUTO_LOCK = threading.RLock()
         SCENE_AUTO_TIMER = None
@@ -2658,6 +2722,267 @@ jobs:
                                               "phase": "Scene export failed", "detail": str(exc)[:300],
                                               "error": str(exc)[:1800]})
                 log("Actual scene geometry export failed: job=%s error=%s" % (job_id, repr(exc)))
+
+
+        def _three_d_export_payload(job_id):
+            with THREE_D_EXPORT_LOCK:
+                row = dict(THREE_D_EXPORT_JOBS.get(str(job_id or ""), {}))
+            if not row:
+                return {"ok": False, "error": "3d_export_job_not_found", "job_id": str(job_id or "")}
+            return {"ok": True, "job": row}
+
+
+        def _three_d_export_worker(job_id, export_format, scope):
+            job_dir = (THREE_D_EXPORT_DIR / job_id).resolve()
+            job_dir.mkdir(parents=True, exist_ok=True)
+            main_name = "Unreal_Level." + export_format
+            main_path = (job_dir / main_name).resolve()
+            with THREE_D_EXPORT_LOCK:
+                THREE_D_EXPORT_JOBS[job_id].update({"status": "running", "phase": "Connecting to Unreal Editor", "progress": 3})
+            try:
+                if not bridge_connected():
+                    raise RuntimeError("Unreal Python Bridge is offline")
+                code = r'''import json, os, traceback, unreal
+        output_path = __OUTPUT_PATH__
+        export_format = __EXPORT_FORMAT__
+        scope = __EXPORT_SCOPE__
+        report = {"ok": False, "format": export_format, "scope": scope, "files": [], "error": ""}
+        try:
+            world = unreal.get_editor_subsystem(unreal.UnrealEditorSubsystem).get_editor_world()
+            if world is None:
+                raise RuntimeError("Unreal Editor has no active editor world")
+            if not hasattr(unreal, "GLTFExporter") or not hasattr(unreal, "GLTFExportOptions"):
+                raise RuntimeError("GLTFExporter is not loaded. Enable it for the project and restart Unreal.")
+            actor_subsystem = unreal.get_editor_subsystem(unreal.EditorActorSubsystem)
+            if scope == "selected":
+                try:
+                    actors = list(actor_subsystem.get_selected_level_actors() or [])
+                except Exception:
+                    actors = list(unreal.EditorLevelLibrary.get_selected_level_actors() or [])
+                if not actors:
+                    raise RuntimeError("No Actors are selected in the Unreal Editor. Select one or more Actors, then export again.")
+            else:
+                try:
+                    actors = list(actor_subsystem.get_all_level_actors() or [])
+                except Exception:
+                    actors = list(unreal.EditorLevelLibrary.get_all_level_actors() or [])
+            if not actors:
+                raise RuntimeError("The active Level contains no Actors to export")
+            options = unreal.GLTFExportOptions()
+            try:
+                options.set_editor_property("bake_material_inputs", unreal.GLTFMaterialBakeMode.DISABLED)
+            except Exception:
+                pass
+            for prop, value in (("export_lights", False), ("export_cameras", False),
+                                ("export_vertex_colors", True), ("export_morph_targets", True),
+                                ("export_vertex_skin_weights", True), ("make_skinned_meshes_root", True)):
+                try:
+                    options.set_editor_property(prop, value)
+                except Exception:
+                    pass
+            os.makedirs(os.path.dirname(output_path), exist_ok=True)
+            raw = unreal.GLTFExporter.export_to_gltf(world, output_path, options, set(actors))
+            messages = None
+            if isinstance(raw, tuple):
+                if raw and isinstance(raw[0], bool) and not raw[0]:
+                    raise RuntimeError("Unreal GLTFExporter returned failure: " + str(raw))
+                messages = raw[-1] if len(raw) > 1 else None
+            elif isinstance(raw, bool):
+                if not raw:
+                    raise RuntimeError("Unreal GLTFExporter returned False")
+            else:
+                messages = raw
+            errors = getattr(messages, "errors", None) if messages is not None else None
+            if errors:
+                raise RuntimeError("GLTFExporter errors: " + "; ".join(str(x) for x in errors)[:1600])
+            if not os.path.isfile(output_path) or os.path.getsize(output_path) < 20:
+                raise RuntimeError("Unreal did not create the requested export file")
+            files = [os.path.basename(output_path)]
+            if export_format == "glb":
+                import struct
+                with open(output_path, "rb") as stream:
+                    header = stream.read(12)
+                    if len(header) != 12:
+                        raise RuntimeError("Exported GLB header is incomplete")
+                    magic, glb_version, glb_length = struct.unpack("<4sII", header)
+                    if magic != b"glTF" or glb_version != 2 or glb_length > os.path.getsize(output_path):
+                        raise RuntimeError("Exported binary file does not have a valid GLB 2.0 header")
+                    chunk_header = stream.read(8)
+                    if len(chunk_header) != 8:
+                        raise RuntimeError("Exported GLB JSON chunk is missing")
+                    chunk_length, chunk_type = struct.unpack("<II", chunk_header)
+                    if chunk_type != 0x4E4F534A or chunk_length > glb_length:
+                        raise RuntimeError("Exported GLB JSON chunk is invalid")
+                    doc = json.loads(stream.read(chunk_length).decode("utf-8").rstrip(" \t\r\n\x00"))
+            else:
+                with open(output_path, "r", encoding="utf-8-sig") as stream:
+                    doc = json.load(stream)
+                if not isinstance(doc, dict) or not isinstance(doc.get("asset"), dict) or not doc["asset"].get("version"):
+                    raise RuntimeError("Exported .gltf JSON is invalid or has no glTF asset version")
+            if not isinstance(doc, dict) or not doc.get("meshes") or not any(isinstance(node, dict) and "mesh" in node for node in (doc.get("nodes") or [])):
+                raise RuntimeError("Export completed but no renderable mesh nodes were found")
+            if export_format == "gltf":
+                references = []
+                for group in (doc.get("buffers") or [], doc.get("images") or []):
+                    for item in group:
+                        uri = item.get("uri") if isinstance(item, dict) else None
+                        if uri and not str(uri).startswith("data:"):
+                            references.append(str(uri))
+                for uri in references:
+                    if ":" in uri or uri.startswith(("/", "\\\\")):
+                        raise RuntimeError("Export generated a non-local external resource URI: " + uri[:180])
+                    sidecar = os.path.realpath(os.path.join(os.path.dirname(output_path), uri.replace("/", os.sep)))
+                    if os.path.commonpath([os.path.realpath(os.path.dirname(output_path)), sidecar]) != os.path.realpath(os.path.dirname(output_path)):
+                        raise RuntimeError("glTF sidecar path escapes export folder")
+                    if not os.path.isfile(sidecar):
+                        raise RuntimeError("Missing glTF sidecar resource: " + uri)
+                    if os.path.basename(sidecar) not in files:
+                        files.append(os.path.basename(sidecar))
+            report.update({"ok": True, "files": files, "actor_count": len(actors),
+                           "level": str(world.get_path_name()), "main_file": os.path.basename(output_path),
+                           "size": sum(os.path.getsize(os.path.join(os.path.dirname(output_path), x)) for x in files)})
+        except Exception as exc:
+            report["error"] = str(exc)[:1800]
+            report["traceback"] = traceback.format_exc()[-1800:]
+        print("__UE58_3D_EXPORT__" + json.dumps(report, ensure_ascii=False))
+        '''
+                code = textwrap.dedent(code).strip()
+                code = code.replace("__OUTPUT_PATH__", repr(str(main_path).replace("\\", "/")))
+                code = code.replace("__EXPORT_FORMAT__", repr(export_format))
+                code = code.replace("__EXPORT_SCOPE__", repr(scope))
+                ast.parse(code, filename="<ue58-file-manager-3d-export>", mode="exec")
+                with THREE_D_EXPORT_LOCK:
+                    THREE_D_EXPORT_JOBS[job_id].update({"phase": "Running Unreal GLTFExporter", "progress": 8})
+                result, status = queue_unreal(code, timeout=10000)
+                deadline = time.monotonic() + 10000
+                while status == 202 and time.monotonic() < deadline:
+                    result, status = wait_unreal_job(result.get("job_id", ""), timeout=60)
+                    with THREE_D_EXPORT_LOCK:
+                        if job_id in THREE_D_EXPORT_JOBS:
+                            THREE_D_EXPORT_JOBS[job_id].update({"phase": "Unreal is exporting", "progress": 60})
+                if status != 200 or not result.get("ok"):
+                    raise RuntimeError(result.get("error") or result.get("message") or str(result))
+                output = str(result.get("output", ""))
+                marker = "__UE58_3D_EXPORT__"
+                line = next((item for item in output.splitlines() if marker in item), "")
+                if not line:
+                    raise RuntimeError("Unreal returned no 3D export report: " + output[-1200:])
+                report = json.loads(line.split(marker, 1)[1])
+                if not report.get("ok"):
+                    raise RuntimeError(report.get("error") or "Unreal 3D export failed")
+                files = []
+                for filename in report.get("files", []):
+                    safe_name = Path(str(filename)).name
+                    target = (job_dir / safe_name).resolve()
+                    if target.parent != job_dir or not target.is_file():
+                        raise RuntimeError("Exported file or glTF sidecar is missing: " + safe_name)
+                    files.append({"name": safe_name, "path": str(target), "size": target.stat().st_size})
+                main_name = Path(str(report.get("main_file") or main_name)).name
+                if not any(item["name"] == main_name for item in files):
+                    raise RuntimeError("Main 3D file is missing from export report")
+                zip_path = job_dir / ("Unreal_3D_Export_" + export_format.upper() + ".zip")
+                with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_STORED, allowZip64=True) as archive:
+                    for item in files:
+                        archive.write(item["path"], arcname=item["name"])
+                files.append({"name": zip_path.name, "path": str(zip_path), "size": zip_path.stat().st_size, "bundle": True})
+                final = {"job_id": job_id, "status": "completed", "format": export_format,
+                         "scope": scope, "level": report.get("level", ""), "actor_count": report.get("actor_count", 0),
+                         "main_file": main_name, "directory": str(job_dir), "files": files,
+                         "viewer_url": "/api/3d/viewer/" + job_id,
+                         "size": sum(item["size"] for item in files if not item.get("bundle")),
+                         "progress": 100, "phase": "Export completed", "detail": "Ready in File Manager"}
+                with THREE_D_EXPORT_LOCK:
+                    THREE_D_EXPORT_JOBS[job_id].update(final)
+                log("3D_EXPORT_COMPLETED job=%s format=%s scope=%s actors=%s files=%s" %
+                    (job_id, export_format, scope, report.get("actor_count", 0), len(files)))
+            except Exception as exc:
+                failure = {"status": "failed", "progress": 100, "phase": "Export failed", "error": str(exc)[:1800],
+                           "detail": str(exc)[:300], "directory": str(job_dir)}
+                with THREE_D_EXPORT_LOCK:
+                    if job_id in THREE_D_EXPORT_JOBS:
+                        THREE_D_EXPORT_JOBS[job_id].update(failure)
+                log("3D_EXPORT_FAILED job=%s error=%s" % (job_id, repr(exc)))
+
+
+        def _start_three_d_export(export_format, scope):
+            export_format = str(export_format or "").lower().strip()
+            scope = str(scope or "level").lower().strip()
+            if export_format not in ("glb", "gltf"):
+                raise ValueError("format must be glb or gltf")
+            if scope not in ("level", "selected"):
+                raise ValueError("scope must be level or selected")
+            if not bridge_connected():
+                raise RuntimeError("Unreal Python Bridge is offline")
+            with THREE_D_EXPORT_LOCK:
+                running = next((row for row in THREE_D_EXPORT_JOBS.values() if row.get("status") in ("queued", "running")), None)
+                if running:
+                    return {"ok": True, "status": running.get("status"), "job_id": running.get("job_id"), "message": "A 3D export is already running"}
+                job_id = uuid.uuid4().hex
+                THREE_D_EXPORT_JOBS[job_id] = {"job_id": job_id, "status": "queued", "format": export_format,
+                    "scope": scope, "created_at": time.time(), "progress": 0, "phase": "Queued", "detail": "Waiting for Unreal Editor"}
+            threading.Thread(target=_three_d_export_worker, args=(job_id, export_format, scope),
+                             name="UE-3DExport-" + job_id[:8], daemon=True).start()
+            log("3D_EXPORT_QUEUED job=%s format=%s scope=%s" % (job_id, export_format, scope))
+            return {"ok": True, "status": "queued", "job_id": job_id}
+
+
+        @app.post("/api/3d/export")
+        @monitor_auth
+        def api_three_d_export():
+            body = request.get_json(silent=True) or {}
+            try:
+                return jsonify(_start_three_d_export(body.get("format", "glb"), body.get("scope", "level"))), 202
+            except Exception as exc:
+                log("3D_EXPORT_REQUEST_FAILED error=%s" % repr(exc))
+                return jsonify(ok=False, error=str(exc)), 400
+
+
+        @app.get("/api/3d/status/<job_id>")
+        @monitor_auth
+        def api_three_d_status(job_id):
+            payload = _three_d_export_payload(job_id)
+            return jsonify(payload), (200 if payload.get("job") else 404)
+
+
+        @app.get("/api/3d/file/<job_id>/<path:filename>")
+        @monitor_auth
+        def api_three_d_file(job_id, filename):
+            with THREE_D_EXPORT_LOCK:
+                job = dict(THREE_D_EXPORT_JOBS.get(job_id, {}))
+            if job.get("status") != "completed":
+                return jsonify(ok=False, error="3d_export_not_ready"), 404
+            wanted = str(filename or "")
+            allowed = {str(item.get("name", "")) for item in (job.get("files") or [])}
+            if not wanted or wanted not in allowed or Path(wanted).name != wanted:
+                return jsonify(ok=False, error="3d_export_file_not_found"), 404
+            target = (Path(job["directory"]).resolve() / wanted).resolve()
+            base = Path(job["directory"]).resolve()
+            if target.parent != base or not target.is_file() or not _inside_root(target):
+                return jsonify(ok=False, error="3d_export_file_not_found"), 404
+            mime = {".glb": "model/gltf-binary", ".gltf": "model/gltf+json", ".bin": "application/octet-stream",
+                    ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".webp": "image/webp",
+                    ".ktx2": "image/ktx2", ".zip": "application/zip"}.get(target.suffix.lower(), "application/octet-stream")
+            response = send_file(target, mimetype=mime, as_attachment=False, conditional=False, max_age=0)
+            response.headers["Cache-Control"] = "no-store, max-age=0"
+            return response
+
+
+        @app.get("/api/3d/viewer/<job_id>")
+        @monitor_auth
+        def api_three_d_viewer(job_id):
+            with THREE_D_EXPORT_LOCK:
+                job = dict(THREE_D_EXPORT_JOBS.get(job_id, {}))
+            if job.get("status") != "completed":
+                return jsonify(ok=False, error="3d_export_not_ready"), 404
+            main_name = str(job.get("main_file", ""))
+            if Path(main_name).name != main_name or not main_name:
+                return jsonify(ok=False, error="3d_export_main_file_not_found"), 404
+            model_url = "/api/3d/file/" + job_id + "/" + __import__("urllib.parse", fromlist=["quote"]).quote(main_name)
+            html = '''<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>UE58 3D Export Viewer</title><style>html,body{margin:0;width:100%;height:100%;overflow:hidden;background:#0b111a;color:#e8f1fb;font:14px Segoe UI,Arial}header{height:48px;display:flex;align-items:center;gap:16px;padding:0 16px;background:#142033}#view{position:absolute;inset:48px 0 0}#error{position:absolute;inset:48px 0 0;display:none;place-items:center;padding:24px;text-align:center;white-space:pre-wrap;color:#ffb4b4}#hint{color:#9fb4cb;font-size:12px}canvas{display:block;width:100%;height:100%}</style><script type="importmap">{"imports":{"three":"https://cdn.jsdelivr.net/npm/three@0.160.1/build/three.module.js","three/addons/":"https://cdn.jsdelivr.net/npm/three@0.160.1/examples/jsm/"}}</script></head><body><header><strong>UE58 3D Export</strong><span id="hint">Drag to orbit · Right-drag to pan · Scroll to zoom</span><a style="color:#9bcfff;margin-left:auto" href="__DOWNLOAD__" download>Download model</a></header><div id="view"></div><div id="error"></div><script type="module">import * as THREE from 'three';import{OrbitControls}from'three/addons/controls/OrbitControls.js';import{GLTFLoader}from'three/addons/loaders/GLTFLoader.js';const host=document.getElementById('view'),err=document.getElementById('error');try{const scene=new THREE.Scene();scene.background=new THREE.Color(0x0b111a);const camera=new THREE.PerspectiveCamera(45,1,.01,100000);camera.position.set(8,6,8);const renderer=new THREE.WebGLRenderer({antialias:true});renderer.setPixelRatio(Math.min(devicePixelRatio||1,2));renderer.outputColorSpace=THREE.SRGBColorSpace;renderer.toneMapping=THREE.ACESFilmicToneMapping;host.appendChild(renderer.domElement);const controls=new OrbitControls(camera,renderer.domElement);controls.enableDamping=true;scene.add(new THREE.HemisphereLight(0xffffff,0x435064,2));const key=new THREE.DirectionalLight(0xffffff,2.5);key.position.set(5,10,7);scene.add(key);new GLTFLoader().load('__MODEL__',g=>{scene.add(g.scene);const box=new THREE.Box3().setFromObject(g.scene);if(!box.isEmpty()){const center=box.getCenter(new THREE.Vector3()),size=box.getSize(new THREE.Vector3());g.scene.position.sub(center);const span=Math.max(size.x,size.y,size.z,1);camera.position.set(span*1.8,span*1.25,span*1.8);camera.near=Math.max(.01,span/10000);camera.far=span*100;camera.updateProjectionMatrix();controls.target.set(0,0,0);controls.update();}},undefined,e=>{throw e});function resize(){const w=host.clientWidth,h=host.clientHeight;renderer.setSize(w,h,false);camera.aspect=w/Math.max(h,1);camera.updateProjectionMatrix()}window.addEventListener('resize',resize);resize();renderer.setAnimationLoop(()=>{controls.update();renderer.render(scene,camera)})}catch(e){err.style.display='grid';err.textContent='Could not load this model.\\n'+(e.message||e)}</script></body></html>'''
+            html = html.replace("__MODEL__", model_url).replace("__DOWNLOAD__", model_url)
+            response = app.response_class(html, mimetype="text/html")
+            response.headers["Cache-Control"] = "no-store"
+            return response
 
 
         @app.post("/api/scene/model/export")
@@ -4371,6 +4696,33 @@ jobs:
                 return _fs_directory_payload(args.get("path", ""), args.get("offset", 0), args.get("limit", 500))
             if name == "file_manager_create_zip":
                 return _fs_create_zip(args.get("paths"), args.get("archive_name", ""), args.get("compress") is True)
+            if name == "file_manager_copy_paths":
+                destination = _fs_resolve(args.get("destination", ""))
+                paths = args.get("paths")
+                if not isinstance(paths, list) or not paths or len(paths) > 50 or not destination.is_dir():
+                    raise ValueError("paths (1-50) and an existing destination directory are required")
+                copied = []
+                for raw in paths:
+                    source = _fs_resolve(raw)
+                    if not source.exists() or source.is_symlink() or source == source.parent or any(source == drive for drive in _fs_drive_roots()):
+                        raise ValueError("Source missing, symbolic, or drive root: " + str(source))
+                    if source.is_dir() and (destination == source or source in destination.parents):
+                        raise ValueError("Cannot copy a folder into itself or one of its subfolders")
+                    stem, suffix = (source.stem, source.suffix) if source.is_file() else (source.name, "")
+                    target = destination / (stem + "_copy" + suffix)
+                    index = 2
+                    while target.exists():
+                        target = destination / (stem + "_copy_" + str(index) + suffix)
+                        index += 1
+                    target = _fs_resolve(target)
+                    shutil.copytree(str(source), str(target), symlinks=False, ignore=_fs_ignore_links) if source.is_dir() else shutil.copy2(str(source), str(target))
+                    copied.append({"source": str(source), "path": str(target), "is_dir": target.is_dir()})
+                log("FILE_COPY_COMPLETED_VIA_MCP count=%s destination=%s" % (len(copied), destination))
+                return {"ok": True, "copied": copied, "destination": str(destination)}
+            if name == "unreal_export_3d":
+                return _start_three_d_export(args.get("format", "glb"), args.get("scope", "level"))
+            if name == "unreal_get_3d_export_status":
+                return _three_d_export_payload(args.get("job_id", ""))
             if name == "file_manager_create_folder":
                 parent = _fs_resolve(args.get("parent", ""))
                 folder_name = _fs_safe_name(args.get("name", ""))
@@ -4975,6 +5327,21 @@ jobs:
                     "name": "file_manager_create_zip",
                     "description": "Create a ZIP archive from selected Windows or Unreal files/folders and save it under UE58 Uploads folder. By default it uses ZIP_STORED for faster large-file packaging.",
                     "inputSchema": {"type": "object", "properties": {"paths": {"type": "array", "items": {"type": "string"}, "minItems": 1, "maxItems": 100}, "archive_name": {"type": "string"}, "compress": {"type": "boolean", "default": False}}, "required": ["paths"], "additionalProperties": False}
+                },
+                {
+                    "name": "file_manager_copy_paths",
+                    "description": "Copy selected files or folders to a destination directory. If a name already exists, automatically create a _copy or _copy_N duplicate. Source and destination must be on accessible local drives.",
+                    "inputSchema": {"type": "object", "properties": {"paths": {"type": "array", "items": {"type": "string"}, "minItems": 1, "maxItems": 50}, "destination": {"type": "string"}}, "required": ["paths", "destination"], "additionalProperties": False}
+                },
+                {
+                    "name": "unreal_export_3d",
+                    "description": "Export the active Unreal Editor Level or currently selected Actors to GLB or glTF. Exports are saved under D:\\UE58\\Uploads\\3D_Exports and can be browsed, downloaded, copied or previewed in the authenticated File Manager. GLTF sidecar files are bundled in a ZIP automatically.",
+                    "inputSchema": {"type": "object", "properties": {"format": {"type": "string", "enum": ["glb", "gltf"], "default": "glb"}, "scope": {"type": "string", "enum": ["level", "selected"], "default": "level"}}, "additionalProperties": False}
+                },
+                {
+                    "name": "unreal_get_3d_export_status",
+                    "description": "Read progress and download/viewer paths for a previous unreal_export_3d job.",
+                    "inputSchema": {"type": "object", "properties": {"job_id": {"type": "string"}}, "required": ["job_id"], "additionalProperties": False}
                 },
                 {
                     "name": "unreal_upload_binary_file",
@@ -5702,9 +6069,9 @@ jobs:
                 return
 
             extra_tool_names = {
-                "file_manager_list_roots", "file_manager_list_directory", "file_manager_create_zip",
+                "file_manager_list_roots", "file_manager_list_directory", "file_manager_create_zip", "file_manager_copy_paths",
                 "file_manager_create_folder", "file_manager_rename_path", "file_manager_delete_path",
-                "unreal_monitor_get_scene", "unreal_monitor_get_scene_status", "unreal_monitor_list_projects", "unreal_switch_project",
+                "unreal_export_3d", "unreal_get_3d_export_status", "unreal_monitor_get_scene", "unreal_monitor_get_scene_status", "unreal_monitor_list_projects", "unreal_switch_project",
                 "unreal_monitor_list_plugins", "unreal_monitor_set_plugin_enabled", "unreal_save_all_dirty_assets",
                 "unreal_create_project_checkpoint", "unreal_package_project", "unreal_get_package_status",
                 "unreal_get_system_status", "mcp_gateway_list_servers", "mcp_gateway_add_server",
@@ -6843,7 +7210,8 @@ jobs:
         - [Open authenticated File Manager]($fileManagerUrl)
         - **Username:** viewer
         - **Password:** repository Actions secret MONITOR_PASSWORD (not printed to logs)
-        - Browse available Windows drives and Unreal Engine folders, select files, create ZIP archives, upload local files, download remote files, rename/create/delete entries, and publish selected files to GitHub Releases.
+        - Browse available Windows drives and Unreal Engine folders, select files, create ZIP archives, upload/download, copy files and folders, copy paths, rename/create/delete entries, and publish selected files to GitHub Releases.
+        - Export the active Unreal Level or selected Actors to GLB or glTF from the 3D Export tab; preview in-browser and download the model or full glTF sidecar ZIP bundle. Export files are saved under D:\UE58\Uploads\3D_Exports.
         - The Activity Logs tab records API commands, Unreal/MCP operations, file uploads/downloads, ZIP creation and Release upload results.
         - **MCP endpoint for ChatGPT:** $mcpEndpoint
         - **ChatGPT Connection:** Custom URL (not a Secure MCP Tunnel ID)
@@ -6853,7 +7221,7 @@ jobs:
         "@
         $summaryText | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
 
-        Write-Host 'REST endpoints: GET /health; authenticated File Manager at GET /files; authenticated filesystem, Drive, GitHub Release, project and unified logs endpoints.'
+        Write-Host 'REST endpoints: GET /health; authenticated File Manager at GET /files; authenticated filesystem/copy, GLB/glTF export and viewer, Drive, GitHub Release, project and unified logs endpoints.'
         Write-Host "MCP_ENDPOINT=$mcpEndpoint"
         Write-Host "MCP_ENDPOINT_COPY=$($mcpEndpoint.TrimEnd('/'))"
         Write-Host 'MCP_CONNECTOR_CONNECTION=Custom URL (not Secure MCP Tunnel ID)'
