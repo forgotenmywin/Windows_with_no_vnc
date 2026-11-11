@@ -1,0 +1,39 @@
+
+name: Copy Release GLB Into Repository
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  copy-model:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Create destination folder
+        run: mkdir -p assessr
+
+      - name: Download GLB from Release
+        run: |
+          curl -L --fail --retry 3 \
+            "https://github.com/forgotenmywin/Windows_with_no_vnc/releases/download/map-of-home/model.glb" \
+            -o assessr/model.glb
+
+      - name: Commit file to repository
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add assessr/model.glb
+
+          if git diff --cached --quiet; then
+            echo "File is already up to date."
+          else
+            git commit -m "Add GLB model from release"
+            git push
+          fi
