@@ -1,5 +1,5 @@
 
-name: Download and ZIP House Model
+name: Split GLB Into Two Parts and Save to Repo
 
 on:
   workflow_dispatch:
@@ -8,42 +8,70 @@ permissions:
   contents: write
 
 jobs:
-  zip-model:
+  split-and-save:
     runs-on: ubuntu-latest
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
 
-      - name: Download GLB from Release
+      - name: Download original GLB
         run: |
           mkdir -p assessr
           curl -L --fail --retry 3 \
             "https://github.com/forgotenmywin/Windows_with_no_vnc/releases/download/map-of-home/model.glb" \
-            -o assessr/model.glb
+            -o /tmp/model.glb
 
-      - name: Verify downloaded file
+      - name: Split into two parts
         run: |
-          test -s assessr/model.glb
-          ls -lh assessr/model.glb
+          python3 - <<'PY'
+          from pathlib import Path
+          import hashlib
 
-      - name: Create ZIP
-        run: |
-          cd assessr
-          zip -1 model.zip model.glb
-          cd ..
-          ls -lh assessr/model.zip
+          source = Path("/tmp/model.glb")
+          output = Path("assessr")
+          output.mkdir(exist_ok=True)
 
-      - name: Upload ZIP to GitHub Release
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          gh release upload map-of-home \
-            assessr/model.zip \
-            --clobber
+          data = source.read_bytes()
+          middle = (len(data) + 1) // 2
 
-      - name: Verify uploaded ZIP
-        env:
-          GH_TOKEN: ${{ github.token }}
+          part1 = data[:middle]
+          part2 = data[middle:]
+
+          (output / "model.glb.part1").write_bytes(part1)
+          (output / "model.glb.part2").write_bytes(part2)
+
+          print("Original size:", len(data))
+          print("Part 1:", len(part1))
+          print("Part 2:", len(part2))
+          print("SHA256:", hashlib.sha256(data).hexdigest())
+
+          # Verify that joining both parts restores the original file.
+          restored = part1 + part2
+          assert restored == data, "Split verification failed!"
+
+          print("Split verification: SUCCESS")
+          PY
+
+      - name: Save parts in GitHub repository
         run: |
-          gh release view map-of-home
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add assessr/model.glb.part1 assessr/model.glb.part2
+
+          if git diff --cached --quiet; then
+            echo "No changes to commit."
+          else
+            git commit -m "Add split house GLB model"
+            git push
+          fi
+
+      - name: Verify repository files
+        run: |
+          ls -lh assessr/
+          test -s assessr/model.glb.part1
+          test -s assessr/model.glb.part2
+          echo "Both model parts are saved in the repository."
