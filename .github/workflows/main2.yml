@@ -1,5 +1,5 @@
 
-name: Copy GLB To Release Asset
+name: Download and ZIP House Model
 
 on:
   workflow_dispatch:
@@ -8,17 +8,17 @@ permissions:
   contents: write
 
 jobs:
-  upload:
+  zip-model:
     runs-on: ubuntu-latest
 
-    env:
-      GH_TOKEN: ${{ github.token }}
-
     steps:
-      - name: Download model
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download GLB from Release
         run: |
           mkdir -p assessr
-          curl -fL --retry 3 \
+          curl -L --fail --retry 3 \
             "https://github.com/forgotenmywin/Windows_with_no_vnc/releases/download/map-of-home/model.glb" \
             -o assessr/model.glb
 
@@ -27,16 +27,23 @@ jobs:
           test -s assessr/model.glb
           ls -lh assessr/model.glb
 
-      - name: Upload to Release
+      - name: Create ZIP
+        run: |
+          cd assessr
+          zip -1 model.zip model.glb
+          cd ..
+          ls -lh assessr/model.zip
+
+      - name: Upload ZIP to GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           gh release upload map-of-home \
-            assessr/model.glb \
-            --repo forgotenmywin/Windows_with_no_vnc \
+            assessr/model.zip \
             --clobber
 
-      - name: Verify uploaded asset
+      - name: Verify uploaded ZIP
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          gh release view map-of-home \
-            --repo forgotenmywin/Windows_with_no_vnc \
-            --json assets \
-            --jq '.assets[] | select(.name == "model.glb") | {name, size, url}'
+          gh release view map-of-home
