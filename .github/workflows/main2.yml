@@ -11,24 +11,32 @@ jobs:
   upload:
     runs-on: ubuntu-latest
 
+    env:
+      GH_TOKEN: ${{ github.token }}
+
     steps:
       - name: Download model
         run: |
           mkdir -p assessr
-          curl -L --fail --retry 3 \
+          curl -fL --retry 3 \
             "https://github.com/forgotenmywin/Windows_with_no_vnc/releases/download/map-of-home/model.glb" \
             -o assessr/model.glb
 
-      - name: Upload to GitHub Release
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Verify downloaded file
+        run: |
+          test -s assessr/model.glb
+          ls -lh assessr/model.glb
+
+      - name: Upload to Release
         run: |
           gh release upload map-of-home \
             assessr/model.glb \
             --repo forgotenmywin/Windows_with_no_vnc \
             --clobber
 
-      - name: Verify
+      - name: Verify uploaded asset
         run: |
           gh release view map-of-home \
-            --repo forgotenmywin/Windows_with_no_vnc
+            --repo forgotenmywin/Windows_with_no_vnc \
+            --json assets \
+            --jq '.assets[] | select(.name == "model.glb") | {name, size, url}'
